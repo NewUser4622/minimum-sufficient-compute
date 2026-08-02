@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Local scratch — the pipeline stages everything under a scratch root before
+# pushing to HuggingFace. None of it belongs in git.
+scratch/
+runs/
+msc_lib.py.tmp
+*.tmp
+
+# Artifacts. HuggingFace is the store of record for these; git holds the code
+# and the documents. Committing a 60 MB checkpoint here would be a mistake you
+# cannot easily undo.
+*.pt
+*.pth
+*.safetensors
+*.parquet
+*.ckpt
+data/
+cifar-100-python/
+cifar-10-batches-py/
+
+# Generated notebooks carry a ~350 KB base64 payload each. Keep them: they are
+# what you upload to Kaggle, and `build_notebooks.py --check` verifies they
+# match the library. If you would rather generate on demand, uncomment:
+# notebooks/*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
