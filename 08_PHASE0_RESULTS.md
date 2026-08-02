@@ -2,6 +2,8 @@
 
 **Decided 2026-08-02 · verdict: `FULL-PROGRAM` · proceed to the Phase 1 atlas and build MSC-KD.**
 
+Running record of every number, defect and decision: [`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md)
+
 Machine-readable record: [`analysis/phase0_decision.json`](https://huggingface.co/datasets/Shanmuk4622/msc-cifar100/blob/main/analysis/phase0_decision.json)
 
 ---

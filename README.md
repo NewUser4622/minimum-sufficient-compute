@@ -33,6 +33,8 @@ and resolution correlate at 0.38, precision is nearly independent at ~0.23. That
 is a result in its own right, and it says results on depth-based early exit do
 not license claims about the other axes.
 
+Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md)**.
+
 ---
 
 ## Contents
@@ -49,6 +51,7 @@ not license claims about the other axes.
 | `05_PLAIN_ENGLISH_GUIDE.md` | **Start here if you want to understand the project.** No jargon — what MSC is, why each question matters, what every notebook does. |
 | `06_DATA_SCHEMA.md` | The HuggingFace repository structure and the complete data schema — 171 per-epoch columns, 91 final-evaluation columns, mapped to the collection requirements. |
 | `08_PHASE0_RESULTS.md` | **The Phase 0 verdict and every number behind it.** Gate table, τ-curves, per-question analysis, and what each result does and does not establish. |
+| `09_LAB_NOTEBOOK.md` | **Running record.** Every measured number with its provenance, every defect found with a contamination analysis, every design decision changed, and a crib mapping all of it onto paper sections. Append-only. |
 | `07_REPLICATION_PLAYBOOK.md` | **Project-agnostic.** How to rebuild this whole Kaggle + HuggingFace infrastructure in any future project, including the six bugs found along the way. |
 
 ### Code

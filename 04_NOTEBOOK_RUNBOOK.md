@@ -1,6 +1,7 @@
 # Notebook Runbook
 
 Operating manual. For *what the project is about*, read `05_PLAIN_ENGLISH_GUIDE.md` first.
+For *what has been measured and what went wrong so far*, see `09_LAB_NOTEBOOK.md`.
 
 ---
 
