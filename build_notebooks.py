@@ -540,7 +540,8 @@ for rid, st in sess.registry.latest().items():
                      'published_%': ref, 'gap': round(ref - acc * 100, 2),
                      'ok': (ref - acc * 100) <= 1.0})
 audit = pd.DataFrame(rows)
-display(audit)
+if len(audit):
+    display(audit)
 if len(audit) and not audit.ok.all():
     print('\\nSOME RUNS ARE UNDER-TRAINED. Fix the recipe before NB02.')
 elif len(audit):
@@ -683,11 +684,28 @@ for d in sorted(sess.runs_dir.iterdir()) if sess.runs_dir.exists() else []:
                          'order_fingerprint': df['sample_order_hash'].iloc[0][:16],
                          'arch': meta.get('arch')})
 align = pd.DataFrame(rows)
-display(align)
-for split, g in align.groupby('split'):
-    n = g.order_fingerprint.nunique()
-    print(f"{split}: {n} distinct ordering(s) -> "
-          f"{'OK' if n == 1 else 'MISALIGNED -- DO NOT ANALYSE THESE'}")
+if not len(align):
+    print('No per-sample tables yet.')
+    print()
+    print('Expected if Step 4 has not produced anything, which happens when the')
+    print('backbones are still training. NB02 only measures runs the registry')
+    print('marks "completed" -- a half-trained model would give measurements')
+    print('that look valid and are not.')
+    state = sess.registry.latest()
+    prog = [{'run_id': c['run_id'],
+             'state': state.get(c['run_id'], {}).get('state', 'not started'),
+             'epoch': state.get(c['run_id'], {}).get('epoch', '-')}
+            for c in cfgs]
+    display(pd.DataFrame(prog))
+    print()
+    print('Finish NB01 first, then re-run this notebook.')
+else:
+    display(align)
+    for split, g in align.groupby('split'):
+        k = g.order_fingerprint.nunique()
+        print(f"{split}: {k} distinct ordering(s) -> "
+              f"{'OK' if k == 1 else 'MISALIGNED -- DO NOT ANALYSE THESE'}")
+    msc.save_analysis(sess.data_dir, 'per_sample_alignment_phase0', align, sess.hub)
 """),
         md("## Step 6 — Finish"),
         code(FINISH_CELL),
@@ -908,9 +926,19 @@ print('  delta_R2 <  0.02 -> it is difficulty renamed; reframe the paper')
 """),
         md("## Step 8 — **The verdict**"),
         code("""\
+def _at_tau(df, col, tau=0.1):
+    if df is None or not len(df):
+        raise RuntimeError(
+            f'no {col} computed -- the earlier steps produced nothing. '
+            'Run NB01 and NB02 to completion first.')
+    sub = df[df.tau == tau]
+    if not len(sub):
+        raise RuntimeError(f'{col} has no row at tau={tau}')
+    return float(sub[col].iloc[0])
+
 rho_seed = float(min(ceil_a, ceil_b))          # the weaker ceiling governs
-T_val    = float(q3[q3.tau == 0.1]['T'].iloc[0])
-dR2      = float(q4[q4.tau == 0.1]['delta_r2'].iloc[0])
+T_val    = _at_tau(q3, 'T')
+dR2      = _at_tau(q4, 'delta_r2')
 
 decision = msc.phase0_decision(rho_seed, T_val, dR2)
 decision.update({'ceiling_resnet32x4': ceil_a, 'ceiling_wrn_40_2': ceil_b,
@@ -1159,11 +1187,14 @@ for d in sorted(sess.runs_dir.iterdir()) if sess.runs_dir.exists() else []:
                      'rows': len(df),
                      'order_fingerprint': df['sample_order_hash'].iloc[0][:16]})
 align = pd.DataFrame(rows)
-display(align)
-if len(align):
-    n = align.order_fingerprint.nunique()
-    print(f'\\n{n} distinct ordering(s) across {len(align)} tables -> '
-          f"{'OK' if n == 1 else 'MISALIGNED -- STOP AND INVESTIGATE'}")
+if not len(align):
+    print('No per-sample tables yet -- nothing measured on this account.')
+    print('Either the atlas is still training, or another worker owns these runs.')
+else:
+    display(align)
+    k = align.order_fingerprint.nunique()
+    print(f'\\n{k} distinct ordering(s) across {len(align)} tables -> '
+          f"{'OK' if k == 1 else 'MISALIGNED -- STOP AND INVESTIGATE'}")
     msc.save_analysis(sess.data_dir, 'per_sample_alignment', align, sess.hub)
 """),
         md("## Step 7 — Finish"),
@@ -1286,7 +1317,10 @@ if len(q1):
 """),
         md("## Step 3 — The ceiling table, across all τ"),
         code("""\
-if len(q1):
+if not len(q1):
+    print('No noise ceilings computed. Every architecture needs at least TWO')
+    print('seeds measured before a ceiling exists -- run NB08 on more runs.')
+elif len(q1):
     display(q1.pivot_table(index='arch', columns='tau', values='rho_seed').round(3))
     print('\\n  >= 0.6 pass | 0.4-0.6 marginal | < 0.4 noise-dominated')
     weak = q1[(q1.tau == 0.1) & (q1.rho_seed < 0.4)].arch.tolist()
@@ -1333,9 +1367,12 @@ for r, m in runs.items():
                      'frac_irreducible': res.frac_irreducible,
                      'mean_msc': float(np.nanmean(res.clean()))})
 irr = pd.DataFrame(rows)
-msc.save_analysis(sess.data_dir, 'irreducible_subpopulation', irr, sess.hub)
-display(irr.pivot_table(index='arch', columns='tau',
-                        values='frac_irreducible').round(3))
+if len(irr):
+    msc.save_analysis(sess.data_dir, 'irreducible_subpopulation', irr, sess.hub)
+    display(irr.pivot_table(index='arch', columns='tau',
+                            values='frac_irreducible').round(3))
+else:
+    print('No measured runs yet.')
 """),
         md("## Step 6 — Finish"),
         code(FINISH_CELL),
@@ -1395,6 +1432,8 @@ for r, m in runs.items():
     except Exception as e:
         print(f'  {r}: {e}')
 q2 = pd.concat(q2_all, ignore_index=True) if q2_all else pd.DataFrame()
+if not len(q2):
+    print('No axis structure computed -- no measured runs found (run NB08).')
 if len(q2):
     msc.save_analysis(sess.data_dir, 'q2_axis_structure_all', q2, sess.hub)
     display(q2.pivot_table(index='arch', columns='tau',
@@ -1553,10 +1592,14 @@ for a, b in pairs[:25]:
     c.update({'arch_a': a, 'arch_b': b})
     ctrl.append(c)
 ctrl = pd.DataFrame(ctrl)
-display(ctrl[['arch_a', 'arch_b', 'T_shuffled', 'passed']].round(4))
-print(f'\\n{ctrl.passed.sum()}/{len(ctrl)} pairs pass')
-assert ctrl.passed.all(), 'Scrambled control FAILED -- tables are misaligned. Bug.'
-msc.save_analysis(sess.data_dir, 'q3_shuffled_control', ctrl, sess.hub)
+if not len(ctrl):
+    print('No architecture pairs available yet. Q3 needs at least two')
+    print('architectures measured AND a noise ceiling for each (NB09).')
+else:
+    display(ctrl[['arch_a', 'arch_b', 'T_shuffled', 'passed']].round(4))
+    print(f'\\n{ctrl.passed.sum()}/{len(ctrl)} pairs pass')
+    assert ctrl.passed.all(), 'Scrambled control FAILED -- tables are misaligned. Bug.'
+    msc.save_analysis(sess.data_dir, 'q3_shuffled_control', ctrl, sess.hub)
 """),
         md("""
         ## Step 4 — The transfer matrix
@@ -1589,8 +1632,11 @@ def pair_type(r):
 q3['pair_type'] = q3.apply(pair_type, axis=1)
 
 msc.save_analysis(sess.data_dir, 'q3_transfer_matrix', q3, sess.hub)
-display(q3.groupby('pair_type')[['T', 'spearman_raw', 'jaccard_top10']]
-          .agg(['mean', 'std', 'count']).round(3))
+if len(q3):
+    display(q3.groupby('pair_type')[['T', 'spearman_raw', 'jaccard_top10']]
+              .agg(['mean', 'std', 'count']).round(3))
+else:
+    print('No pairs to compare yet.')
 print('\\nH3 predicts T decreases down this table.')
 print('  T ~ 1.0 -> transfer as complete as measurement allows')
 print('  T < 0.5 -> architecture-specific; the field assumption is wrong')
@@ -1707,13 +1753,20 @@ battery = ('msp', 'margin', 'entropy', 'ce_loss', 'el2n', 'forget_events',
            'pred_depth')
 rows = []
 for r in list(runs)[:6]:
-    df = msc.load_per_sample(sess.data_dir, r, 'train_holdout')
+    try:
+        df = msc.load_per_sample(sess.data_dir, r, 'train_holdout')
+    except FileNotFoundError:
+        continue
     rows.append({'run_id': r,
                  **{c: (int(df[c].notna().sum()) if c in df.columns else 0)
                     for c in battery}})
 cov = pd.DataFrame(rows)
-display(cov)
-missing = [c for c in battery if cov[c].sum() == 0]
+if not len(cov):
+    print('No per-sample tables found. Run NB08 (or NB02 for Phase 0) first.')
+    missing = list(battery)
+else:
+    display(cov)
+    missing = [c for c in battery if cov[c].sum() == 0]
 if missing:
     print(f'\\nMISSING: {missing}')
     print('Q4 will be weaker. These come from training-time instrumentation;')
@@ -1750,6 +1803,8 @@ for a, b in pairs:
     except Exception as e:
         print(f'  {a} -> {b}: {e}')
 q4 = pd.concat(q4_all, ignore_index=True) if q4_all else pd.DataFrame()
+if not len(q4):
+    print('No pairs analysed. Q4 needs at least two measured architectures.')
 if len(q4):
     msc.save_analysis(sess.data_dir, 'q4_irreducibility_all', q4, sess.hub)
     display(q4[['arch_a', 'arch_b', 'partial_spearman', 'r2_difficulty_only',
@@ -2081,7 +2136,7 @@ display(cmp_df.round(4))
         method wins**, and we have to say so in the paper.
         """),
         code("""\
-if len(cmp_df) and 'gap_points' in cmp_df:
+if len(cmp_df) and 'gap_points' in cmp_df.columns:
     order = ['resnet8x4', 'resnet20', 'vgg8']
     g = (cmp_df.groupby('student').gap_points.agg(['mean', 'std', 'count'])
          .reindex([s for s in order if s in set(cmp_df.student)]))
@@ -2247,6 +2302,8 @@ for d in sorted(sess.runs_dir.iterdir()) if sess.runs_dir.exists() else []:
                   'total_time_sec', 'total_energy_kwh', 'total_co2_kg',
                   'num_epochs_run', 'config_hash')})
 t1 = pd.DataFrame(rows)
+if not len(t1):
+    print('No completed runs found. Nothing to tabulate yet.')
 if len(t1):
     t1['params_M'] = (t1.num_parameters / 1e6).round(2)
     t1['GFLOPs'] = (t1.full_flops / 1e9).round(3)
@@ -2376,12 +2433,16 @@ if fi_frames:
 
     num = all_fi.select_dtypes('number').columns
     summ = (all_fi.groupby('arch')[list(num)].agg(['mean', 'std', 'count'])
-            if 'arch' in all_fi else pd.DataFrame())
+            if ('arch' in all_fi.columns and len(all_fi)) else pd.DataFrame())
     if len(summ):
         summ.to_csv(tdir / 'atlas_summary.csv')
         print(f'tables/atlas_summary.csv : mean +/- std across seeds')
 
-if sess.hub.enabled:
+if not ep_frames and not fi_frames:
+    print('Nothing to combine yet -- no run has written metrics/ on this account.')
+    print('Run sess.sync_state() first, or wait for training to produce epochs.')
+
+if sess.hub.enabled and (ep_frames or fi_frames):
     sess.hub.hub.enqueue_dir(tdir, 'tables')
     sess.hub.flush(timeout=600)
 """),
