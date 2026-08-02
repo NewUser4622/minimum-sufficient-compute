@@ -1,5 +1,16 @@
 # Phase 0 — Decisive Pilot
 
+> ## OUTCOME: `FULL-PROGRAM` (2026-08-02)
+> ρ_seed **0.715** · T **0.946** · ΔR² **0.254** · shuffled control **0.007**
+>
+> Row 1 of the §6 decision table. Every gate cleared at every τ. Full analysis in
+> `08_PHASE0_RESULTS.md`; machine-readable record in
+> `analysis/phase0_decision.json` on HuggingFace.
+>
+> One surprise: H2 (PC1 ≥ 0.60) was **refuted** at 0.503 — compute-need is not
+> one-dimensional across axes. That question was not part of the gate, so it does
+> not change the decision, but it is a finding.
+
 **Purpose:** determine in ~12 GPU-hours whether the MSC construct is real, before committing ~1,200 GPU-hours to the full program.
 
 **Rule:** no other code gets written until this returns numbers. Not the HF push infrastructure, not the method, not the atlas. If Phase 0 fails, all of that work is wasted, and the fastest way to find out is to run the smallest possible experiment that can falsify the premise.

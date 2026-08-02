@@ -4,6 +4,28 @@ No jargon. If you read only one document, read this one.
 
 ---
 
+## 0. Where we are right now
+
+**Phase 0 is done and it passed.** The go/no-go answered `FULL-PROGRAM` — the
+best of five possible outcomes. In plain terms:
+
+- Two copies of the same model, trained separately, **agree about which images
+  are hard** (0.72). So the thing we're measuring is real, not noise.
+- A ResNet and a WideResNet agree **~95% as much as our measurement precision
+  allows** (T = 0.946). Compute-need looks like a property of the image.
+- Our measurement carries **substantial information that existing "difficulty"
+  scores do not** (adding it nearly doubles predictive power). It isn't an old
+  idea renamed.
+- **One of our own predictions was wrong**, which is the interesting part. We
+  expected the three compute dials to be measuring one underlying thing. They
+  aren't — depth and resolution are moderately related, precision is nearly
+  independent. That means the field's habit of studying only depth and
+  generalising is not safe.
+
+Numbers and caveats: `08_PHASE0_RESULTS.md`.
+
+---
+
 ## 1. The question, in one paragraph
 
 Modern neural networks can be made to "think harder" on some inputs than others. A photo of a clearly-lit golden retriever is easy — the network could answer after a fraction of its layers. A blurry photo of a dog that looks a bit like a wolf is hard — it needs everything the network has.

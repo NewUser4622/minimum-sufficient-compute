@@ -12,6 +12,29 @@ Adaptive-inference networks decide at runtime how much computation to spend per 
 
 If it is a property of the input, a large teacher can supervise a small student's compute-allocation policy. If it is not, a growing line of teacher-guided adaptive-inference work rests on a false premise — and saying so is a contribution.
 
+
+## ✅ Phase 0 cleared — `FULL-PROGRAM`
+
+Decided 2026-08-02. Full write-up: **[`08_PHASE0_RESULTS.md`](08_PHASE0_RESULTS.md)**
+
+| Gate | Need | Got | |
+|---|---|---|---|
+| ρ_seed (noise ceiling) | ≥ 0.6 | **0.715** | ✓ |
+| T (transfer, disattenuated) | ≥ 0.7 | **0.946** | ✓ |
+| ΔR² (irreducibility) | ≥ 0.05 | **0.254** | ✓ 5× |
+| Shuffled control | ≈ 0 | **0.007** | ✓ |
+
+Every gate holds across the whole τ grid. All four backbones beat their published
+references (resnet32x4 79.59% vs 79.42; wrn-40-2 76.89% vs 75.61).
+
+**One pre-registered hypothesis was refuted:** H2 predicted PC1 ≥ 0.60 across the
+compute axes; measured **0.503**. Compute-need is *not* one-dimensional — depth
+and resolution correlate at 0.38, precision is nearly independent at ~0.23. That
+is a result in its own right, and it says results on depth-based early exit do
+not license claims about the other axes.
+
+---
+
 ## Contents
 
 ### Documents
@@ -25,6 +48,7 @@ If it is a property of the input, a large teacher can supervise a small student'
 | `04_NOTEBOOK_RUNBOOK.md` | **How to run it.** Kaggle setup, run order, worker splitting, push policy, resumability, troubleshooting. |
 | `05_PLAIN_ENGLISH_GUIDE.md` | **Start here if you want to understand the project.** No jargon — what MSC is, why each question matters, what every notebook does. |
 | `06_DATA_SCHEMA.md` | The HuggingFace repository structure and the complete data schema — 171 per-epoch columns, 91 final-evaluation columns, mapped to the collection requirements. |
+| `08_PHASE0_RESULTS.md` | **The Phase 0 verdict and every number behind it.** Gate table, τ-curves, per-question analysis, and what each result does and does not establish. |
 | `07_REPLICATION_PLAYBOOK.md` | **Project-agnostic.** How to rebuild this whole Kaggle + HuggingFace infrastructure in any future project, including the six bugs found along the way. |
 
 ### Code
@@ -93,10 +117,14 @@ Then, in order:
 1. **Read SAFE-KD (arXiv 2602.03043) as a team.** It is the closest prior art, it appeared in February 2026, and a competing group is active in this space. Write a one-page differentiation memo before writing any code. If it already does cross-architecture transfer, the protocol changes.
 2. Verify the 2026 arXiv IDs cited in the protocol — several are recent preprints that may have been revised.
 3. Run `notebooks/NB00_Setup_And_Verify` on every account. It ends with a kill-and-resume acceptance test; do not proceed past a failure there.
-4. Run Phase 0 (NB01 → NB02 → NB03).
-5. **Hold the decision meeting** against the table in §6 of `01_PHASE0_GO_NOGO.md`, and write the decision into the repo.
+4. ~~Run Phase 0 (NB01 → NB02 → NB03).~~ **Done — see `08_PHASE0_RESULTS.md`.**
+5. ~~Hold the decision meeting.~~ **Verdict: `FULL-PROGRAM`.**
+6. **Now:** NB04 → NB07 (atlas training), NB08 (measurement), NB09–NB12 (analysis).
 
-The infrastructure for the full program is built and tested, but **Phase 0 still runs first and its gate still governs.** Building the pipeline early costs nothing; skipping the gate costs a month.
+Phase 0 cost 9.5 GPU-hours and cleared every gate, so the remaining ~150 are
+justified. The two open questions it could not answer — does transfer survive the
+CNN→Transformer boundary, and does the non-one-dimensionality of compute-need
+generalise — are exactly what the atlas is for.
 
 ## Running across several accounts
 
