@@ -6052,7 +6052,8 @@ def analyse_q4_irreducibility(data_dir, run_a: str, run_b: str, budgets_by_run,
                               axis: str = "depth", taus=TAU_GRID,
                               battery_cols=("msp", "margin", "entropy", "ce_loss",
                                             "el2n", "forget_events", "pred_depth"),
-                              n_boot: int = 500) -> "Any":
+                              n_boot: int = 500,
+                              split: str = "train_holdout") -> "Any":
     """Q4: is MSC reducible to classical difficulty scores?
 
     The question that decides whether the project has a new object or a
@@ -6065,21 +6066,43 @@ def analyse_q4_irreducibility(data_dir, run_a: str, run_b: str, budgets_by_run,
     follows ("use a cheap difficulty score instead of a multi-axis oracle") is
     arguably better than the method paper.
     """
+    # DEFAULTS TO train_holdout, not test.
+    #
+    # Two of the seven difficulty scores -- EL2N and forgetting events -- are
+    # TRAINING-set quantities. They index training images, and the test set's
+    # sample_idx refers to entirely different images, so they cannot be attached
+    # there and are correctly NaN. Running Q4 on the test split therefore answers
+    # the question with 5 of 7 scores, which understates the battery and makes
+    # MSC look more irreducible than a fair test would.
+    #
+    # The train_holdout split is a 5,000-image slice of training data evaluated
+    # with augmentation off, so it carries all seven. That is the honest place to
+    # ask whether MSC survives controlling for classical difficulty. The test
+    # split remains available as a robustness check via split="test".
     core = _import_msc_core()
-    da, db = load_per_sample(data_dir, run_a), load_per_sample(data_dir, run_b)
+    da = load_per_sample(data_dir, run_a, split)
+    db = load_per_sample(data_dir, run_b, split)
     assert_aligned({run_a: da, run_b: db})
     cols = [c for c in battery_cols if c in da.columns and da[c].notna().any()]
     missing = [c for c in battery_cols if c not in cols]
     if missing:
-        log(f"battery incomplete, missing {missing}. Q4's answer is weaker "
-            f"than it should be -- rerun the oracle with train_dynamics present.",
-            "WARN")
+        train_only = [c for c in missing if c in ("el2n", "forget_events")]
+        if train_only and split == "test":
+            log(f"{train_only} are training-set scores and do not exist on the "
+                f"test split. Q4 on 'test' uses {len(cols)}/7 scores -- an "
+                f"EASIER test for MSC. Use split='train_holdout' for the "
+                f"full battery.", "WARN")
+        else:
+            log(f"battery incomplete, missing {missing}. Q4's answer is weaker "
+                f"than it should be -- rerun the oracle with train_dynamics "
+                f"present.", "WARN")
     rows = []
     for t in taus:
         ma = msc_for_run(da, budgets_by_run[run_a], axis, t).clean()
         mb = msc_for_run(db, budgets_by_run[run_b], axis, t).clean()
         res = core.irreducibility(ma, mb, da[cols], n_boot=n_boot)
         rows.append({"run_a": run_a, "run_b": run_b, "axis": axis, "tau": t,
+                     "split": split, "n_battery_scores": len(cols),
                      "battery": ",".join(cols), **res,
                      "delta_r2_lo": res["delta_r2_ci95"][0],
                      "delta_r2_hi": res["delta_r2_ci95"][1]})

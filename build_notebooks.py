@@ -1119,13 +1119,28 @@ if 'res_native' in msc.available_axes(dfa):
         oracle.
         """),
         code("""\
-q4 = msc.analyse_q4_irreducibility(sess.data_dir, A1, B1, buds, axis='depth')
+# Runs on train_holdout: EL2N and forgetting events are TRAINING-set scores, so
+# the test split carries only 5 of the 7. The full battery is the harder, fairer
+# test of whether MSC survives controlling for classical difficulty.
+q4 = msc.analyse_q4_irreducibility(sess.data_dir, A1, B1, buds, axis='depth',
+                                   split='train_holdout')
 msc.save_analysis(sess.data_dir, 'q4_irreducibility', q4, sess.hub)
-display(q4[['tau', 'partial_spearman', 'r2_difficulty_only',
+display(q4[['tau', 'n_battery_scores', 'partial_spearman', 'r2_difficulty_only',
             'r2_difficulty_plus_msc', 'delta_r2', 'delta_r2_lo',
             'delta_r2_hi', 'battery']].round(4))
+
+# Test split as a robustness check -- fewer scores available, so an easier test.
+q4t = msc.analyse_q4_irreducibility(sess.data_dir, A1, B1, buds, axis='depth',
+                                    split='test')
+msc.save_analysis(sess.data_dir, 'q4_irreducibility_testsplit', q4t, sess.hub)
+print()
+print(f'robustness -- test split, '
+      f'{int(q4t.n_battery_scores.iloc[0])} of 7 scores available there:')
+display(q4t[['tau', 'n_battery_scores', 'delta_r2', 'partial_spearman']].round(4))
+
 print('\\n  delta_R2 >= 0.05 -> genuinely new information')
 print('  delta_R2 <  0.02 -> it is difficulty renamed; reframe the paper')
+print('  The train_holdout number (full battery) is the one for the paper.')
 """),
         md("## Step 8 — **The verdict**"),
         code("""\
@@ -1970,10 +1985,16 @@ def nb12():
         md("""
         ## Step 2 — Is the difficulty battery complete?
 
-        Seven scores. Three of them (EL2N, forgetting events, prediction depth)
-        can only be recorded *during* training — they can't be recovered from a
-        finished model. If they're missing, this analysis is weaker than it
-        should be and NB08 needs re-running.
+        Seven scores. Two of them — **EL2N** and **forgetting events** — are
+        *training-set* quantities: they index training images, so they exist on
+        the `train_holdout` split and are genuinely undefined on the test set.
+
+        **Q4 therefore runs on `train_holdout`**, where all seven are available.
+        Running it on the test split would use 5 of 7, which is an *easier* test
+        for MSC and would overstate its irreducibility.
+
+        Phase 0 measured ΔR² = 0.254 on the test split with 5 scores. The
+        full-battery number is the one that belongs in the paper.
         """),
         code("""\
 battery = ('msp', 'margin', 'entropy', 'ce_loss', 'el2n', 'forget_events',
@@ -2024,7 +2045,7 @@ for a, b in pairs:
     try:
         d = msc.analyse_q4_irreducibility(sess.data_dir, seed1[a], seed1[b],
                                           budgets, axis='depth', taus=(0.1,),
-                                          n_boot=500)
+                                          n_boot=500, split='train_holdout')
         d['arch_a'] = a; d['arch_b'] = b
         q4_all.append(d)
     except Exception as e:
