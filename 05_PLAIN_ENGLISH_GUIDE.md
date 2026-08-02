@@ -210,9 +210,14 @@ Phase 1 is 45 training runs, about 110 GPU-hours. On one account that's roughly 
 Every notebook has two lines at the top:
 
 ```python
-NUM_WORKERS = 6     # how many accounts you're running
-WORKER_ID   = 0     # <<< CHANGE THIS: 0 on account 1, 1 on account 2, ...
+NUM_WORKERS = 1     # DEFAULT: this one account does everything
+WORKER_ID   = 0     # <<< 0 on account 1, 1 on account 2, ...
 ```
+
+**The default is 1**, so out of the box one account runs each notebook end to
+end. Nothing is lost by that except time. Every notebook also tells you, right
+at the top, how many models it contains and roughly how long it will take at 1,
+2, 4 or 6 accounts — so you can decide per notebook.
 
 Every account computes the **same** assignment from the **same** list of jobs. Each one keeps only the jobs assigned to its own number.
 
@@ -256,7 +261,16 @@ Own work first, always. So two *live* workers never fight over the same job.
 
 ### Just want to run on one account?
 
-Leave `NUM_WORKERS = 1`. Everything works, it just takes longer.
+That is already the default. Everything works, it just takes longer:
+
+| | 1 account | 6 accounts |
+|---|---|---|
+| Phase 0 (NB01–03) | ~12 h | ~3 h |
+| Atlas (NB04–08) | ~116 h | ~20 h |
+| Whole project | ~163 h | ~28 h |
+
+The pipeline pauses cleanly at 8.5 hours and resumes when you start a fresh
+session, so a 25-hour notebook is three sessions, not a problem.
 
 ---
 

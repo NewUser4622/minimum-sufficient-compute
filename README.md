@@ -39,17 +39,29 @@ If it is a property of the input, a large teacher can supervise a small student'
 
 ## The notebooks
 
-| # | Notebook | GPU | Time | Workers |
-|---|---|---|---|---|
-| 00 | Setup & Verify | T4 | 15 min | every account |
-| 01 | Phase 0 — train | T4 | ~12 GPU-h | 4 |
-| 02 | Phase 0 — measure + final eval | T4 | ~2 h | 4 |
-| 03 | Phase 0 — decision | off | 10 min | 1 |
-| 04–07 | Atlas training (ResNets / WRN+VGG / Mobile / Modern) | T4 | ~110 GPU-h | 6 |
-| 08 | Atlas measurement | T4 | ~25 GPU-h | 6 |
-| 09–12 | Analysis Q1 / Q2 / Q3 / Q4 | off | 5–20 min | 1 |
-| 13–14 | MSC-KD training and comparison | T4 | ~125 GPU-h | 6 |
-| 15 | Paper outputs | off | 10 min | 1 |
+| # | Notebook | GPU | Runs | Est. GPU-h | Wall-clock @ 1 worker |
+|---|---|---|---|---|---|
+| 00 | Setup & Verify | T4 | — | — | ~15 min |
+| 01 | Phase 0 — train | T4 | 4 | ~10 | ~10 h (2 sessions) |
+| 02 | Phase 0 — measure + final eval | T4 | 4 | ~2 | ~2 h |
+| 03 | Phase 0 — decision | **off** | — | — | ~10 min |
+| 04 | Atlas — ResNets | T4 | 15 | ~25 | ~25 h (3 sessions) |
+| 05 | Atlas — WRN + VGG | T4 | 15 | ~19 | ~19 h (3 sessions) |
+| 06 | Atlas — Mobile | T4 | 6 | ~9 | ~9 h (2 sessions) |
+| 07 | Atlas — ConvNeXt/ViT/Mixer | T4 | 9 | ~36 | ~36 h (5 sessions) |
+| 08 | Atlas — measure + final eval | T4 | 45 | ~27 | ~27 h (4 sessions) |
+| 09–12 | Analysis Q1–Q4 | **off** | — | — | 5–20 min each |
+| 13 | MSC-KD training | T4 | 9 | ~30 | ~30 h |
+| 14 | Method comparison | T4 | — | ~5 | ~5 h |
+| 15 | Paper outputs | **off** | — | — | ~10 min |
+
+**Total ≈ 163 GPU-hours.** Every notebook defaults to `NUM_WORKERS = 1`, meaning
+one account does all of it. Raise it and run the same notebook on each account
+with a different `WORKER_ID` to divide the time — the wall-clock column at
+2/4/6 workers is printed inside each notebook.
+
+Sessions assume the 8.5 h pause-and-resume limit. A notebook needing more than
+one session resumes automatically: start a fresh session and re-run.
 
 ## Why the structure changed from CEB-KD
 
@@ -92,8 +104,12 @@ Every account runs the **same notebook**. Two lines differ:
 
 ```python
 ACCOUNT     = 'acct1'      # label for the run log
-NUM_WORKERS = 6            # how many accounts you're running
+NUM_WORKERS = 1            # DEFAULT: this account does everything
 WORKER_ID   = 0            # 0..N-1, DIFFERENT on each account
 ```
+
+Leave `NUM_WORKERS = 1` and one account runs the whole notebook. Raise it only
+when you actually have several accounts going at once — then give each a
+different `WORKER_ID`.
 
 Work is split by a deterministic cost-balanced scheduler — no communication, no collisions, no gaps. See `04_NOTEBOOK_RUNBOOK.md` §3.

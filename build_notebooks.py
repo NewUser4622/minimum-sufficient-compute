@@ -23,6 +23,7 @@ Usage
 """
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -36,6 +37,127 @@ CORE = ROOT / "msc_core.py"
 OUT = ROOT / "notebooks"
 
 HF_REPO = "Shanmuk4622/msc-cifar100"
+SESSION_LIMIT_H = 8.5
+
+
+def _cost_model():
+    """Read the cost model out of msc_lib without importing it -- the generator
+    must run with nothing but the stdlib.
+
+    Handles annotated assignments (`X: Dict[str, float] = {...}`), which is how
+    ARCH_COST_HINT is declared. Missing that silently yields an empty table and
+    every architecture prices at the fallback, which is how five ResNets of very
+    different sizes all reported the same estimate.
+    """
+    tree = ast.parse(LIB.read_text(encoding="utf-8"))
+    hints, sec, measured = {}, None, set()
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, value = node.target.id, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+        else:
+            continue
+        try:
+            if name == "ARCH_COST_HINT":
+                hints = ast.literal_eval(value)
+            elif name == "SECONDS_PER_COST_UNIT":
+                sec = float(ast.literal_eval(value))
+            elif name == "MEASURED_ARCHS":
+                # frozenset({...})
+                measured = set(ast.literal_eval(value.args[0])
+                               if isinstance(value, ast.Call)
+                               else ast.literal_eval(value))
+        except Exception:
+            continue
+    if not hints or sec is None:
+        raise RuntimeError(
+            "could not parse the cost model out of src/msc_lib.py -- "
+            f"hints={len(hints)} entries, seconds={sec}. Estimates would be "
+            "wrong, so refusing to generate notebooks.")
+    return hints, sec, measured
+
+
+COST_HINT, SEC_PER_UNIT, MEASURED = _cost_model()
+TRANSFORMER_LIKE = {"convnext_femto", "vit_tiny", "mixer_nano"}
+
+
+def est_hours(arch: str, epochs: int | None = None) -> float:
+    ep = epochs or (300 if arch in TRANSFORMER_LIKE else 240)
+    return COST_HINT.get(arch, 3.0) * ep * SEC_PER_UNIT / 3600.0
+
+
+def scope_panel(archs, seeds=(1, 2, 3), epochs=None, kind="training",
+                extra_note="") -> str:
+    """The 'what this notebook runs' table, computed at build time."""
+    rows, total = [], 0.0
+    for a in sorted(archs):
+        ep = epochs or (300 if a in TRANSFORMER_LIKE else 240)
+        h = est_hours(a, ep)
+        rows.append((a, len(seeds), ep, h, h * len(seeds),
+                     "measured" if a in MEASURED else "estimate"))
+        total += h * len(seeds)
+    n_runs = len(archs) * len(seeds)
+
+    def wall(nw):
+        # cost-balanced packing: sort desc, give each to the least-loaded worker
+        jobs = sorted((r[3] for r in rows for _ in range(len(seeds))),
+                      reverse=True)
+        load = [0.0] * nw
+        for j in jobs:
+            i = load.index(min(load))
+            load[i] += j
+        return max(load)
+
+    lines = [
+        "## What this notebook runs",
+        "",
+        f"| | |",
+        f"|---|---|",
+        f"| **Architectures** | {len(archs)} |",
+        f"| **Seeds each** | {len(seeds)} |",
+        f"| **Total {kind} runs** | **{n_runs}** |",
+        f"| **Estimated GPU time** | **~{total:.0f} GPU-hours** |",
+        "",
+        "### Wall-clock, by how many accounts you run",
+        "",
+        "| NUM_WORKERS | Wall-clock | Kaggle sessions each |",
+        "|---|---|---|",
+    ]
+    for nw in (1, 2, 4, 6):
+        if nw > n_runs:
+            continue
+        w = wall(nw)
+        lines.append(f"| {nw} | ~{w:.1f} h | {max(1, -(-w // SESSION_LIMIT_H)):.0f} |")
+    lines += [
+        "",
+        "### Per architecture",
+        "",
+        "| Architecture | Epochs | Est. per run | × seeds | Basis |",
+        "|---|---|---|---|---|",
+    ]
+    for a, ns, ep, h, tot, basis in rows:
+        lines.append(f"| `{a}` | {ep} | {h:.2f} h | {tot:.1f} h | {basis} |")
+    lines += [
+        "",
+        f"> Estimates are calibrated against measured Phase 0 timings on a "
+        f"Kaggle T4 ({SEC_PER_UNIT:.2f} s per cost-unit-epoch). "
+        f"{len([r for r in rows if r[5] == 'measured'])} of {len(rows)} "
+        f"architectures here are measured; the rest are priced from a relative "
+        f"cost model that self-corrects as runs finish.",
+        "",
+        f"> A Kaggle session lasts ~9–12 h and this pipeline pauses cleanly at "
+        f"{SESSION_LIMIT_H} h, so a run needing more than one session resumes "
+        f"automatically — just start a fresh session and re-run.",
+    ]
+    if extra_note:
+        lines += ["", extra_note]
+    # Match the surrounding template's indent so md()'s dedent works uniformly.
+    # The first line is substituted at an already-indented position, so it is
+    # left bare.
+    out = [lines[0]] + [("        " + l) if l else "" for l in lines[1:]]
+    return "\n".join(out)
 KAGGLE_DATASET = "shanmuk4622/dataset-cifar100-python"
 
 
@@ -108,10 +230,18 @@ print(f'[BOOT] artifact space: {{msc.WORK_ROOT}}   scratch space: {{msc.SCRATCH_
 # ---------------------------------------------------------------------------
 # Shared cells
 # ---------------------------------------------------------------------------
-def worker_cell(phase, workers=1, note="") -> str:
+def worker_cell(phase, workers=1, note="", n_runs=None, hours=None) -> str:
     extra = f"\n# {note}" if note else ""
+    scope = ""
+    if n_runs is not None:
+        scope = (f"#\n"
+                 f"# THIS NOTEBOOK: {n_runs} run(s), ~{hours:.0f} GPU-hours total.\n"
+                 f"# At NUM_WORKERS = 1 that is all of it on this account.\n"
+                 f"# Raise NUM_WORKERS and run the same notebook on each account\n"
+                 f"# with a different WORKER_ID to divide it.\n")
     return f"""\
 # === Who am I? =============================================================
+{scope}#
 # ACCOUNT   labels this Kaggle account in the run log. Two accounts calling
 #           themselves the same thing makes the log useless.
 # WORKER_ID splits the work. Every account runs THE SAME notebook; the only
@@ -120,7 +250,9 @@ def worker_cell(phase, workers=1, note="") -> str:
 #           jobs belong to it -- no communication needed, no chance of two
 #           accounts training the same model, no chance of a job being missed.
 #
-# Running solo? Leave NUM_WORKERS = 1. Everything works, it just takes longer.{extra}
+# DEFAULT IS 1: this account does everything in this notebook. That is the
+# simplest thing that works. Change it only when you actually have several
+# accounts running at once.{extra}
 ACCOUNT     = 'acct1'      # <<< CHANGE ME
 NUM_WORKERS = {workers}          # <<< how many accounts you are running in parallel
 WORKER_ID   = 0            # <<< CHANGE ME: 0, 1, 2, ... up to NUM_WORKERS-1
@@ -143,6 +275,30 @@ DATA_CELL = """\
 # (20 GB, and that is the space your results need).
 DATA_ROOT = sess.prepare_data()
 print('dataset:', DATA_ROOT)
+"""
+
+ESTIMATE_CELL = """\
+# === How long will this take? ==============================================
+# Recomputed live, using measured per-epoch times from any runs that have
+# already finished. The more of the project you have completed, the more
+# accurate this gets -- the built-in estimates are only a starting prior.
+est = msc.estimate_phase(run_ids, num_workers=NUM_WORKERS)
+print(f"runs in this notebook : {est['n_runs']}")
+print(f"total GPU time        : ~{est['total_gpu_hours']:.1f} GPU-hours")
+print(f"at NUM_WORKERS={NUM_WORKERS:<2d}      : ~{est['wall_clock_hours']:.1f} h wall-clock "
+      f"({est['sessions_needed']} Kaggle session(s) on this account)")
+print(f"cost model            : {est['frac_measured']:.0%} of these architectures "
+      f"have measured timings; the rest are estimates")
+if NUM_WORKERS > 1:
+    print(f"per-worker hours      : "
+          f"{[round(h,1) for h in est['per_worker_hours']]}")
+print()
+for nw in (1, 2, 4, 6):
+    if nw > est['n_runs']:
+        break
+    e = msc.estimate_phase(run_ids, num_workers=nw)
+    mark = '  <-- you' if nw == NUM_WORKERS else ''
+    print(f"  NUM_WORKERS={nw}: ~{e['wall_clock_hours']:5.1f} h wall-clock{mark}")
 """
 
 SYNC_CELL = """\
@@ -490,7 +646,9 @@ def nb01():
         """),
         code(bootstrap_cell()),
         md("## Step 1 — Session (set your WORKER_ID)"),
-        code(worker_cell("p0", 4, "Phase 0 is 4 runs, so up to 4 accounts help here.")),
+        code(worker_cell("p0", workers=1, n_runs=4,
+                         hours=2*est_hours('resnet32x4') + 2*est_hours('wrn_40_2'),
+                         note="Phase 0 is 4 runs, so up to 4 accounts can help.")),
         md("## Step 2 — Dataset"),
         code(DATA_CELL),
         md("## Step 3 — Catch up with prior progress"),
@@ -511,6 +669,15 @@ EPOCHS = 240        # the standard published recipe. Do not shorten for Phase 0 
 
 cfgs = [sess.config(a, seed=s, num_epochs=EPOCHS)
         for a in ('resnet32x4', 'wrn_40_2') for s in (1, 2)]
+run_ids = [c['run_id'] for c in cfgs]
+
+est = msc.estimate_phase(run_ids, num_workers=NUM_WORKERS)
+print(f"{est['n_runs']} runs, ~{est['total_gpu_hours']:.1f} GPU-hours total")
+print(f"at NUM_WORKERS={NUM_WORKERS}: ~{est['wall_clock_hours']:.1f} h wall-clock, "
+      f"{est['sessions_needed']} session(s)")
+for r in run_ids:
+    print(f"  {r:34s} ~{msc.estimate_run_hours(r):.2f} h")
+print()
 
 summaries = sess.run_all(cfgs, title='Phase 0 training')
 
@@ -629,7 +796,8 @@ def nb02():
         """),
         code(bootstrap_cell()),
         md("## Step 1 — Session"),
-        code(worker_cell("p0", 4)),
+        code(worker_cell("p0", n_runs=4, hours=4*0.6,
+                         note="Measurement is inference-only: ~30 min per model.")),
         md("## Step 2 — Dataset"),
         code(DATA_CELL),
         md("## Step 3 — Catch up"),
@@ -1028,17 +1196,14 @@ plt.show()
 # Atlas training notebooks (NB04 - NB07)
 # ===========================================================================
 def atlas_nb(num, title, archs, hours, why, workers=6, extra_md=""):
-    arch_rows = "\n".join(
-        f"        | `{a}` | {'ResNet family' if 'resnet' in a else 'see below'} |"
-        for a in archs)
+    panel = scope_panel(archs)
     return notebook([
         md(f"""
         # NB{num:02d} — Atlas: {title}
 
-        **{len(archs)} architectures × 3 seeds = {len(archs)*3} runs · ~{hours} GPU-hours ·
-        shardable across up to {workers} accounts**
-
         {HEADER_NOTE}
+
+        {panel}
 
         ## Why this group is its own notebook
 
@@ -1069,17 +1234,19 @@ def atlas_nb(num, title, archs, hours, why, workers=6, extra_md=""):
         """),
         code(bootstrap_cell()),
         md("## Step 1 — Session"),
-        code(worker_cell("p1", workers)),
+        code(worker_cell("p1", n_runs=len(archs)*3,
+                         hours=sum(est_hours(a) for a in archs)*3)),
         md("## Step 2 — Dataset"),
         code(DATA_CELL),
         md("## Step 3 — Catch up"),
         code(SYNC_CELL),
         md("""
-        ## Step 4 — See the plan before committing hours to it
+        ## Step 4 — See the plan and the time before committing to it
 
-        Shows this worker's share and the estimated time. If the split looks
-        badly unbalanced, change `NUM_WORKERS` now rather than discovering it on
-        day three.
+        Prints how long this will actually take, using measured per-epoch times
+        from any runs already finished. If the split looks badly unbalanced, or
+        the hours are more than you want on one account, change `NUM_WORKERS`
+        now rather than discovering it on day three.
         """),
         code(f"""\
 ARCHS = {archs!r}
@@ -1087,7 +1254,9 @@ SEEDS = (1, 2, 3)
 
 cfgs = [sess.config(a, seed=s) for a in ARCHS for s in SEEDS]
 run_ids = [c['run_id'] for c in cfgs]
-
+"""),
+        code(ESTIMATE_CELL),
+        code(f"""\
 display(msc.shard_report(run_ids, NUM_WORKERS, mode='cost'))
 plan = sess.plan(run_ids, title='NB{num:02d} plan')
 """),
@@ -1167,7 +1336,8 @@ def nb08():
         """),
         code(bootstrap_cell()),
         md("## Step 1 — Session"),
-        code(worker_cell("p1", 6)),
+        code(worker_cell("p1", n_runs=45, hours=45*0.6,
+                         note="Measurement is inference-only: ~30-40 min per model.")),
         md("## Step 2 — Dataset"),
         code(DATA_CELL),
         md("## Step 3 — Catch up"),
@@ -1980,7 +2150,7 @@ def nb13():
         """),
         code(bootstrap_cell()),
         md("## Step 1 — Session"),
-        code(worker_cell("p3", 6)),
+        code(worker_cell("p3")),
         md("## Step 2 — Dataset"),
         code(DATA_CELL),
         md("## Step 3 — Catch up"),
@@ -2122,7 +2292,7 @@ def nb14():
         """),
         code(bootstrap_cell()),
         md("## Step 1 — Session"),
-        code(worker_cell("p3", 3)),
+        code(worker_cell("p3")),
         md("## Step 2 — Dataset"),
         code(DATA_CELL),
         md("## Step 3 — Catch up"),

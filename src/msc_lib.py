@@ -1385,18 +1385,69 @@ def hash_owner(key: str, num_workers: int) -> int:
 # require every worker to see the same universe list, which they do because it
 # is generated from the same config code.
 
-# Rough relative GPU cost per epoch, normalised so resnet20 = 1.0. These do not
-# need to be accurate -- they need to be roughly right, so that a ViT is not
-# scheduled as if it were a resnet20. Refined automatically from real timings
-# once history.csv exists (see estimate_costs_from_history).
+# Relative GPU cost per epoch, normalised so resnet20 = 1.0.
+#
+# CALIBRATED against real Phase 0 timings on a Kaggle T4 (2026-08-02):
+#   resnet32x4  240 epochs in 10,389 s  ->  43.3 s/epoch
+#   wrn_40_2    240 epochs in  6,758 s  ->  28.2 s/epoch
+#
+# Those two fix both the scale and the ratio. The first-guess table predicted
+# 1.73 h for the resnet32x4 run that actually took 2.89 h -- a 40% underestimate,
+# which matters when the whole point of these numbers is telling you how long a
+# phase will take before you commit to it.
+#
+# The rest remain estimates. `estimate_costs_from_history` replaces any entry
+# with a measured median as soon as that architecture has finished a run, so the
+# table self-corrects as the atlas progresses.
+MEASURED_ARCHS = frozenset({"resnet32x4", "wrn_40_2"})
+
 ARCH_COST_HINT: Dict[str, float] = {
     "resnet20": 1.0, "resnet56": 2.4, "resnet110": 4.6,
-    "resnet8x4": 1.6, "resnet32x4": 5.2,
-    "wrn_40_2": 4.4, "wrn_16_2": 1.7, "wrn_40_1": 2.2,
+    "resnet8x4": 1.6, "resnet32x4": 5.2,          # measured
+    "wrn_40_2": 3.38, "wrn_16_2": 1.3, "wrn_40_1": 1.7,   # wrn_40_2 measured
     "vgg13": 3.4, "vgg8": 1.8,
     "mobilenetv2": 3.0, "shufflenetv2": 2.2,
     "convnext_femto": 6.0, "vit_tiny": 7.5, "mixer_nano": 4.0,
 }
+
+# Seconds of T4 wall-clock per cost-unit-epoch. Derived from the anchor above:
+#   10,389 s / (240 epochs x 5.2 units) = 8.32
+SECONDS_PER_COST_UNIT = 8.32
+
+
+def estimate_run_hours(run_id: str, epochs_hint: Optional[int] = None,
+                       costs: Optional[Dict[str, float]] = None) -> float:
+    """Estimated wall-clock hours for one run on a single T4."""
+    return (estimate_run_cost(run_id, epochs_hint, costs)
+            * SECONDS_PER_COST_UNIT / 3600.0)
+
+
+def estimate_phase(run_ids: Sequence[str], num_workers: int = 1,
+                   costs: Optional[Dict[str, float]] = None,
+                   session_limit_h: float = 8.5) -> Dict[str, Any]:
+    """Total GPU-hours, wall-clock at N workers, and sessions needed.
+
+    Wall-clock is NOT total/N: work is assigned in whole runs, so the phase ends
+    when the busiest worker does. This uses the same cost-balanced packing the
+    scheduler uses, so the number matches what will actually happen.
+    """
+    costs = costs or ARCH_COST_HINT
+    per_run = {r: estimate_run_hours(r, costs=costs) for r in run_ids}
+    total = float(sum(per_run.values()))
+    owner = assign_workers(list(run_ids), max(1, num_workers), mode="cost",
+                           costs=costs)
+    loads = [sum(per_run[r] for r, w in owner.items() if w == i)
+             for i in range(max(1, num_workers))]
+    wall = max(loads) if loads else 0.0
+    n_measured = sum(1 for r in run_ids
+                     if str(r).split("-")[1] in MEASURED_ARCHS)
+    return {
+        "n_runs": len(run_ids), "total_gpu_hours": total,
+        "wall_clock_hours": wall, "per_worker_hours": loads,
+        "sessions_needed": int(math.ceil(wall / session_limit_h)) if wall else 0,
+        "per_run_hours": per_run, "num_workers": max(1, num_workers),
+        "frac_measured": (n_measured / len(run_ids)) if run_ids else 0.0,
+    }
 
 
 def estimate_run_cost(run_id: str, epochs_hint: Optional[int] = None,
@@ -1516,7 +1567,7 @@ class WorkerPlan:
         print(f"{'='*74}")
         print(f"  universe (all runs in this phase) : {len(self.universe)}")
         print(f"  my slice                          : {len(self.mine)}"
-              f"   (~{self.est_cost * 5.0 / 3600.0:.1f} GPU-h estimated)")
+              f"   (~{self.est_cost * SECONDS_PER_COST_UNIT / 3600.0:.1f} GPU-h estimated)")
         print(f"  already finished (GLOBAL, from HF): {len(self.done)}"
               f"   <- for the '{self.stage}' stage")
         print(f"  MY REMAINING WORK                 : {len(self.todo)}")
@@ -1628,9 +1679,7 @@ def shard_report(run_ids: Sequence[str], num_workers: int, mode: str = "cost",
     if pd is None:
         return rows
     df = pd.DataFrame(rows)
-    # est_cost is in "relative units x epochs"; ~1 unit-epoch is about 5 seconds
-    # on a T4 for the resnet20 baseline, which is where this constant comes from.
-    df["est_hours"] = df.est_cost * 5.0 / 3600.0
+    df["est_hours"] = df.est_cost * SECONDS_PER_COST_UNIT / 3600.0
     g = (df.groupby("owner")
            .agg(n_runs=("run_id", "count"), est_hours=("est_hours", "sum"),
                 archs=("arch", lambda s: ", ".join(sorted(set(s)))))

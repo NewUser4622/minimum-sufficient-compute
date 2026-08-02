@@ -48,13 +48,21 @@ Near the top of every notebook:
 
 ```python
 ACCOUNT     = 'acct1'      # <<< CHANGE ME
-NUM_WORKERS = 6            # <<< how many accounts you're running
+NUM_WORKERS = 1            # <<< DEFAULT: this account does everything
 WORKER_ID   = 0            # <<< CHANGE ME: 0, 1, 2, ... NUM_WORKERS-1
 ```
 
-**`WORKER_ID` must differ on every account.** It's what splits the work. Two accounts sharing a `WORKER_ID` will train exactly the same models and waste half your compute.
+**Every notebook ships with `NUM_WORKERS = 1`** — one account runs the whole
+thing. That is the simplest thing that works, and nothing is lost by it except
+wall-clock.
 
-Running alone? Leave `NUM_WORKERS = 1`.
+Raise it only when you have several accounts going at once. Then
+**`WORKER_ID` must differ on every account** — it's what splits the work. Two
+accounts sharing a `WORKER_ID` will train exactly the same models and waste
+half your compute.
+
+Each notebook prints, at the top and again at runtime, how many runs it
+contains and the wall-clock at 1 / 2 / 4 / 6 workers. Decide from that.
 
 ---
 
@@ -62,54 +70,38 @@ Running alone? Leave `NUM_WORKERS = 1`.
 
 Sixteen notebooks. Restart the kernel between them.
 
-### Stage 0 — verify
+| # | Notebook | GPU | Runs | Est. GPU-h | Wall-clock @ 1 worker |
+|---|---|---|---|---|---|
+| 00 | Setup & Verify | T4 | — | — | ~15 min |
+| 01 | Phase 0 — train | T4 | 4 | ~10 | ~10 h (2 sessions) |
+| 02 | Phase 0 — measure + final eval | T4 | 4 | ~2 | ~2 h |
+| 03 | Phase 0 — decision | **off** | — | — | ~10 min |
+| 04 | Atlas — ResNets | T4 | 15 | ~25 | ~25 h (3 sessions) |
+| 05 | Atlas — WRN + VGG | T4 | 15 | ~19 | ~19 h (3 sessions) |
+| 06 | Atlas — Mobile | T4 | 6 | ~9 | ~9 h (2 sessions) |
+| 07 | Atlas — ConvNeXt/ViT/Mixer | T4 | 9 | ~36 | ~36 h (5 sessions) |
+| 08 | Atlas — measure + final eval | T4 | 45 | ~27 | ~27 h (4 sessions) |
+| 09–12 | Analysis Q1–Q4 | **off** | — | — | 5–20 min each |
+| 13 | MSC-KD training | T4 | 9 | ~30 | ~30 h |
+| 14 | Method comparison | T4 | — | ~5 | ~5 h |
+| 15 | Paper outputs | **off** | — | — | ~10 min |
 
-| # | Notebook | GPU | Time | Workers |
-|---|---|---|---|---|
-| 00 | `NB00_Setup_And_Verify` | T4 | 15 min | run on **every** account |
+**Total ≈ 163 GPU-hours.** Every notebook defaults to `NUM_WORKERS = 1`, meaning
+one account does all of it. Raise it and run the same notebook on each account
+with a different `WORKER_ID` to divide the time — the wall-clock column at
+2/4/6 workers is printed inside each notebook.
 
-### Stage 1 — Phase 0, the go/no-go
+Sessions assume the 8.5 h pause-and-resume limit. A notebook needing more than
+one session resumes automatically: start a fresh session and re-run.
 
-| # | Notebook | GPU | Time | Workers |
-|---|---|---|---|---|
-| 01 | `NB01_Phase0_Train` | T4 | ~12 GPU-h | up to 4 |
-| 02 | `NB02_Phase0_Measure` | T4 | ~2 h | up to 4 |
-| 03 | `NB03_Phase0_Decision` | **off** | 10 min | 1 |
+**Turn the GPU OFF for NB03, NB09–NB12, NB15.**
 
 ### ⛔ Stop after NB03. Read the verdict. Decide as a team.
 
-### Stage 2 — the atlas
-
-| # | Notebook | GPU | Time | Workers |
-|---|---|---|---|---|
-| 04 | `NB04_Atlas_Train_ResNets` | T4 | ~25 GPU-h | up to 6 |
-| 05 | `NB05_Atlas_Train_WRN_VGG` | T4 | ~25 GPU-h | up to 6 |
-| 06 | `NB06_Atlas_Train_Mobile` | T4 | ~15 GPU-h | up to 6 |
-| 07 | `NB07_Atlas_Train_Modern` | T4 | ~45 GPU-h | up to 6 |
-| 08 | `NB08_Atlas_Measure` | T4 | ~25 GPU-h | up to 6 |
-
-NB04–NB07 are independent. Run them in any order, or simultaneously on different accounts. NB08 can start as soon as *any* model finishes.
-
-### Stage 3 — analysis (no GPU)
-
-| # | Notebook | GPU | Time |
-|---|---|---|---|
-| 09 | `NB09_Analysis_Q1_NoiseCeiling` | **off** | 5 min |
-| 10 | `NB10_Analysis_Q2_AxisStructure` | **off** | 5 min |
-| 11 | `NB11_Analysis_Q3_Transfer` | **off** | 15 min |
-| 12 | `NB12_Analysis_Q4_Irreducibility` | **off** | 20 min |
-
-**NB09 must run before NB11** — it produces the noise ceilings NB11 divides by.
-
-### Stage 4 — the method (only if NB11 showed transfer)
-
-| # | Notebook | GPU | Time | Workers |
-|---|---|---|---|---|
-| 13 | `NB13_Method_MSCKD_Train` | T4 | ~120 GPU-h | up to 6 |
-| 14 | `NB14_Method_Comparison` | T4 | ~5 h | up to 3 |
-| 15 | `NB15_Paper_Outputs` | **off** | 10 min | 1 |
-
----
+NB04–NB07 are independent — run them in any order, or simultaneously on
+different accounts. NB08 can start as soon as *any* model finishes.
+**NB09 must run before NB11** (it produces the ceilings NB11 divides by).
+NB13–NB14 only if NB11 showed transfer.
 
 ## 3. How the work splits across accounts
 
@@ -143,9 +135,16 @@ NB00 Step 6 prints all three so you can see it.
 
 Each notebook heartbeats every 30 minutes. After 2 hours of silence, other workers — **once they've finished their own share** — pick up the abandoned jobs automatically. Own work always comes first, so two live workers never collide.
 
-### Suggested split for 6 accounts
+### Using several accounts
 
-Just set `NUM_WORKERS = 6` and give each account `WORKER_ID` 0–5, then run the same notebooks everywhere. The scheduler handles it. Manual architecture assignment isn't needed and generally does worse.
+Set `NUM_WORKERS` to how many you have and give each `WORKER_ID` 0..N-1, then run the same notebooks everywhere. The scheduler handles the rest — manual architecture assignment isn't needed and generally does worse.
+
+The default is 1, so nothing is required of you here. It only changes wall-clock:
+
+| | 1 account | 2 | 4 | 6 |
+|---|---|---|---|---|
+| Atlas training (NB04–07) | ~89 h | ~45 h | ~23 h | ~15 h |
+| Whole project | ~163 h | ~82 h | ~41 h | ~28 h |
 
 ---
 
@@ -161,7 +160,7 @@ Proves: HF reachable **and writable** (pushes a probe, re-lists the repo to conf
 
 ### NB01 — Phase 0 training
 
-Four runs, ~3 h each. Split across up to 4 accounts.
+Four runs, ~10 GPU-hours total (resnet32x4 ≈ 2.9 h each, wrn-40-2 ≈ 1.9 h each). At `NUM_WORKERS = 1` that is ~10 h across two sessions; at 4 accounts, ~3 h.
 
 Expected: **resnet32x4 ≈ 79.4%**, **wrn-40-2 ≈ 75.6%**. Step 5 audits this. Do not proceed past a warning — measurements from an under-trained model are meaningless, and an under-trained model is otherwise easy to miss.
 

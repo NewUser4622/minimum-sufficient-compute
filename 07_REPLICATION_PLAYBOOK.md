@@ -319,6 +319,12 @@ Result:
 
 Still deterministic, still zero-communication — every worker computes the same packing from the same inputs.
 
+**Calibrate the estimates against reality as soon as you can.** The first
+guessed cost table predicted 1.73 h for a run that took 2.89 h — a 40%
+underestimate. Two measured runs were enough to fix both the scale and the
+ratio, after which predictions matched actuals to within 0.01 h. If you are
+going to print "this will take N hours" anywhere, anchor N on a measurement.
+
 **Make it self-correcting.** Seed with rough estimates, then replace them with measured per-unit times once any run has finished:
 
 ```python
