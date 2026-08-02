@@ -5683,12 +5683,102 @@ def _import_msc_core():
         "directory -- the analysis will not run without it.")
 
 
+class MissingInputs(RuntimeError):
+    """Raised when an analysis is asked to run before its inputs exist.
+
+    A distinct exception type because this is almost never a bug -- it means a
+    notebook was run out of order, and the useful response is a clear statement
+    of what is missing and which notebook produces it.
+    """
+
+
 def load_per_sample(data_dir, run_id: str, split: str = "test"):
+    base = Path(data_dir) / "runs" / run_id / "per_sample"
     for ext in ("parquet", "csv"):
-        p = Path(data_dir) / "runs" / run_id / "per_sample" / f"{split}.{ext}"
+        p = base / f"{split}.{ext}"
         if p.exists():
             return pd.read_parquet(p) if ext == "parquet" else pd.read_csv(p)
-    raise FileNotFoundError(f"no per-sample table for {run_id}/{split}")
+    trained = (Path(data_dir) / "runs" / run_id / "summary.json").exists()
+    hint = ("This run finished TRAINING but has not been MEASURED yet -- the "
+            "per-sample tables come from the oracle sweep. Run NB02 (Phase 0) "
+            "or NB08 (atlas) first."
+            if trained else
+            "This run has not finished training. Run NB01 (Phase 0) or "
+            "NB04-NB07 (atlas) first.")
+    raise MissingInputs(
+        f"no per-sample table at runs/{run_id}/per_sample/{split}.parquet\n{hint}")
+
+
+def check_inputs(data_dir, run_ids: Sequence[str], split: str = "test",
+                 verbose: bool = True) -> Dict[str, Any]:
+    """What each run has, and what is still missing, before any analysis runs.
+
+    Called at the top of every analysis notebook so a missing input produces one
+    readable table and one clear instruction, rather than a FileNotFoundError
+    raised six frames deep inside a statistic.
+    """
+    def _has_table(ps: Path, split: str) -> bool:
+        # Must agree with load_per_sample, which accepts a CSV fallback --
+        # run_oracle writes CSV when no parquet engine is available. A checker
+        # that disagrees with the loader reports work as missing that is
+        # actually there.
+        return any((ps / f"{split}.{e}").exists() for e in ("parquet", "csv"))
+
+    rows, missing = [], []
+    for r in run_ids:
+        base = Path(data_dir) / "runs" / r
+        ps = base / "per_sample"
+        rec = {
+            "run_id": r,
+            "trained": (base / "summary.json").exists(),
+            "checkpoint": (base / "checkpoints" / "ckpt_best.pt").exists(),
+            "epochs_csv": (base / "metrics" / "epochs.csv").exists(),
+            "exit_heads": (base / "checkpoints" / "exit_heads.pt").exists(),
+            "per_sample_test": _has_table(ps, split),
+            "final_eval": (base / "metrics" / "final.csv").exists(),
+        }
+        acc = read_json(base / "summary.json", default={}) or {}
+        rec["accuracy"] = acc.get("best_accuracy")
+        rec["epochs_run"] = acc.get("num_epochs_run")
+        rows.append(rec)
+        if not rec["per_sample_test"]:
+            missing.append(r)
+
+    table = pd.DataFrame(rows) if pd is not None else rows
+    ready = not missing
+
+    if verbose:
+        print(f"\n{'='*72}\n  Input check\n{'='*72}")
+        if pd is not None and len(table):
+            print(table.to_string(index=False))
+        if ready:
+            print("\n  All inputs present.\n")
+        else:
+            n_trained = sum(1 for r in rows if r["trained"])
+            print(f"\n  MISSING per-sample tables for {len(missing)} of "
+                  f"{len(run_ids)} runs:")
+            for r in missing:
+                print(f"    {r}")
+            if n_trained == len(run_ids):
+                print("\n  All runs finished TRAINING but none have been MEASURED.")
+                print("  The per-sample tables are produced by the oracle sweep.")
+                print("\n  -> Run NB02 (Phase 0) or NB08 (atlas), then come back.")
+            else:
+                print(f"\n  {n_trained}/{len(run_ids)} runs have finished training.")
+                print("  -> Finish NB01 / NB04-NB07, then NB02 / NB08, then return.")
+        print(f"{'='*72}\n")
+
+    return {"ready": ready, "missing": missing, "table": table,
+            "n_runs": len(run_ids)}
+
+
+def require_inputs(data_dir, run_ids: Sequence[str], split: str = "test") -> None:
+    """Hard stop with an actionable message if the analysis cannot proceed."""
+    rep = check_inputs(data_dir, run_ids, split=split, verbose=True)
+    if not rep["ready"]:
+        raise MissingInputs(
+            f"{len(rep['missing'])} of {rep['n_runs']} runs have no per-sample "
+            f"table. See the table above -- run the measurement notebook first.")
 
 
 def assert_aligned(frames: Dict[str, Any]) -> str:

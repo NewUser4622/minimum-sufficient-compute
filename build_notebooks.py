@@ -725,6 +725,13 @@ def nb03():
 
         {HEADER_NOTE}
 
+        ## Prerequisites
+
+        **NB01 and NB02 must both be finished** for all four Phase 0 runs.
+        NB01 trains; NB02 produces the per-sample tables every statistic here
+        reads. Step 1 checks and stops with a clear message if anything is
+        missing.
+
         ## This is the most important notebook in the project
 
         It answers: **is there a project here?**
@@ -773,8 +780,15 @@ import pandas as pd, numpy as np, matplotlib.pyplot as plt
 
 A1, A2 = 'p0-resnet32x4-cifar100-base-s1', 'p0-resnet32x4-cifar100-base-s2'
 B1, B2 = 'p0-wrn_40_2-cifar100-base-s1',   'p0-wrn_40_2-cifar100-base-s2'
+PHASE0_RUNS = [A1, A2, B1, B2]
+
+# Stop here, with a readable explanation, if the measurement step has not run.
+# Every statistic below reads the per-sample tables, and a missing one would
+# otherwise surface as a FileNotFoundError six frames deep inside a correlation.
+msc.require_inputs(sess.data_dir, PHASE0_RUNS)
+
 bud_a, bud_b = sess.budgets('resnet32x4'), sess.budgets('wrn_40_2')
-print('ready')
+print('inputs present -- proceeding')
 """),
         md("""
         ## Step 2 — Q1: the noise ceiling
@@ -1252,10 +1266,26 @@ inv = pd.DataFrame([{'run_id': k, 'arch': v['arch'], 'family': v['family'],
                      'order': v['sample_order_hash'][:10]} for k, v in runs.items()])
 if len(inv):
     inv = inv.sort_values(['family', 'arch', 'seed'])
-display(inv)
-print(f"\\n{len(runs)} measured models   "
-      f"{inv.order.nunique() if len(inv) else 0} distinct image orderings "
-      f"(must be 1)")
+    display(inv)
+    print(f"\\n{len(runs)} measured models   "
+          f"{inv.order.nunique()} distinct image orderings (must be 1)")
+else:
+    # Not an error -- it means the measurement notebook has not run yet on any
+    # model this account can see.
+    trained = [d.name for d in sorted(sess.runs_dir.iterdir())
+               if (d / 'summary.json').exists()] if sess.runs_dir.exists() else []
+    print('No measured models found.')
+    print()
+    if trained:
+        print(f'{len(trained)} run(s) have finished TRAINING but not MEASUREMENT:')
+        for t in trained[:10]:
+            print(f'  {t}')
+        print()
+        print('-> Run NB02 (Phase 0) or NB08 (atlas) to produce the per-sample')
+        print('   tables, then re-run this notebook.')
+    else:
+        print('-> No completed runs at all. Run sess.sync_state(), or finish')
+        print('   the training notebooks first.')
 """
 
 
