@@ -637,25 +637,46 @@ def nb02():
         md("""
         ## Step 4 — Measure
 
-        ~30 minutes per model. Downloads each trained model from HuggingFace as
-        it needs it, measures, uploads the tables, deletes the local copy, moves
-        on — so the 20 GB disk never holds more than one model's worth.
+        **~30 minutes per model.** Downloads each trained model from HuggingFace
+        as it needs it, measures, uploads the tables, moves on.
 
-        Already measured? It skips instantly. Safe to re-run.
+        > **If this cell finishes in under a minute, it did nothing.** The
+        > printed status table before and after tells you directly. A genuine
+        > run prints exit-head training progress and a sweep progress bar per
+        > model.
+
+        Already measured? It skips instantly — that is the one legitimate way
+        this is fast. Safe to re-run.
         """),
         code("""\
 cfgs = [sess.config(a, seed=s) for a in ('resnet32x4', 'wrn_40_2') for s in (1, 2)]
 
-# Only measure models that actually finished training.
-done = {r for r, st in sess.registry.latest().items() if st.get('state') == 'completed'}
-ready = [c for c in cfgs if c['run_id'] in done]
-missing = [c['run_id'] for c in cfgs if c['run_id'] not in done]
+# Only measure models that actually finished TRAINING.
+ready   = [c for c in cfgs if sess.trained(c['run_id'])]
+missing = [c['run_id'] for c in cfgs if not sess.trained(c['run_id'])]
 if missing:
-    print(f'Not yet trained (run NB01 first): {missing}\\n')
+    print(f'Not yet trained (run NB01 first): {missing}')
+    print()
 
-results = sess.run_all(ready, fn=sess.oracle, title='Phase 0 measurement')
+# State BEFORE we start, so it is obvious whether this cell had work to do.
+print('measurement status before this run:')
+for c in cfgs:
+    print(f"  {c['run_id']:34s} trained={sess.trained(c['run_id'])!s:5s} "
+          f"measured={sess.measured(c['run_id'])}")
+print()
+
+# stage='measure' matters. The ledger already says 'completed' for every run --
+# training set that. Without a measurement-specific completion test, this cell
+# plans zero work and exits in seconds looking like a success.
+results = sess.run_all(ready, fn=sess.oracle, title='Phase 0 measurement',
+                       done_fn=sess.measured, stage='measure')
 for r in results:
     print(f"{r.get('run_id')}: {r.get('status')}")
+
+print()
+print('measurement status after:')
+for c in cfgs:
+    print(f"  {c['run_id']:34s} measured={sess.measured(c['run_id'])}")
 """),
         md("""
         ## Step 5 — Are the tables lined up?
@@ -1177,9 +1198,15 @@ for r in ready:
     c['run_id'] = r['run_id']
     cfgs.append(c)
 
-results = sess.run_all(cfgs, fn=sess.oracle, title='atlas measurement')
+# stage='measure': the ledger says 'completed' because TRAINING finished, so
+# completion for this stage is decided by whether the per-sample tables exist.
+results = sess.run_all(cfgs, fn=sess.oracle, title='atlas measurement',
+                       done_fn=sess.measured, stage='measure')
 for x in results:
     print(f"{x.get('run_id')}: {x.get('status')}")
+
+n_done = sum(1 for c in cfgs if sess.measured(c['run_id']))
+print(f'\\n{n_done}/{len(cfgs)} of this account\\'s runs now measured')
 """),
         md("""
         ## Step 6 — Row-alignment audit

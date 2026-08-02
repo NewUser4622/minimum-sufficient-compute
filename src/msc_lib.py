@@ -1501,6 +1501,7 @@ class WorkerPlan:
     stolen: List[str] = field(default_factory=list)
     in_progress_elsewhere: List[str] = field(default_factory=list)
     mode: str = "cost"
+    stage: str = "train"
     est_cost: float = 0.0
 
     @property
@@ -1511,12 +1512,13 @@ class WorkerPlan:
     def describe(self, title: str = "work plan") -> None:
         print(f"\n{'='*74}")
         print(f"  {title}   worker {self.worker_id} of {self.num_workers}"
-              f"   (split mode: {self.mode})")
+              f"   (stage: {self.stage}, split: {self.mode})")
         print(f"{'='*74}")
         print(f"  universe (all runs in this phase) : {len(self.universe)}")
         print(f"  my slice                          : {len(self.mine)}"
               f"   (~{self.est_cost * 5.0 / 3600.0:.1f} GPU-h estimated)")
-        print(f"  already finished (GLOBAL, from HF): {len(self.done)}")
+        print(f"  already finished (GLOBAL, from HF): {len(self.done)}"
+              f"   <- for the '{self.stage}' stage")
         print(f"  MY REMAINING WORK                 : {len(self.todo)}")
         if self.in_progress_elsewhere:
             print(f"  live on another worker (skipped)  : {len(self.in_progress_elsewhere)}")
@@ -1542,7 +1544,9 @@ def plan_work(run_ids: Sequence[str], registry: "RunRegistry",
               worker_id: int = 0, num_workers: int = 1,
               steal_stale: bool = True, mode: str = "cost",
               costs: Optional[Dict[str, float]] = None,
-              done_states: Sequence[str] = ("completed",)) -> WorkerPlan:
+              done_states: Sequence[str] = ("completed",),
+              done_fn: Optional[Callable[[str], bool]] = None,
+              stage: str = "train") -> WorkerPlan:
     """Build this worker's plan. Call it right before the training loop.
 
     `steal_stale=True` means: after my own slice is exhausted, also pick up runs
@@ -1563,8 +1567,26 @@ def plan_work(run_ids: Sequence[str], registry: "RunRegistry",
     universe = list(run_ids)
     owner = assign_workers(universe, num_workers, mode=mode, costs=costs)
     mine = [r for r in universe if owner.get(r) == worker_id]
-    done = {r for r in universe
-            if latest.get(r, {}).get("state") in done_states}
+
+    # WHAT COUNTS AS DONE DEPENDS ON THE STAGE.
+    #
+    # A run passes through several stages -- train, then measure, then method --
+    # but the ledger carries one state per run. Asking "is state == completed?"
+    # from the measurement notebook therefore returns True because TRAINING
+    # completed, and the measurement stage plans zero work and exits in seconds
+    # looking like a success. That is exactly what happened on the first real
+    # Phase 0 run.
+    #
+    # So the caller supplies a predicate for its own stage. The training stage
+    # uses ledger state; the measurement stage asks whether the per-sample
+    # tables actually exist, which is both stage-correct and robust to a lost
+    # ledger event -- the same "trust the artifacts, not the status file"
+    # principle used when repairing progress on resume.
+    if done_fn is not None:
+        done = {r for r in universe if done_fn(r)}
+    else:
+        done = {r for r in universe
+                if latest.get(r, {}).get("state") in done_states}
     todo = [r for r in mine if r not in done]
 
     stolen, live_elsewhere = [], []
@@ -1584,6 +1606,7 @@ def plan_work(run_ids: Sequence[str], registry: "RunRegistry",
     p = WorkerPlan(worker_id=worker_id, num_workers=num_workers,
                    universe=universe, mine=mine, done=done, todo=todo,
                    stolen=stolen, in_progress_elsewhere=live_elsewhere)
+    p.stage = stage
     p.mode = mode
     p.est_cost = sum(estimate_run_cost(r, costs=costs) for r in mine)
     return p
@@ -6654,9 +6677,27 @@ class Session:
         return repaired
 
     # ------------------------------------------------------------------
+    def measured(self, run_id: str, split: str = "test") -> bool:
+        """Has the ORACLE SWEEP produced this run's per-sample tables?
+
+        The stage-completion predicate for measurement. Checks the artifact
+        rather than the ledger, because the ledger's single `state` field is
+        already "completed" from training.
+        """
+        ps = run_layout(self.work, run_id)["per_sample"]
+        return any((ps / f"{split}.{e}").exists() for e in ("parquet", "csv"))
+
+    def trained(self, run_id: str) -> bool:
+        """Has TRAINING finished for this run?"""
+        st = self.registry.latest().get(run_id, {})
+        return (st.get("state") == "completed"
+                or (run_layout(self.work, run_id)["base"] / "summary.json").exists())
+
     def plan(self, run_ids: Sequence[str], steal_stale: bool = True,
              describe: bool = True, title: str = "work plan",
-             mode: Optional[str] = None) -> WorkerPlan:
+             mode: Optional[str] = None,
+             done_fn: Optional[Callable[[str], bool]] = None,
+             stage: str = "train") -> WorkerPlan:
         """This worker's slice of the given runs. See section 4b.
 
         Uses measured per-epoch times from any runs already finished, falling
@@ -6673,7 +6714,8 @@ class Session:
                 "PLAN")
         p = plan_work(run_ids, self.registry, worker_id=self.worker_id,
                       num_workers=self.num_workers, steal_stale=steal_stale,
-                      mode=mode or self.shard_mode, costs=costs)
+                      mode=mode or self.shard_mode, costs=costs,
+                      done_fn=done_fn, stage=stage)
         if describe:
             p.describe(title)
         fn = f"registry/plans/{self.account}_w{self.worker_id}of{self.num_workers}_{self.phase}.json"
@@ -6686,7 +6728,8 @@ class Session:
 
     def run_all(self, cfgs: Sequence[Dict[str, Any]], fn: Optional[Callable] = None,
                 steal_stale: bool = True, title: str = "work plan",
-                **kw) -> List[Dict[str, Any]]:
+                done_fn: Optional[Callable[[str], bool]] = None,
+                stage: str = "train", **kw) -> List[Dict[str, Any]]:
         """Plan, then execute this worker's share, stopping cleanly at the
         session limit.
 
@@ -6696,8 +6739,28 @@ class Session:
         notebook out of fourteen.
         """
         fn = fn or self.train
+        # Infer the stage from the entry point, so a caller cannot forget it and
+        # silently get the training stage's notion of "done".
+        if done_fn is None and fn is getattr(self, "oracle", None):
+            done_fn, stage = self.measured, "measure"
         by_id = {c["run_id"]: c for c in cfgs}
-        plan = self.plan(list(by_id), steal_stale=steal_stale, title=title)
+        plan = self.plan(list(by_id), steal_stale=steal_stale, title=title,
+                         done_fn=done_fn, stage=stage)
+
+        if not plan.work:
+            # Zero work is normal when the stage really is finished, and a bug
+            # when it is not. Distinguish, loudly -- a stage that exits in
+            # seconds looking like a success is the worst possible outcome.
+            unfinished = [r for r in plan.mine
+                          if done_fn is not None and not done_fn(r)]
+            if unfinished:
+                log(f"NOTHING PLANNED, but {len(unfinished)} of this worker's "
+                    f"runs are not finished for stage '{stage}': "
+                    f"{unfinished[:4]}. This is a bug, not an idle worker.",
+                    "ALARM")
+            else:
+                log(f"nothing to do -- stage '{stage}' is complete for this "
+                    f"worker's {len(plan.mine)} run(s)", "PLAN")
         out: List[Dict[str, Any]] = []
         for i, rid in enumerate(plan.work, 1):
             print(f"\n{'='*74}\n>>> [{i}/{len(plan.work)}] {rid}\n{'='*74}")
@@ -7551,6 +7614,39 @@ def _selftest() -> bool:
     check("overconfidence gap is positive when overconfident",
           cw["overconfidence_gap"] > 0.9, f"{cw['overconfidence_gap']:.3f}")
     check("reliability bins are returned", len(cm["bins"]) == 15)
+
+    print("stage-aware completion")
+    # Reproduces the live failure: four runs finished TRAINING, so the ledger
+    # says 'completed'. The MEASUREMENT stage then planned zero work and exited
+    # in 30 seconds looking like a success.
+    shutil.rmtree(tmp / "stage", ignore_errors=True)
+    hub_s = MSCHub(enable=False)
+    regs = RunRegistry(hub_s, tmp / "stage", account="acct1", worker_id=0)
+    runs4 = [f"p0-{a}-cifar100-base-s{sd}"
+             for a in ("resnet32x4", "wrn_40_2") for sd in (1, 2)]
+    for r in runs4:
+        regs.append(r, "completed", best_accuracy=0.79)
+
+    p_train = plan_work(runs4, regs, 0, 1, stage="train")
+    check("training stage sees its work as finished", p_train.todo == [],
+          "correct -- training really is done")
+
+    measured_none = lambda r: False        # no per-sample tables written yet
+    p_meas = plan_work(runs4, regs, 0, 1, done_fn=measured_none, stage="measure")
+    check("MEASUREMENT stage still has all 4 runs to do",
+          sorted(p_meas.todo) == sorted(runs4),
+          f"{len(p_meas.todo)} planned (was 0 before the fix)")
+    check("plan records which stage it is for", p_meas.stage == "measure")
+
+    measured_two = lambda r: r in runs4[:2]
+    p_part = plan_work(runs4, regs, 0, 1, done_fn=measured_two, stage="measure")
+    check("partially measured -> only the remainder is planned",
+          sorted(p_part.todo) == sorted(runs4[2:]), str(p_part.todo))
+
+    p_all = plan_work(runs4, regs, 0, 1, done_fn=lambda r: True, stage="measure")
+    check("fully measured -> nothing planned", p_all.todo == [])
+    check("done set reflects the stage predicate, not ledger state",
+          len(p_meas.done) == 0 and len(p_all.done) == 4)
 
     print("epoch telemetry")
     t = EpochTelemetry()
