@@ -3292,6 +3292,44 @@ def make_run_id(phase: str, arch: str, dataset: str, method: str, seed: int) -> 
     return f"{safe(phase)}-{safe(arch)}-{safe(dataset)}-{safe(method)}-s{int(seed)}"
 
 
+def parse_run_id(run_id: str) -> Dict[str, Any]:
+    """Recover a run's identity from its id, which is authoritative by design.
+
+        {phase}-{arch}-{dataset}-{method}-s{seed}
+
+    Use this rather than reading `arch`/`seed` out of ledger events. Not every
+    event carries every field -- `repair_ledger`, for instance, reconstructs a
+    completion from history.csv and knows the run_id but not the architecture.
+    Trusting the ledger for metadata therefore yields None where the id has the
+    answer sitting in plain text. That is what broke NB08 (defect D-13).
+
+    The run_id format exists precisely so that identity never needs a lookup.
+    """
+    parts = str(run_id).split("-")
+    out: Dict[str, Any] = {"run_id": run_id, "phase": None, "arch": None,
+                           "dataset": None, "method": None, "seed": None}
+    if len(parts) < 5:
+        return out
+    out["phase"] = parts[0]
+    out["arch"] = parts[1]
+    out["dataset"] = parts[2]
+    out["method"] = "-".join(parts[3:-1])
+    tail = parts[-1]
+    if tail.startswith("s") and tail[1:].isdigit():
+        out["seed"] = int(tail[1:])
+    out["family"] = ZOO.get(out["arch"], {}).get("family")
+    return out
+
+
+def run_meta(run_id: str, ledger_entry: Optional[Dict[str, Any]] = None
+             ) -> Dict[str, Any]:
+    """Identity from the run_id, enriched with whatever the ledger happens to
+    carry. The id always wins for the fields it defines."""
+    meta = dict(ledger_entry or {})
+    meta.update({k: v for k, v in parse_run_id(run_id).items() if v is not None})
+    return meta
+
+
 def base_config(arch: str, dataset: str = "cifar100", seed: int = 1,
                 phase: str = "p1", method: str = "base", **overrides) -> Dict[str, Any]:
     """Standard CRD/DKD recipe for CNNs, DeiT-style recipe for token models.
@@ -6741,9 +6779,12 @@ class Session:
             done = (summ.get("status") == "completed"
                     and planned > 0 and (last_ep + 1) >= 0.9 * planned)
             cur = known.get(rd.name, {})
+            ident = parse_run_id(rd.name)
             if done and cur.get("state") != "completed":
                 self.registry.append(rd.name, "completed", best_accuracy=best,
-                                     num_epochs_run=last_ep + 1, repaired=True)
+                                     num_epochs_run=last_ep + 1, repaired=True,
+                                     arch=ident["arch"], seed=ident["seed"],
+                                     dataset=ident["dataset"], phase=ident["phase"])
                 repaired += 1
             elif (not done) and cur.get("state") == "completed":
                 log(f"broken stub: {rd.name} marked completed at only "
@@ -6751,7 +6792,9 @@ class Session:
                     "REPAIR")
                 self.registry.append(rd.name, "paused", best_accuracy=best,
                                      last_completed_epoch=last_ep,
-                                     demoted_broken_stub=True)
+                                     demoted_broken_stub=True,
+                                     arch=ident["arch"], seed=ident["seed"],
+                                     dataset=ident["dataset"], phase=ident["phase"])
                 repaired += 1
         return repaired
 
@@ -6914,6 +6957,29 @@ class Session:
 
     def status(self) -> "Any":
         return self.registry.summary()
+
+    def completed_runs(self, phase: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Every completed run with its identity resolved from the run_id.
+
+        The entry point every downstream notebook should use. Identity comes
+        from `parse_run_id`, so a ledger event written without `arch`/`seed`
+        (as `repair_ledger` does) cannot produce a None where a value is needed.
+        """
+        out = []
+        for rid, st in sorted(self.registry.latest().items()):
+            if st.get("state") != "completed":
+                continue
+            if phase and not rid.startswith(f"{phase}-"):
+                continue
+            m = run_meta(rid, st)
+            if m.get("arch") is None or m.get("seed") is None:
+                log(f"cannot parse identity from run_id '{rid}' -- skipping", "WARN")
+                continue
+            out.append({"run_id": rid, "arch": m["arch"], "seed": int(m["seed"]),
+                        "dataset": m.get("dataset"), "family": m.get("family"),
+                        "accuracy": st.get("best_accuracy"),
+                        "measured": self.measured(rid)})
+        return out
 
     def audit_repos(self, expected_run_ids: Optional[Sequence[str]] = None,
                     verbose: bool = True) -> Dict[str, Any]:
@@ -7708,6 +7774,37 @@ def _selftest() -> bool:
     check("overconfidence gap is positive when overconfident",
           cw["overconfidence_gap"] > 0.9, f"{cw['overconfidence_gap']:.3f}")
     check("reliability bins are returned", len(cm["bins"]) == 15)
+
+    print("run identity comes from the run_id, not the ledger")
+    m = parse_run_id("p1-resnet32x4-cifar100-base-s3")
+    check("parses phase/arch/dataset/method/seed",
+          (m["phase"], m["arch"], m["dataset"], m["method"], m["seed"])
+          == ("p1", "resnet32x4", "cifar100", "base", 3), str(m))
+    check("resolves family from the zoo", m["family"] == "resnet")
+    m2 = parse_run_id("p3-resnet8x4-cifar100-mscKD-from-resnet32x4-s2")
+    check("handles a hyphenated method",
+          m2["arch"] == "resnet8x4" and m2["seed"] == 2
+          and m2["method"] == "mscKD-from-resnet32x4", str(m2))
+    check("malformed id returns None rather than raising",
+          parse_run_id("nonsense")["arch"] is None)
+
+    # Reproduces D-13 exactly: repair_ledger writes a completion knowing only
+    # the run_id, so the event has no arch/seed. Reading them from the ledger
+    # gives None and int(None) raises.
+    ev = {"run_id": "p1-resnet8x4-cifar100-base-s1", "state": "completed",
+          "best_accuracy": 0.7335, "repaired": True}
+    check("a repaired event genuinely lacks arch/seed",
+          ev.get("arch") is None and ev.get("seed") is None)
+    merged = run_meta(ev["run_id"], ev)
+    check("run_meta fills them from the id",
+          merged["arch"] == "resnet8x4" and merged["seed"] == 1)
+    check("and keeps the ledger's own fields",
+          merged["best_accuracy"] == 0.7335 and merged["repaired"] is True)
+    check("int(seed) now works", int(merged["seed"]) == 1)
+    rich = {"run_id": "p1-resnet20-cifar100-base-s2", "arch": "resnet20",
+            "seed": 2, "state": "completed"}
+    check("id and ledger agree when both are present",
+          run_meta(rich["run_id"], rich)["arch"] == "resnet20")
 
     print("assignment stability (the guarantee the whole design rests on)")
     # Reproduces defect D-12. Ownership must not depend on how much of the

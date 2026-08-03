@@ -1366,14 +1366,16 @@ def nb08():
         """),
         code("""\
 import pandas as pd
-ready = []
-for rid, st in sorted(sess.registry.latest().items()):
-    if st.get('state') == 'completed' and rid.startswith('p1-'):
-        ready.append({'run_id': rid, 'arch': st.get('arch'), 'seed': st.get('seed'),
-                      'accuracy': st.get('best_accuracy')})
+# Identity comes from the run_id, not from ledger fields. Not every event
+# carries arch/seed -- repair_ledger reconstructs a completion from history.csv
+# and knows only the id -- so reading them from the ledger yields None.
+ready = sess.completed_runs(phase='p1')
 rdf = pd.DataFrame(ready)
 display(rdf)
 print(f'\\n{len(ready)} trained models available to measure')
+if len(rdf):
+    print(f"{int(rdf.measured.sum())} already measured, "
+          f"{int((~rdf.measured).sum())} remaining")
 """),
         md("## Step 5 — Measure this worker's share"),
         code("""\
@@ -2243,12 +2245,9 @@ pd.DataFrame([{k: r.get(k) for k in
         """),
         code("""\
 import pandas as pd
-rows = []
-for rid, st in sess.registry.latest().items():
-    if st.get('state') != 'completed' or 'mscKD' not in rid:
-        continue
-    rows.append({'run_id': rid, 'arch': st.get('arch'), 'seed': st.get('seed'),
-                 'scrambled': 'shuf' in rid, 'accuracy': st.get('best_accuracy')})
+rows = [{'run_id': r['run_id'], 'arch': r['arch'], 'seed': r['seed'],
+         'scrambled': 'shuf' in r['run_id'], 'accuracy': r['accuracy']}
+        for r in sess.completed_runs() if 'mscKD' in r['run_id']]
 ab = pd.DataFrame(rows)
 if len(ab) and ab.scrambled.nunique() == 2:
     piv = ab.pivot_table(index=['arch', 'seed'], columns='scrambled',
@@ -2326,10 +2325,9 @@ TEACHER_ARCH = 'resnet32x4'
 TAU = 0.1
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-students = []
-for rid, st in sorted(sess.registry.latest().items()):
-    if st.get('state') == 'completed' and 'mscKD' in rid and 'shuf' not in rid:
-        students.append((rid, st.get('arch'), int(st.get('seed', 1))))
+students = [(r['run_id'], r['arch'], r['seed'])
+            for r in sess.completed_runs()
+            if 'mscKD' in r['run_id'] and 'shuf' not in r['run_id']]
 print(f'{len(students)} trained students to evaluate')
 
 comparisons = []

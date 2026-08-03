@@ -18,13 +18,13 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 
 | | |
 |---|---|
-| **Phase** | 0 complete · Phase 1 **NB04 14/15** (one run at epoch 79/240) |
+| **Phase** | 0 complete · Phase 1: **NB04 14/15 on HF** · NB05–NB07 **not yet on HF** |
 | **Verdict** | `FULL-PROGRAM` (2026-08-02) |
-| **Runs completed** | Phase 0: 4/4 trained, 4/4 measured · NB04: **14/15** trained, 0/15 measured |
+| **Runs completed** | Phase 0: 4/4 trained + measured · NB04: 14/15 trained, **0 measured** · NB05/06/07: 0 on HF |
 | **GPU-hours spent** | ~42 (9.5 Phase 0 + ~32 atlas, incl. 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~120 |
 | **Library version** | `msc_lib` 1.0.0 · 143 offline self-checks |
-| **Defects found** | 12 · all fixed · 1 affects a reported number (D-11) · **1 cost GPU-time (D-12)** |
+| **Defects found** | 13 · all fixed · 1 affects a reported number (D-11) · 1 cost GPU-time (D-12) |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` |
 
 ---
@@ -188,6 +188,30 @@ Used to calibrate the scheduler. See D-10.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-13 · NB08 crashed on `int(None)` — run identity read from the ledger
+**Found** user ran NB08: `TypeError: int() argument must be ... not 'NoneType'`
+at `sess.config(r['arch'], seed=int(r['seed']))`.
+**Cause** NB08 built its work list from ledger events and read `arch`/`seed` out
+of them. Not every event carries those fields: `repair_ledger` reconstructs a
+completion from `history.csv` and knows only the run_id, so it writes
+`{run_id, state, best_accuracy, num_epochs_run, repaired: true}` and nothing
+else. Exactly one such event existed — `p1-resnet8x4-cifar100-base-s1`, written
+by acct4 at 18:06 while recovering from D-12 — and it was enough to stop the
+notebook.
+**The deeper mistake** is treating the ledger as the source of run *metadata*.
+The run_id format `{phase}-{arch}-{dataset}-{method}-s{seed}` exists precisely so
+identity never needs a lookup. It was sitting in plain text in the key.
+**Fix** `parse_run_id()` and `run_meta()` derive identity from the id, which is
+authoritative by construction; ledger fields only enrich. New
+`Session.completed_runs(phase=)` returns fully-resolved rows and is now what
+NB04–NB08, NB13 and NB14 use. `repair_ledger` also writes arch/seed now, but
+nothing depends on that any more.
+**Contamination** none — a crash, and it happened before NB08 measured anything.
+**Lesson** if an identifier encodes the facts, parse the identifier. A lookup
+that *usually* has the field will fail on the one record that does not.
+
+---
 
 ### D-12 · Work assignment drifted between sessions — one run abandoned, one duplicated
 **Found** auditing NB04 on HF: `p1-resnet32x4-cifar100-base-s3` stopped at epoch
@@ -443,6 +467,7 @@ Draft, from the record:
 |---|---|---|---|
 | O-1 | Recompute Q4 on `train_holdout` (D-11) | Q4 number in the paper | **high** |
 | O-1b | **Finish `p1-resnet32x4-cifar100-base-s3`** (epoch 79/240, resumable) | resnet32x4 3rd seed | **high** |
+| O-1c | **Verify NB05/NB06 actually pushed** — no WRN/VGG/Mobile runs on HF as of the last audit | the whole atlas | **high** |
 | O-2 | Run NB05–NB07 atlas training (~64 GPU-h remaining) | Q3 across families | **high** |
 | O-3 | Run NB08 measurement (~27 GPU-h) | Q1–Q4 at scale | high |
 | O-4 | Confirm Q2 non-one-dimensionality across the atlas | §4.2 claim | high |
@@ -457,6 +482,8 @@ Draft, from the record:
 
 | Date | Event |
 |---|---|
+| 2026-08-02 | D-13 found — NB08 crashed on a ledger event lacking arch/seed; identity now parsed from the run_id |
+| 2026-08-02 | **Audit: only NB04 runs are on HF.** No WRN/VGG/Mobile/Modern runs pushed |
 | 2026-08-02 | D-12 found auditing NB04 — assignment drift; ownership now uses a static cost table |
 | 2026-08-02 | **NB04 atlas: 14/15 ResNet runs complete**, all beating published references |
 | 2026-08-02 | **Phase 0 verdict `FULL-PROGRAM`.** All gates cleared at every τ. H2 refuted. |
