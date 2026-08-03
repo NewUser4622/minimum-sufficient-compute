@@ -1505,6 +1505,13 @@ def assign_workers(run_ids: Sequence[str], num_workers: int,
 
     Every worker calls this with identical arguments and reads off its own
     slice. No communication, no locking, no negotiation.
+
+    `costs` MUST be a stable table -- in practice, always leave it None so
+    ARCH_COST_HINT is used. Passing measured timings here makes the assignment
+    depend on how much of the project has finished, which means two sessions of
+    the same worker can disagree about what it owns. Use estimate_phase() if you
+    want time predictions refined by measurements; that is a display concern and
+    has no effect on ownership.
     """
     ids = sorted(run_ids)                       # canonical order on every machine
     n = max(1, int(num_workers))
@@ -6779,14 +6786,29 @@ class Session:
         Records the plan to HF so you can reconstruct, months later, which
         account was responsible for which run.
         """
+        # OWNERSHIP USES THE STATIC COST TABLE ONLY. This is not a detail.
+        #
+        # The whole sharding guarantee is "identical code + identical input =
+        # identical assignment, with no communication". Feeding MEASURED
+        # per-epoch times into the assignment breaks that input-identity: a
+        # worker planning before any run has finished computes a different
+        # packing than one planning after twelve have, so ownership silently
+        # changes between sessions.
+        #
+        # That is exactly what happened on 2026-08-02 (defect D-12): acct4's
+        # first session owned resnet32x4-s3 and its second session did not,
+        # abandoning it at epoch 79 and re-training acct2's resnet32x4-s1
+        # instead. Two runs' worth of damage from a "self-correcting" feature.
+        #
+        # Measured timings are still used -- but only to REPORT time, never to
+        # decide ownership. See estimate_phase().
         measured = estimate_costs_from_history(self.data_dir)
-        costs = {**ARCH_COST_HINT, **measured} if measured else None
         if measured:
-            log(f"cost model refined from {len(measured)} measured architectures",
-                "PLAN")
+            log(f"{len(measured)} architectures have measured timings "
+                f"(used for time estimates only -- ownership is fixed)", "PLAN")
         p = plan_work(run_ids, self.registry, worker_id=self.worker_id,
                       num_workers=self.num_workers, steal_stale=steal_stale,
-                      mode=mode or self.shard_mode, costs=costs,
+                      mode=mode or self.shard_mode, costs=None,
                       done_fn=done_fn, stage=stage)
         if describe:
             p.describe(title)
@@ -7686,6 +7708,45 @@ def _selftest() -> bool:
     check("overconfidence gap is positive when overconfident",
           cw["overconfidence_gap"] > 0.9, f"{cw['overconfidence_gap']:.3f}")
     check("reliability bins are returned", len(cm["bins"]) == 15)
+
+    print("assignment stability (the guarantee the whole design rests on)")
+    # Reproduces defect D-12. Ownership must not depend on how much of the
+    # project has already finished, or two sessions of the same worker disagree
+    # about what they own -- abandoning one run and duplicating another.
+    ids15 = [make_run_id("p1", a, "cifar100", "base", sd)
+             for a in ("resnet20", "resnet56", "resnet110", "resnet8x4", "resnet32x4")
+             for sd in (1, 2, 3)]
+    base_assign = assign_workers(ids15, 4, mode="cost")
+
+    # A "self-correcting" cost table, as it would look part-way through a phase.
+    measured_like = {**ARCH_COST_HINT, "resnet20": 0.9, "resnet56": 2.1,
+                     "resnet110": 4.9, "resnet8x4": 1.4}
+    drifted = assign_workers(ids15, 4, mode="cost", costs=measured_like)
+    check("measured costs WOULD change ownership (why it must not be used)",
+          drifted != base_assign,
+          f"{sum(1 for k in base_assign if drifted[k] != base_assign[k])}"
+          f"/{len(ids15)} runs would move")
+
+    shutil.rmtree(tmp / "stable", ignore_errors=True)
+    hub_st = MSCHub(enable=False)
+    reg_st = RunRegistry(hub_st, tmp / "stable", account="a", worker_id=3)
+    p_early = plan_work(ids15, reg_st, 3, 4, stage="train")
+    for r in ids15[:12]:
+        reg_st.append(r, "completed", best_accuracy=0.75)
+    p_late = plan_work(ids15, reg_st, 3, 4, stage="train")
+    check("a worker's SLICE is identical before and after 12 runs finish",
+          p_early.mine == p_late.mine, f"{p_early.mine} vs {p_late.mine}")
+    check("only the todo list shrinks", set(p_late.todo) < set(p_early.todo)
+          or p_late.todo == p_early.todo)
+
+    all_owned = [r for w in range(4)
+                 for r in plan_work(ids15, reg_st, w, 4, stage="train").mine]
+    check("all four slices still partition the universe exactly",
+          sorted(all_owned) == sorted(ids15) and len(all_owned) == len(set(all_owned)))
+    check("assignment is stable across a fresh registry",
+          plan_work(ids15, RunRegistry(hub_st, tmp / "stable2", account="b",
+                                       worker_id=3), 3, 4, stage="train").mine
+          == p_early.mine)
 
     print("stage-aware completion")
     # Reproduces the live failure: four runs finished TRAINING, so the ledger

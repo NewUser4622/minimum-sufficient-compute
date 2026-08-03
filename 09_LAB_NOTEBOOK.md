@@ -18,13 +18,13 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 
 | | |
 |---|---|
-| **Phase** | 0 complete · Phase 1 atlas next |
+| **Phase** | 0 complete · Phase 1 **NB04 14/15** (one run at epoch 79/240) |
 | **Verdict** | `FULL-PROGRAM` (2026-08-02) |
-| **Runs completed** | 4 / 4 Phase 0 backbones, 4 / 4 measured |
-| **GPU-hours spent** | 9.5 (0.71 kWh, 0.34 kg CO₂) |
-| **GPU-hours remaining** | ~153 |
+| **Runs completed** | Phase 0: 4/4 trained, 4/4 measured · NB04: **14/15** trained, 0/15 measured |
+| **GPU-hours spent** | ~42 (9.5 Phase 0 + ~32 atlas, incl. 2.9 wasted to D-12) |
+| **GPU-hours remaining** | ~120 |
 | **Library version** | `msc_lib` 1.0.0 · 143 offline self-checks |
-| **Defects found** | 11 · all fixed · **1 affects a reported number** (D-11) |
+| **Defects found** | 12 · all fixed · 1 affects a reported number (D-11) · **1 cost GPU-time (D-12)** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` |
 
 ---
@@ -56,6 +56,34 @@ Seed-pair spread: resnet32x4 0.04 pts, wrn-40-2 0.17 pts.
 
 `sample_order_hash = 80031c23f8300724…` identical across all four → per-sample
 tables are index-aligned and may be correlated.
+
+### 1.1b Phase 1 atlas — ResNet family (NB04)
+
+Same recipe. Four Kaggle accounts, workers 0–3, cost-balanced split.
+**14 of 15 complete.** All completed runs beat their published references.
+
+| arch | s1 | s2 | s3 | mean | published | Δ |
+|---|---|---|---|---|---|---|
+| `resnet20` | 70.25 | 70.36 | 69.78 | **70.13** | 69.06 | **+1.07** |
+| `resnet56` | 73.88 | 73.35 | 73.85 | **73.69** | 72.34 | **+1.35** |
+| `resnet110` | 74.31 | 74.57 | 74.26 | **74.38** | 74.31 | **+0.07** |
+| `resnet8x4` | 73.35 | 73.39 | 73.04 | **73.26** | 72.50 | **+0.76** |
+| `resnet32x4` | 79.72 | 80.03 | *incomplete* | **79.88**\* | 79.42 | **+0.46** |
+
+\* two seeds only. `p1-resnet32x4-cifar100-base-s3` stopped at **epoch 79/240**
+(best 64.47% so far), resumable from its checkpoint. See D-12.
+
+Seed spread: resnet20 0.58 pts, resnet56 0.53, resnet110 0.31, resnet8x4 0.35.
+All four share `sample_order_hash = 80031c23…`, matching Phase 0 — the atlas and
+pilot tables are mutually correlatable.
+
+Wall-clock: 11:51 → 20:31 (~8.7 h) across four accounts for ~32 GPU-hours of
+work, of which 2.9 h were wasted re-training a run another account had already
+done (D-12).
+
+*source* `runs/p1-*/summary.json`, `registry/events/*.jsonl`
+
+---
 
 ### 1.2 Q1 — noise ceiling (ρ_seed)
 
@@ -160,6 +188,36 @@ Used to calibrate the scheduler. See D-10.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-12 · Work assignment drifted between sessions — one run abandoned, one duplicated
+**Found** auditing NB04 on HF: `p1-resnet32x4-cifar100-base-s3` stopped at epoch
+79/240 with no completion event, while `p1-resnet32x4-cifar100-base-s1` was
+trained **twice** — by acct2 (79.72%) and again by acct4 (79.54%).
+**Cause** *My own feature, working exactly as written and being wrong anyway.*
+`Session.plan()` called `estimate_costs_from_history()` and merged measured
+per-epoch times into the cost table **used for the assignment**. The whole
+sharding guarantee is "identical code + identical input → identical ownership,
+with no communication". Measured timings are not identical input: they change as
+runs finish. acct4's first session (11:51, nothing finished) computed a different
+packing than its second (18:06, twelve runs finished), so it stopped owning
+resnet32x4-s3 and started owning acct2's resnet32x4-s1.
+**Cost** 2.9 GPU-hours wasted, one run left at epoch 79, and the "no overlap, no
+gaps" property silently violated. A self-test now shows **4 of 15 runs move**
+when the cost table drifts.
+**Fix** ownership uses `ARCH_COST_HINT` **only**, always. Measured timings still
+refine *displayed* estimates via `estimate_phase()`, which has no effect on who
+owns what. `assign_workers` documents that `costs` must be a stable table.
+Self-test asserts a worker's slice is identical before and after 12 runs finish,
+and that all slices still partition the universe.
+**Contamination** none — every *completed* run is valid and trained under the
+correct config. Two independent trainings of resnet32x4-s1 agreeing to 0.18 pts
+is incidental evidence that training is reproducible. Only wasted time and one
+unfinished run.
+**Lesson** an optimisation that improves an *estimate* must never be allowed to
+change a *decision* that had to be deterministic. Feeding measurement back into
+allocation broke the one property the design existed to provide.
+
+---
 
 ### D-11 · Q4 ran with 5 of 7 difficulty scores
 **Found** reading the Phase 0 output (`battery` column listed five names).
@@ -323,6 +381,7 @@ termination at 1.0. Cross-architecture comparison is unaffected: MSC is a cost
 | DC-7 | `NUM_WORKERS` default | 6 | **1** | Splitting across accounts is an optimisation, not a prerequisite. Defaulting to it made the simple case look complicated. |
 | DC-8 | Q4 split | test | **train_holdout** | Only that split carries all seven battery scores (D-11). |
 | DC-9 | Deleted loss terms | Omitted | **Columns present, value `NA`** | Uniform schema; enabling a term later needs no migration. Fabricating a number for a loss the model never computed would be worse. Protocol's 3-term objective intact. |
+| DC-11 | Cost model in assignment | Refined by measured timings | **Static table only** | Measured costs change as runs finish, so ownership stopped being stable (D-12). Estimates still use measurements; allocation must not. |
 | DC-10 | Telemetry breadth | 22 columns/epoch | **171** + 91 final | "We only train once." Re-running the atlas to recover a forgotten metric is unrecoverable time. |
 
 ---
@@ -383,7 +442,8 @@ Draft, from the record:
 | | Item | Blocks | Priority |
 |---|---|---|---|
 | O-1 | Recompute Q4 on `train_holdout` (D-11) | Q4 number in the paper | **high** |
-| O-2 | Run NB04–NB07 atlas training (~89 GPU-h) | Q3 across families | **high** |
+| O-1b | **Finish `p1-resnet32x4-cifar100-base-s3`** (epoch 79/240, resumable) | resnet32x4 3rd seed | **high** |
+| O-2 | Run NB05–NB07 atlas training (~64 GPU-h remaining) | Q3 across families | **high** |
 | O-3 | Run NB08 measurement (~27 GPU-h) | Q1–Q4 at scale | high |
 | O-4 | Confirm Q2 non-one-dimensionality across the atlas | §4.2 claim | high |
 | O-5 | Read SAFE-KD (2602.03043); write the differentiation memo | Related work | **high, not started** |
@@ -397,6 +457,8 @@ Draft, from the record:
 
 | Date | Event |
 |---|---|
+| 2026-08-02 | D-12 found auditing NB04 — assignment drift; ownership now uses a static cost table |
+| 2026-08-02 | **NB04 atlas: 14/15 ResNet runs complete**, all beating published references |
 | 2026-08-02 | **Phase 0 verdict `FULL-PROGRAM`.** All gates cleared at every τ. H2 refuted. |
 | 2026-08-02 | D-11 found reading the Q4 output; Q4 default moved to `train_holdout` |
 | 2026-08-02 | Phase 0 measurement (NB02) completed for all four runs |

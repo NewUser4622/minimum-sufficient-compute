@@ -325,7 +325,10 @@ underestimate. Two measured runs were enough to fix both the scale and the
 ratio, after which predictions matched actuals to within 0.01 h. If you are
 going to print "this will take N hours" anywhere, anchor N on a measurement.
 
-**Make it self-correcting.** Seed with rough estimates, then replace them with measured per-unit times once any run has finished:
+**Make the DISPLAY self-correcting, never the assignment.** Replacing estimates
+with measured times is worth doing — but only for what you print. If measured
+values reach the packing function, ownership changes as the project progresses
+and workers disagree about what they own (Bug 7). Keep two paths:
 
 ```python
 measured = estimate_costs_from_history(data_dir)   # median sec/epoch per arch
@@ -649,6 +652,17 @@ Every one of these was found by running the thing, not by reading the code.
 **Cause:** ViT positional embeddings are sized for one grid; MLP-Mixer's token-mixing layer *is* sized to the token count.
 **Fix:** interpolate where principled (ViT); declare unsupported and fall back where not (Mixer), recording the limitation in the artifact.
 **Lesson:** when one member of a family can't do something, uniform treatment across the whole family beats a better measurement on all but one.
+
+### Bug 7 — measurement fed back into allocation
+**Symptom:** one job abandoned mid-run, another trained twice by two workers.
+**Cause:** the scheduler refined its cost table from measured runtimes, so a
+worker planning before anything finished computed a different assignment than
+one planning later. "Identical input" quietly stopped being identical.
+**Fix:** ownership uses a static cost table, always. Measurements refine
+displayed estimates only.
+**Lesson:** **an optimisation that improves an estimate must never change a
+decision that had to be deterministic.** If you add adaptivity anywhere near
+allocation, add a test that the assignment is invariant to it.
 
 ### Bug 6 — a test that validated nothing
 **Symptom:** resume test "failed" — but it had never exercised resume.

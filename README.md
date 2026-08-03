@@ -33,6 +33,19 @@ and resolution correlate at 0.38, precision is nearly independent at ~0.23. That
 is a result in its own right, and it says results on depth-based early exit do
 not license claims about the other axes.
 
+### Phase 1 in progress — NB04 (ResNets) 14/15
+
+| arch | mean top-1 | published | Δ |
+|---|---|---|---|
+| `resnet20` | 70.13 | 69.06 | +1.07 |
+| `resnet56` | 73.69 | 72.34 | +1.35 |
+| `resnet110` | 74.38 | 74.31 | +0.07 |
+| `resnet8x4` | 73.26 | 72.50 | +0.76 |
+| `resnet32x4` | 79.88 (2 seeds) | 79.42 | +0.46 |
+
+One run (`resnet32x4` seed 3) stopped at epoch 79/240 and is resumable — see
+defect D-12 in the lab notebook.
+
 Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md)**.
 
 ---
