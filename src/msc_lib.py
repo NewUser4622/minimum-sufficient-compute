@@ -4359,6 +4359,97 @@ def save_checkpoint(path, cfg, model, optimizer, scheduler, scaler, epoch: int,
     })
 
 
+def ensure_run_local(hub, work, run_id: str, why: str = "") -> bool:
+    """Pull a run's own artifacts back from HF before concluding it never ran.
+
+    **D-19.** `load_checkpoint` returns "start from scratch" when the file is
+    merely absent. That is correct in isolation and catastrophic in context:
+    Kaggle wipes the scratch disk between sessions, so on a fresh session
+    *every* run looks unstarted unless something pulled it back first.
+
+    `run_oracle` already did this for itself. Neither training entry point did,
+    so both depended entirely on the notebook having called `sync_state` with
+    the right scope beforehand -- an invisible coupling between a cell near the
+    top of a notebook and a decision taken deep inside the library. When that
+    coupling broke for NB13, nine completed MSC-KD runs restarted at epoch 0
+    and nothing said a word.
+
+    Cheap when the checkpoint is already local, which is the common case within
+    a session. Returns True if a resumable checkpoint is present afterwards.
+    """
+    L = run_layout(work, run_id)
+    ck = L["checkpoints"] / "ckpt_last.pt"
+    if ck.exists():
+        return True
+    if hub is None or not getattr(hub, "enabled", False):
+        return False
+    log(f"no local checkpoint for {run_id} -- pulling from HF before deciding "
+        f"whether it has already run" + (f" ({why})" if why else ""), "RESUME")
+    try:
+        hub.hub.download(Path(work), allow_patterns=[f"runs/{run_id}/**"],
+                         quiet=True)
+    except Exception as e:                                   # noqa: BLE001
+        log(f"pull failed for {run_id}: {type(e).__name__}: {e}", "RESUME")
+        return False
+    if ck.exists():
+        log(f"recovered checkpoint for {run_id} from HF", "RESUME")
+        return True
+    if (L["base"] / "summary.json").exists():
+        log(f"{run_id} has a summary.json on HF but no ckpt_last.pt -- it "
+            f"finished and its checkpoint was pruned. Nothing to resume.",
+            "RESUME")
+    return False
+
+
+def already_finished(hub, work, run_id: str, cfg: Dict[str, Any],
+                     registry=None) -> Optional[Dict[str, Any]]:
+    """Has this run already finished, on the evidence of its own artifacts?
+
+    **D-19.** `can_claim` consults the ledger and nothing else, so a lost or
+    unpushed completion event is indistinguishable from "never ran" -- and the
+    programmed response to "never ran" is to spend the GPU-hours again. The
+    run's `summary.json` is durable evidence and lives on HF whether or not the
+    ledger event survived the session.
+
+    `run_oracle` has always had this guard (`per-sample tables already present`).
+    The two *training* entry points did not, which is why a lost ledger could
+    cost 30 GPU-hours rather than 30 seconds.
+
+    Self-healing: when the artifact says finished but the ledger disagrees, the
+    completion event is re-emitted so the next worker inherits the answer
+    instead of rediscovering it.
+    """
+    if cfg.get("force_rerun"):
+        return None
+    ensure_run_local(hub, work, run_id, why="completion check")
+    p = run_layout(work, run_id)["base"] / "summary.json"
+    if not p.exists():
+        return None
+    prev = read_json(p, default=None)
+    if not isinstance(prev, dict):
+        return None
+    ran = int(prev.get("num_epochs_run") or 0)
+    want = int(cfg.get("num_epochs") or 0)
+    if ran < want:
+        return None
+    log(f"{run_id} already finished: {ran}/{want} epochs, "
+        f"acc={prev.get('best_accuracy')}. NOT retraining -- pass "
+        f"force_rerun=True to override.", "DONE")
+    if registry is not None:
+        try:
+            st = registry.latest().get(run_id, {}).get("state")
+            if st != "completed":
+                log(f"ledger said '{st}' but the artifact says finished -- "
+                    f"repairing the ledger", "DONE")
+                registry.finish(run_id, **{k: prev[k] for k in
+                                           ("best_accuracy", "num_epochs_run",
+                                            "final_accuracy")
+                                           if k in prev})
+        except Exception as e:                               # noqa: BLE001
+            log(f"ledger repair skipped: {type(e).__name__}: {e}", "DONE")
+    return {**prev, "status": "cached"}
+
+
 def load_checkpoint(path, cfg, model, optimizer, scheduler, scaler,
                     dynamics: Optional[TrainingDynamics], device,
                     strict_hash: bool = True) -> Dict[str, Any]:
@@ -4473,6 +4564,12 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
         return {"run_id": run_id, "status": "skipped", "reason": why}
     log(f"claiming {run_id} ({why})", "CLAIM")
 
+    # D-19: the ledger is not the only evidence. Check the artifact before
+    # spending the GPU-hours again.
+    _cached = already_finished(hub, work, run_id, cfg, registry)
+    if _cached is not None:
+        return _cached
+
     if cfg.get("force_rerun") and run_dir.exists():
         log(f"force_rerun -- wiping {run_dir}", "RUN")
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -4508,6 +4605,10 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     dynamics = TrainingDynamics(n_train, el2n_epoch=int(cfg.get("el2n_epoch", 10)))
 
     # --- resume ----------------------------------------------------------
+    # D-19: pull this run's own artifacts first. Without it, resume silently
+    # depends on the notebook having called sync_state with checkpoints in
+    # scope, and a fresh Kaggle session makes every run look unstarted.
+    ensure_run_local(hub, work, run_id, why="backbone resume")
     st = load_checkpoint(ckpt_last, cfg, model, optimizer, scheduler, scaler,
                          dynamics, device, strict_hash=not cfg.get("force_rerun"))
     start_epoch = st["start_epoch"]
@@ -6455,6 +6556,13 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
         log(f"SKIP {run_id}: {why}", "CLAIM")
         return {"run_id": run_id, "status": "skipped", "reason": why}
 
+    # D-19: check the artifact BEFORE the teacher sweep, which is the expensive
+    # part of this function -- a full multi-exit pass over 50,000 training
+    # images. Discovering "already done" after paying for that is no use.
+    _cached = already_finished(hub, work, run_id, cfg, registry)
+    if _cached is not None:
+        return _cached
+
     atomic_write_yaml(run_dir / "config.yaml", cfg)
     atomic_write_json(L["env"] / "environment.json", environment_report())
     set_seed(int(cfg["seed"]), deterministic=bool(cfg.get("deterministic", False)))
@@ -6536,6 +6644,9 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
         scaler = torch.cuda.amp.GradScaler(enabled=amp)
     lossfn = MSCLoss(alpha=alpha, beta=beta, temperature=temperature)
 
+    # D-19: recover this run's own checkpoint from HF before load_checkpoint
+    # reads an absent file as "never started".
+    ensure_run_local(hub, work, run_id, why="MSC-KD resume")
     st = load_checkpoint(ckpt_last, cfg, student, optimizer, scheduler, scaler,
                          None, device, strict_hash=not cfg.get("force_rerun"))
     start_epoch, best = st["start_epoch"], st["best_metric"]
@@ -7013,8 +7124,20 @@ class Session:
         fn = fn or self.train
         # Infer the stage from the entry point, so a caller cannot forget it and
         # silently get the training stage's notion of "done".
-        if done_fn is None and fn is getattr(self, "oracle", None):
-            done_fn, stage = self.measured, "measure"
+        #
+        # D-19: this used to be a single `if` naming ONE function, so any custom
+        # entry point -- NB13 passes a closure over train_msc_kd, NB14 likewise
+        # -- fell through with done_fn=None. `plan_work` then falls back to the
+        # raw ledger, which is a SINGLE POINT OF FAILURE: if the completion
+        # events did not survive the session, every finished run looks unstarted
+        # and gets retrained from scratch. `self.trained` checks the ledger OR
+        # the run's summary.json, so a lost ledger event alone cannot cause a
+        # 30-GPU-hour re-run. Default to it for anything that is not the oracle.
+        if done_fn is None:
+            if fn is getattr(self, "oracle", None):
+                done_fn, stage = self.measured, "measure"
+            else:
+                done_fn = self.trained
         by_id = {c["run_id"]: c for c in cfgs}
         plan = self.plan(list(by_id), steal_stale=steal_stale, title=title,
                          done_fn=done_fn, stage=stage)
@@ -7089,6 +7212,47 @@ class Session:
         self._flush_all("notebook complete")
         self.hub.stop(drain=True)
         print(f"[SESSION] done. elapsed {self.guard.elapsed_h:.2f} h")
+
+    def confirm_on_hf(self, run_ids: Sequence[str],
+                      require: Sequence[str] = ("summary.json",),
+                      verbose: bool = True) -> Dict[str, List[str]]:
+        """After `finish()`: is the work actually ON HuggingFace?
+
+        **D-19.** `finish()` drains the upload queue and prints "done", which
+        reads like confirmation and is not one -- draining says the queue
+        emptied, not that the files landed. Someone who closes the tab at that
+        point has no way to tell the difference, and the cost of being wrong is
+        re-running everything.
+
+        This asks the repository. Run it before closing a session; it is the
+        difference between believing the work is safe and knowing it.
+        """
+        ids = list(run_ids)
+        if not self.hub.enabled:
+            if verbose:
+                print("[VERIFY] HF disabled -- cannot confirm anything")
+            return {"ok": [], "missing": [], "unknown": ids}
+        try:
+            have = set(self.hub.hub.list_repo_files())
+        except Exception as e:                               # noqa: BLE001
+            log(f"could not list the repo: {type(e).__name__}: {e}. "
+                f"Treat this as UNCONFIRMED, not as success.", "ALARM")
+            return {"ok": [], "missing": [], "unknown": ids}
+        ok, missing = [], []
+        for r in ids:
+            need = [f"runs/{r}/{x}" for x in require]
+            (ok if all(n in have for n in need) else missing).append(r)
+        if verbose:
+            print(f"\n[VERIFY] {len(ok)}/{len(ids)} run(s) confirmed on HuggingFace")
+            for r in missing:
+                print(f"    NOT ON HF: {r}")
+            if missing:
+                log(f"{len(missing)} run(s) are NOT on HuggingFace. DO NOT close "
+                    f"this session. Re-run sess.finish(), then this cell again. "
+                    f"Closing now means retraining them.", "ALARM")
+            else:
+                print("    All present. Safe to close the session.")
+        return {"ok": ok, "missing": missing, "unknown": []}
 
     def status(self) -> "Any":
         return self.registry.summary()
@@ -8107,6 +8271,48 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-19: artifact-based completion, not ledger-only -------------------
+    import tempfile as _tf
+    _w = Path(_tf.mkdtemp(prefix="msc_d19_"))
+    _rid = "p3-resnet8x4-cifar100-mscKD-from-resnet32x4-s1"
+    _cfg = {"run_id": _rid, "num_epochs": 240}
+    _L = run_layout(_w, _rid)
+    for _s in RUN_SUBDIRS:
+        ensure_dir(_L[_s])
+    ensure_dir(_L["base"])
+
+    check("D-19: no artifacts -> not finished",
+          already_finished(None, _w, _rid, _cfg) is None)
+    check("D-19: no local checkpoint is reported honestly",
+          ensure_run_local(None, _w, _rid) is False)
+
+    atomic_write_json(_L["base"] / "summary.json",
+                      {"run_id": _rid, "num_epochs_run": 79,
+                       "best_accuracy": 0.6447})
+    check("D-19: a PARTIAL run is not treated as finished",
+          already_finished(None, _w, _rid, _cfg) is None,
+          "79/240 epochs must still be resumable, not skipped")
+
+    atomic_write_json(_L["base"] / "summary.json",
+                      {"run_id": _rid, "num_epochs_run": 240,
+                       "best_accuracy": 0.7412})
+    _hit = already_finished(None, _w, _rid, _cfg)
+    check("D-19: a finished run is detected from summary.json alone",
+          isinstance(_hit, dict) and _hit.get("status") == "cached",
+          "this is what stops a lost ledger event costing 30 GPU-hours")
+    check("D-19: and it carries the original metrics forward",
+          _hit.get("best_accuracy") == 0.7412)
+    check("D-19: force_rerun overrides the guard",
+          already_finished(None, _w, _rid, {**_cfg, "force_rerun": True}) is None)
+    check("D-19: a corrupt summary.json does not crash the guard",
+          (_L["base"] / "summary.json").write_text("{not json", encoding="utf-8")
+          is not None and already_finished(None, _w, _rid, _cfg) is None)
+
+    (_L["checkpoints"] / "ckpt_last.pt").write_bytes(b"x")
+    check("D-19: a present checkpoint short-circuits the pull",
+          ensure_run_local(None, _w, _rid) is True)
+    shutil.rmtree(_w, ignore_errors=True)
 
     # --- D-18: representative run selection ---------------------------------
     _runs = {"p1-vgg8-cifar100-base-s2": {"arch": "vgg8", "seed": 2},

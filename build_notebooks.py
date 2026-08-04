@@ -318,6 +318,18 @@ FINISH_CELL = """\
 # === Push everything and stop ==============================================
 # Blocks until HuggingFace confirms. Safe to re-run.
 sess.finish()
+
+# D-19: draining the upload queue is NOT the same as the files being on
+# HuggingFace, and "[SESSION] done" reads like a confirmation it is not.
+# Ask the repository before you close this tab. If anything is listed as
+# NOT ON HF, re-run sess.finish() and this cell again -- closing now means
+# retraining those runs from scratch.
+try:
+    _ids = [c['run_id'] for c in cfgs]
+except NameError:
+    _ids = []
+if _ids:
+    sess.confirm_on_hf(_ids)
 """
 
 

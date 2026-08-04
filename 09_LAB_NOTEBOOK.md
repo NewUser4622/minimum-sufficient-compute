@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **176** offline self-checks |
-| **Defects found** | 18 · 15 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-11 confirmed and corrected: ΔR² was 2.5× too high** |
+| **Library version** | `msc_lib` 1.0.0 · **184** offline self-checks |
+| **Defects found** | 19 · 16 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-19 may have cost up to 30 GPU-h** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `9b18d2b`, 2026-08-04T06:1x Z |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -563,6 +563,112 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-19 · NB13 restarted completed MSC-KD runs from epoch 0 — resume was never wired into the method notebooks
+
+**Severity:** **the worst defect in the project — silently destroys GPU-hours**
+**Status:** fixed in code, HF verification pending · **Found:** 2026-08-04, reported by the user
+
+Nine MSC-KD runs were completed across five accounts. The sessions were closed
+without checking the output. On re-opening NB13 with one worker, **it began
+training from epoch 0.**
+
+**Three independent failures had to line up, and all three did.**
+
+**(1) `run_all` only recognised one entry point.**
+
+```python
+if done_fn is None and fn is getattr(self, "oracle", None):
+    done_fn, stage = self.measured, "measure"
+```
+
+That names a single function by identity. NB13 passes a *closure* over
+`train_msc_kd`, so it falls straight through with `done_fn = None`, and
+`plan_work` then defines "done" as **the ledger and nothing else**:
+
+```python
+done = {r for r in universe if latest.get(r, {}).get("state") in done_states}
+```
+
+`Session.trained()` already existed and does the right thing — ledger **or**
+`summary.json` — and no notebook ever passed it. The D-09 fix was applied to the
+one code path that had failed and never generalised. This is the same defect
+class, one notebook over.
+
+**(2) Nothing pulled the run's own checkpoint back.** `load_checkpoint` returns
+`start_epoch = 0` when the file is absent. Kaggle wipes `/kaggle/temp` between
+sessions, so on a fresh session *every* run's checkpoint is absent. `run_oracle`
+pulled its own run directory before deciding; **neither training entry point
+did.** They relied entirely on the notebook having called `sync_state` with the
+right scope near the top — an invisible coupling between a cell on page one and
+a decision taken deep in the library.
+
+**(3) `can_claim` is ledger-only too.** So a lost completion event meant
+`can_claim` → True, no checkpoint → `start_epoch = 0`, and the run trains again.
+No error, no warning. **It looks exactly like normal work.**
+
+**And the alarm that should have caught it was dead code:**
+
+```python
+unfinished = [r for r in plan.mine if done_fn is not None and not done_fn(r)]
+```
+
+With `done_fn = None`, this list is *always* empty, so the D-09 zero-work ALARM
+could never fire in NB13 — the one notebook where it was most needed.
+
+**Contamination analysis.**
+
+- **No published number is affected.** This destroys compute, not correctness.
+  A re-trained run is a *valid* run; it is just paid for twice.
+- **Nothing is silently corrupted.** If the original nine runs did reach HF,
+  their `summary.json` files are intact and the fix will find them.
+- **The exposure is up to ~30 GPU-hours** (9 MSC-KD runs) if the completed work
+  is not recoverable.
+- **`train_backbone` had the same two holes** and was only saved by NB01 and the
+  atlas notebooks calling `sync_state()` with checkpoints in scope. That is luck,
+  not design — NB13 called `sync_state` too, and it was not enough.
+
+**Why it survived every previous audit.** Five defects in this project have been
+about resume (D-05, D-06, D-09, D-12, and now D-19). The acceptance test from
+D-06 exercises `train_backbone` *within a single session*, where the checkpoint
+is still on local disk. **The failure mode is specifically cross-session**, and
+no test crosses a session boundary. D-06's lesson was "a test that validated
+nothing"; this is its sequel.
+
+**Fix — four changes, all committed.**
+
+1. **`run_all` defaults to `self.trained`** for any non-oracle entry point,
+   instead of falling through to the raw ledger. A lost ledger event alone can
+   no longer cause a re-run, and the zero-work ALARM is live again because
+   `done_fn` is never `None`.
+2. **`ensure_run_local(hub, work, run_id)`** — pulls the run's own artifacts
+   from HF before `load_checkpoint` reads an absent file as "never started".
+   Called from **both** `train_backbone` and `train_msc_kd`. Free when the
+   checkpoint is already local.
+3. **`already_finished(hub, work, run_id, cfg, registry)`** — checks
+   `summary.json` for `num_epochs_run >= num_epochs` and returns the cached
+   result. In `train_msc_kd` this runs **before the teacher sweep**, which is
+   the expensive part; discovering "already done" after paying for a full
+   multi-exit pass over 50,000 images would be no use. It also **repairs the
+   ledger** when the artifact and the ledger disagree, so the next worker
+   inherits the answer.
+4. **`Session.confirm_on_hf(run_ids)`**, now the last cell of every training
+   notebook. `finish()` drains the upload queue and prints `[SESSION] done`,
+   which *reads* like confirmation and is not one — draining says the queue
+   emptied, not that the files landed. The new cell asks the repository and
+   prints `NOT ON HF` per run with an explicit "do not close this session".
+   **This is the fix that addresses what the user actually did**: closing a tab
+   should not be able to lose work, and if it can, the notebook must say so
+   before the tab is closed.
+
+**Guard added:** 8 self-checks, including that a **79/240 partial run is not**
+mistaken for finished (the guard must not skip resumable work), that
+`force_rerun` still overrides, and that a corrupt `summary.json` does not crash
+it. Self-checks 176 → **184**.
+
+**Open:** confirm on HF whether the nine `p3-*-mscKD*` runs are present. If they
+are, the fix makes NB13 skip them and nothing is lost. If they are not, they
+must be retrained — and no code change can recover them, only prevent a repeat.
 
 ### D-18 · Analysis sampled alphabetically, not representatively
 
@@ -1180,6 +1286,8 @@ Draft, from the record:
 
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
+| O-17 | **Confirm on HF whether the nine `p3-*-mscKD*` runs survived (D-19).** If they did, re-run NB13 and it will skip them. If not, they must be retrained — up to 30 GPU-h | NB13, NB14 | ~5 min to check | **highest** |
+| O-18 | **Add a cross-session resume test.** Five defects have now been about resume (D-05, D-06, D-09, D-12, D-19) and every test we have runs inside one session — which is precisely the case that works. The acceptance test must delete the local run directory to simulate a fresh Kaggle session | the next D-19 | ~1 h | **high** |
 | O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
 | O-12 | **Close D-14/D-15:** null the `mobilenetv2` reference; measure the 6 unmeasured runs + train `wrn_16_2-s1`; add the NB08 coverage ALARM and the parameter-count assertion | "15 architectures" being true | ~4 GPU-h | **high** |
 | O-5 | Read SAFE-KD (2602.03043); write the differentiation memo | Related work | ~1 day | **high, not started** |
@@ -1208,6 +1316,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | **D-19 — NB13 restarted completed MSC-KD runs from epoch 0.** Resume was never wired into the method notebooks: `run_all` recognised only one entry point, neither training function pulled its own checkpoint, and the zero-work ALARM was dead code. The worst defect so far — it destroys GPU-hours silently |
 | 2026-08-04 | D-18 — **analysis sampled alphabetically**; Q4's 15 pairs were 12 convnext + 3 mixer, and `vgg8` was silently dropped from all three analyses |
 | 2026-08-04 | **Q4 corrected on `train_holdout` with 7 scores: ΔR² 0.254 → ~0.10.** D-11's prediction confirmed; the published number overstated irreducibility 2.5× |
 | 2026-08-04 | **Q3 across 78 pairs — THE CENTRAL RESULT.** within-family 0.920 > across-CNN 0.878 > CNN→transformer 0.710, complete separation. H3's ordering confirmed, its "< 0.6" magnitude refuted **favourably**: compute-need transfers across the CNN/Transformer boundary |
