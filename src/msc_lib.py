@@ -7214,45 +7214,81 @@ class Session:
         print(f"[SESSION] done. elapsed {self.guard.elapsed_h:.2f} h")
 
     def confirm_on_hf(self, run_ids: Sequence[str],
-                      require: Sequence[str] = ("summary.json",),
+                      require: Optional[Sequence[str]] = None,
                       verbose: bool = True) -> Dict[str, List[str]]:
-        """After `finish()`: is the work actually ON HuggingFace?
+        """After `finish()`: is the work SAFE on HuggingFace?
 
         **D-19.** `finish()` drains the upload queue and prints "done", which
         reads like confirmation and is not one -- draining says the queue
-        emptied, not that the files landed. Someone who closes the tab at that
-        point has no way to tell the difference, and the cost of being wrong is
-        re-running everything.
+        emptied, not that the files landed.
 
-        This asks the repository. Run it before closing a session; it is the
-        difference between believing the work is safe and knowing it.
+        **D-20. "Safe" is not the same as "finished", and the first version of
+        this method confused the two.** It asked only for `summary.json` and
+        reported every in-progress run as ``NOT ON HF ... closing now means
+        retraining them``. For nine MSC-KD runs paused mid-training that was
+        false *and* alarming: their `ckpt_last.pt` was on HF, they would have
+        resumed losing nothing, and the message said the opposite.
+
+        A run is therefore in one of three states, not two:
+
+        - **finished**  -- `summary.json` present; nothing left to do.
+        - **resumable** -- `checkpoints/ckpt_last.pt` present. Perfectly safe to
+          close; the next session picks it up at the epoch it reached.
+        - **at risk**   -- neither. This alone is worth an alarm.
+
+        Pass `require=(...)` to check specific paths instead.
         """
         ids = list(run_ids)
+        empty = {"ok": [], "done": [], "resumable": [], "at_risk": [],
+                 "unknown": ids}
         if not self.hub.enabled:
             if verbose:
                 print("[VERIFY] HF disabled -- cannot confirm anything")
-            return {"ok": [], "missing": [], "unknown": ids}
+            return empty
         try:
             have = set(self.hub.hub.list_repo_files())
         except Exception as e:                               # noqa: BLE001
             log(f"could not list the repo: {type(e).__name__}: {e}. "
                 f"Treat this as UNCONFIRMED, not as success.", "ALARM")
-            return {"ok": [], "missing": [], "unknown": ids}
-        ok, missing = [], []
+            return empty
+
+        latest = self.registry.latest()
+        done, resumable, at_risk = [], [], []
         for r in ids:
-            need = [f"runs/{r}/{x}" for x in require]
-            (ok if all(n in have for n in need) else missing).append(r)
-        if verbose:
-            print(f"\n[VERIFY] {len(ok)}/{len(ids)} run(s) confirmed on HuggingFace")
-            for r in missing:
-                print(f"    NOT ON HF: {r}")
-            if missing:
-                log(f"{len(missing)} run(s) are NOT on HuggingFace. DO NOT close "
-                    f"this session. Re-run sess.finish(), then this cell again. "
-                    f"Closing now means retraining them.", "ALARM")
+            base = f"runs/{r}/"
+            if require:
+                (done if all(f"{base}{x}" in have for x in require)
+                 else at_risk).append(r)
+            elif f"{base}summary.json" in have:
+                done.append(r)
+            elif f"{base}checkpoints/ckpt_last.pt" in have:
+                resumable.append(r)
             else:
-                print("    All present. Safe to close the session.")
-        return {"ok": ok, "missing": missing, "unknown": []}
+                at_risk.append(r)
+
+        if verbose:
+            print(f"\n[VERIFY] {len(ids)} run(s): {len(done)} finished, "
+                  f"{len(resumable)} resumable, {len(at_risk)} at risk")
+            for r in done:
+                print(f"    FINISHED   {r}")
+            for r in resumable:
+                ep = latest.get(r, {}).get("epoch")
+                at = f" (epoch {ep})" if ep is not None else ""
+                print(f"    RESUMABLE  {r}{at}")
+            for r in at_risk:
+                print(f"    AT RISK    {r}")
+            if at_risk:
+                log(f"{len(at_risk)} run(s) have NEITHER a summary.json NOR a "
+                    f"checkpoint on HuggingFace. DO NOT close this session -- "
+                    f"re-run sess.finish(), then this cell again.", "ALARM")
+            elif resumable:
+                print("\n    Nothing is at risk. The resumable runs are "
+                      "checkpointed on HuggingFace and will\n    continue from "
+                      "where they stopped. Safe to close the session.")
+            else:
+                print("\n    All finished. Safe to close the session.")
+        return {"ok": done + resumable, "done": done, "resumable": resumable,
+                "at_risk": at_risk, "unknown": []}
 
     def status(self) -> "Any":
         return self.registry.summary()
@@ -8271,6 +8307,41 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-20: "safe" is not "finished" -------------------------------------
+    # A paused run whose ckpt_last.pt is on HF loses NOTHING when the tab is
+    # closed. Classifying it as at-risk was a false alarm, and a verification
+    # cell that cries wolf is the D-17 failure mode all over again.
+    def _classify(have, rid):
+        if f"runs/{rid}/summary.json" in have:
+            return "done"
+        if f"runs/{rid}/checkpoints/ckpt_last.pt" in have:
+            return "resumable"
+        return "at_risk"
+
+    _r = "p3-resnet8x4-cifar100-mscKDshuffromresnet32x4-s1"
+    check("D-20: summary.json -> finished",
+          _classify({f"runs/{_r}/summary.json"}, _r) == "done")
+    check("D-20: checkpoint only -> RESUMABLE, not at risk",
+          _classify({f"runs/{_r}/checkpoints/ckpt_last.pt"}, _r) == "resumable",
+          "this is the case that produced the false alarm")
+    check("D-20: neither -> at risk",
+          _classify({f"runs/{_r}/config.yaml"}, _r) == "at_risk")
+    check("D-20: a config.yaml alone is NOT reassurance",
+          _classify({f"runs/{_r}/config.yaml", f"runs/{_r}/STATUS.json"}, _r)
+          == "at_risk",
+          "status files are written before any real work exists")
+
+    # The hyphen-stripping in make_run_id is what produces these ids; assert it
+    # round-trips, because the D-20 report prints them and they look wrong.
+    _mk = make_run_id("p3", "resnet8x4", "cifar100",
+                      "mscKDshuf-from-resnet32x4", 1)
+    check("D-20: method hyphens are stripped, deterministically",
+          _mk == "p3-resnet8x4-cifar100-mscKDshuffromresnet32x4-s1", _mk)
+    check("D-20: and the id still parses into exactly its 5 fields",
+          parse_run_id(_mk)["arch"] == "resnet8x4"
+          and parse_run_id(_mk)["seed"] == 1,
+          "stripping is what keeps the '-' split unambiguous")
 
     # --- D-19: artifact-based completion, not ledger-only -------------------
     import tempfile as _tf

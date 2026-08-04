@@ -321,9 +321,11 @@ sess.finish()
 
 # D-19: draining the upload queue is NOT the same as the files being on
 # HuggingFace, and "[SESSION] done" reads like a confirmation it is not.
-# Ask the repository before you close this tab. If anything is listed as
-# NOT ON HF, re-run sess.finish() and this cell again -- closing now means
-# retraining those runs from scratch.
+# Ask the repository before you close this tab.
+#
+# D-20: three states, not two. FINISHED and RESUMABLE are both safe -- a run
+# paused at epoch 120 whose ckpt_last.pt is on HF loses nothing when you close
+# the tab. Only AT RISK (no summary.json AND no checkpoint) needs action.
 try:
     _ids = [c['run_id'] for c in cfgs]
 except NameError:

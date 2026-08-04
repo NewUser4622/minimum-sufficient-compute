@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **184** offline self-checks |
-| **Defects found** | 19 · 16 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-19 may have cost up to 30 GPU-h** |
+| **Library version** | `msc_lib` 1.0.0 · **190** offline self-checks |
+| **Defects found** | 20 · 17 fixed · **3 open** (D-14, D-15, D-18 re-run) · D-19 cost 0 in the end — the runs were checkpointed (D-20) |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `9b18d2b`, 2026-08-04T06:1x Z |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -563,6 +563,69 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-20 · The D-19 verification cell raised a false alarm on healthy runs
+
+**Severity:** no data lost, but it told the user their work was at risk when it
+was not · **Status:** **fixed** · **Found:** 2026-08-04, minutes after shipping D-19
+
+The verification cell added to fix D-19 printed:
+
+```
+[VERIFY] 0/9 run(s) confirmed on HuggingFace
+    NOT ON HF: p3-resnet8x4-cifar100-mscKDshuffromresnet32x4-s1
+    ... (9 of 9)
+[ALARM] 9 run(s) are NOT on HuggingFace. DO NOT close this session.
+        Closing now means retraining them.
+```
+
+**Every word after "0/9" was false.** The same output block reported
+`uploaded=1283 commits=8 pending=0` — the queue had drained completely, and all
+nine runs had `checkpoints/ckpt_last.pt` on HF. They would have resumed from
+their exact epoch, losing nothing.
+
+**The bug.** `confirm_on_hf` defaulted to `require=("summary.json",)`, i.e. it
+asked *"did this run finish?"* — then phrased the answer as *"is this run
+safe?"*. Those are different questions. The session had been running 1.08 h
+against a job needing ~30 GPU-h, so of course nothing had finished. **Being
+unfinished is the normal state of a paused run, not a failure.**
+
+Safety has three states, and the check collapsed them into two:
+
+| state | evidence | safe to close? |
+|---|---|---|
+| finished | `summary.json` | yes, nothing left |
+| **resumable** | `checkpoints/ckpt_last.pt` | **yes — resumes at its epoch** |
+| at risk | neither | **no** |
+
+**Contamination analysis.** No data lost, no number affected. The cost was a
+false alarm on a live session and the user having to ask whether to trust it.
+
+**But that cost is not small, and it is the same cost as D-17.** A check that
+fires on healthy data teaches you to ignore it, and the next alarm is the real
+one. D-19 was itself a silent-failure defect; shipping its fix with a false
+alarm attached is close to the worst outcome, because it makes the mechanism
+that was supposed to restore trust into another thing to second-guess.
+
+**Why it happened.** `require=("summary.json",)` was chosen while writing the
+guard for *completed* runs — D-19's story was about nine runs that had finished.
+The in-progress case was never considered, and the self-tests I added for D-19
+covered `already_finished` thoroughly and `confirm_on_hf` **not at all**. I
+tested the function whose logic I had reasoned about and skipped the one I had
+merely written.
+
+**Fix.** Three-way classification, `RESUMABLE` reported as safe with its epoch
+from the ledger, and the ALARM reserved for runs with neither artifact. The
+summary line now reads `9 run(s): 0 finished, 9 resumable, 0 at risk` followed
+by *"Nothing is at risk … Safe to close the session."*
+
+**Guard added:** 6 self-checks pinning all three states, including that a
+checkpoint alone is `resumable` (the exact false-alarm case) and that a
+`config.yaml`/`STATUS.json` pair is **not** reassurance — those are written
+before any real work exists. Also pins the `make_run_id` hyphen-stripping that
+produces the odd-looking `mscKDshuffromresnet32x4`, since the report prints
+those ids and they read like corruption: stripping is deliberate, it is what
+keeps the `-` split into exactly five fields unambiguous. Self-checks 184 → **190**.
 
 ### D-19 · NB13 restarted completed MSC-KD runs from epoch 0 — resume was never wired into the method notebooks
 
@@ -1286,7 +1349,7 @@ Draft, from the record:
 
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
-| O-17 | **Confirm on HF whether the nine `p3-*-mscKD*` runs survived (D-19).** If they did, re-run NB13 and it will skip them. If not, they must be retrained — up to 30 GPU-h | NB13, NB14 | ~5 min to check | **highest** |
+| ~~O-17~~ | ~~Confirm the nine `p3-*-mscKD*` runs survived~~ — **CLOSED.** All nine are checkpointed on HF and resumable; nothing was lost. The alarm that said otherwise was D-20 | — | — | done |
 | O-18 | **Add a cross-session resume test.** Five defects have now been about resume (D-05, D-06, D-09, D-12, D-19) and every test we have runs inside one session — which is precisely the case that works. The acceptance test must delete the local run directory to simulate a fresh Kaggle session | the next D-19 | ~1 h | **high** |
 | O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
 | O-12 | **Close D-14/D-15:** null the `mobilenetv2` reference; measure the 6 unmeasured runs + train `wrn_16_2-s1`; add the NB08 coverage ALARM and the parameter-count assertion | "15 architectures" being true | ~4 GPU-h | **high** |
@@ -1316,6 +1379,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | D-20 — **the D-19 verification cell cried wolf**: nine healthy checkpointed runs reported as "NOT ON HF ... closing means retraining". Safety has three states, not two |
 | 2026-08-04 | **D-19 — NB13 restarted completed MSC-KD runs from epoch 0.** Resume was never wired into the method notebooks: `run_all` recognised only one entry point, neither training function pulled its own checkpoint, and the zero-work ALARM was dead code. The worst defect so far — it destroys GPU-hours silently |
 | 2026-08-04 | D-18 — **analysis sampled alphabetically**; Q4's 15 pairs were 12 convnext + 3 mixer, and `vgg8` was silently dropped from all three analyses |
 | 2026-08-04 | **Q4 corrected on `train_holdout` with 7 scores: ΔR² 0.254 → ~0.10.** D-11's prediction confirmed; the published number overstated irreducibility 2.5× |
