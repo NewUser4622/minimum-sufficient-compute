@@ -330,9 +330,51 @@ Kill the session whenever. To resume: fresh session, run all cells.
 
 **If the config changed, it refuses to resume and raises.** Deliberate. Silently continuing under an edited config is how you get numbers that don't reproduce and no idea why. Restore the config, or set `force_rerun=True` to discard and retrain.
 
+### 7.1 Before you close a session — always run the verify cell
+
+`sess.finish()` prints `[SESSION] done`. **That is not confirmation your work is
+safe.** It means the upload queue drained, not that the files landed. Every
+training notebook now ends with:
+
+```python
+sess.finish()
+sess.confirm_on_hf([c['run_id'] for c in cfgs])
+```
+
+which asks the repository and prints one line per run. If anything says
+`NOT ON HF`, **do not close the tab** — re-run `sess.finish()` and the verify
+cell again. This is defect **D-19**: nine completed MSC-KD runs restarted from
+epoch 0 because a session was closed on the strength of `[SESSION] done`.
+
+### 7.2 Checking what survived, from any notebook
+
+Paste this into a fresh cell. It needs only `HF_TOKEN` — no GPU, no dataset:
+
+```python
+from huggingface_hub import HfApi
+api = HfApi(token=UserSecretsClient().get_secret("HF_TOKEN"))
+files = set(api.list_repo_files("Shanmuk4622/msc-cifar100", repo_type="dataset"))
+
+runs = sorted({f.split("/")[1] for f in files if f.startswith("runs/")})
+done = sorted({f.split("/")[1] for f in files if f.endswith("/summary.json")})
+print(f"{len(runs)} run directories, {len(done)} with summary.json\n")
+for r in runs:
+    print(f"  {'DONE   ' if r in done else 'partial'}  {r}")
+```
+
+`summary.json` is the durable evidence a run finished — the ledger can be lost,
+that file cannot. Anything listed `DONE` will now be **skipped** by a re-run
+rather than retrained (D-19 fix).
+
 ---
 
 ## 8. Troubleshooting
+
+**NB13 (or any training notebook) starts a finished run from epoch 0**
+This was **D-19**, fixed. If it recurs: the run's `summary.json` is missing from
+HuggingFace, so nothing knows it finished. Check with the snippet in §7.2. If
+`summary.json` is absent the work genuinely cannot be recovered and the run must
+be retrained — which is exactly why §7.1's verify cell exists.
 
 **`no token: add 'HF_TOKEN' to Kaggle Secrets`**
 Secret missing, or not enabled for *this* notebook. Add-ons → Secrets, check the toggle.
