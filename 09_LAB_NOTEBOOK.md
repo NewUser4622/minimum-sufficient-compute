@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **190** offline + **3 torch-gated** self-checks |
-| **Defects found** | 21 · 18 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-21 blocked MSC-KD entirely — the method's own loss was never tested** |
+| **Library version** | `msc_lib` 1.0.0 · **202** offline + **3 torch-gated** self-checks |
+| **Defects found** | 22 · 19 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-21+D-22 both blocked MSC-KD and both cost an hour each to surface — see O-19** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `9b18d2b`, 2026-08-04T06:1x Z |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -563,6 +563,78 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-22 · Five wrong column names killed every MSC-KD run at the end of epoch 0
+
+**Severity:** blocked NB13 · **Status:** **fixed** · **Found:** 2026-08-04, immediately after D-21
+
+```
+File "msc_lib.py", line 6781, in train_msc_kd
+    w.writerow(row)
+ValueError: dict contains fields not in fieldnames:
+    'recall', 'f1_score', 'throughput_img_s', 'grad_norm', 'precision'
+```
+
+The MSC-KD history row used five names that are not columns. The schema has
+`f1_macro`, `precision_macro`, `recall_macro`, `grad_norm_mean` and
+`throughput_train_img_s`; the row wrote `f1_score`, `precision`, `recall`,
+`grad_norm`, `throughput_img_s`. `csv.DictWriter` raises on any key it does not
+recognise — **at the end of the first epoch**, after the training is done and
+the time is unrecoverable.
+
+**The two training paths disagreed about what an unknown column means, and both
+answers were wrong.**
+
+| | behaviour | consequence |
+|---|---|---|
+| `train_msc_kd` | `DictWriter` default → **raises** | every run dies at epoch 0 |
+| `train_backbone` | `extrasaction="ignore"` → **silently drops** | a typo becomes a column of blanks in a 171-column table nobody reads by eye |
+
+The second is the more dangerous of the two on a project whose standing
+instruction is *"we only train once — collect every detail."* A crash gets
+fixed; a silently missing column gets discovered while writing the paper.
+
+**Contamination analysis.** No MSC-KD run ever wrote a history row, so nothing
+is lost there. For the atlas, `train_backbone` built its row from explicit
+literals plus `**g, **sysagg, **pw` and then `row.setdefault(_c, NA)` over every
+field — so the 171 columns were all present and only genuinely-extra
+machine-specific keys were dropped. **The 44 atlas runs are unaffected**, but
+that was luck rather than a guarantee, because nothing checked.
+
+**Fix.**
+
+- `append_history_row(path, row, strict=True)` — one writer for both paths.
+  `strict=True` raises **and names the column you probably meant**
+  (`Did you mean: {'f1_score': ['f1_macro', ...]}`). `strict=False` still writes,
+  because `train_backbone`'s GPU/power dicts legitimately vary by machine, but
+  **logs what it dropped**, once per key. Silent loss becomes visible loss.
+- `msckd_history_row(...)` — the row extracted into a pure function so its key
+  set can be validated offline in microseconds instead of after an hour of real
+  training on a real teacher.
+
+**And a gap worth more than the bug.** The old row recorded no identity columns
+and — for a *method* notebook — **threw away the three-term loss decomposition
+entirely.** `L_CE`, `L_KD` and `L_MSC` were computed every epoch, printed to
+stdout, and never written down. The whole argument of the paper is how those
+three trade off against each other; the curve was being discarded. The new row
+records all three plus `alpha`, `beta`, `temperature`, `run_id`, `arch`, `seed`,
+`phase`, `method`, `config_hash`, `is_best` and `samples_seen` — 42 columns
+where there were 23.
+
+**Guard added:** 12 self-checks. They build a representative row and assert
+every key is in `HISTORY_FIELDS`, that each of the five bad names is gone, that
+the three loss components **sum to the total**, that `is_best` compares against
+the *previous* best rather than the one just written, that the header is written
+exactly once, that strict mode raises with a usable suggestion, and that
+non-strict mode still writes. Self-checks 190 → **202**.
+
+**The pattern across D-21 and D-22.** Both were in `train_msc_kd`, both were
+trivial, and both cost a full hour of GPU setup to discover — because
+`train_msc_kd` does teacher loading, exit-head training and a 50,000-image sweep
+*before* the first student batch, and the history write is at the *end* of the
+first epoch after that. Two bugs, two hours, both findable in milliseconds.
+**O-19 (dry-run one batch early) is now the highest-value engineering item in
+the project** — it would have caught both.
 
 ### D-21 · The MSC-KD loss cannot run under AMP — the method's own training step was never tested
 
@@ -1416,7 +1488,7 @@ Draft, from the record:
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
 | ~~O-17~~ | ~~Confirm the nine `p3-*-mscKD*` runs survived~~ — **CLOSED.** All nine are checkpointed on HF and resumable; nothing was lost. The alarm that said otherwise was D-20 | — | — | done |
-| O-19 | **Dry-run one student batch before the teacher sweep** in `train_msc_kd`. It currently does ~1 h of setup (checkpoint load, exit heads, 50k-image sweep) before the first student step, so D-21 took an hour to surface instead of seconds | fast failure | ~20 min | **high** |
+| O-19 | **Dry-run one student batch — and one history write — before the teacher sweep** in `train_msc_kd`. ~1 h of setup precedes the first student step, and the history write is at the END of epoch 0 after that. D-21 and D-22 each cost an hour to surface; both were findable in milliseconds | fast failure | ~20 min | **highest engineering item** |
 | O-18 | **Add a cross-session resume test.** Five defects have now been about resume (D-05, D-06, D-09, D-12, D-19) and every test we have runs inside one session — which is precisely the case that works. The acceptance test must delete the local run directory to simulate a fresh Kaggle session | the next D-19 | ~1 h | **high** |
 | O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
 | O-12 | **Close D-14/D-15:** null the `mobilenetv2` reference; measure the 6 unmeasured runs + train `wrn_16_2-s1`; add the NB08 coverage ALARM and the parameter-count assertion | "15 architectures" being true | ~4 GPU-h | **high** |
@@ -1446,6 +1518,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | D-22 — **five wrong column names killed every MSC-KD run at the end of epoch 0.** The two training paths disagreed about unknown columns: one raised, one silently dropped. Also recovered the three-term loss decomposition, which was being computed and thrown away |
 | 2026-08-04 | **D-21 — the MSC-KD loss cannot run under AMP.** `F.binary_cross_entropy` is banned under autocast, so the method's training step could never execute. The NB00 preflight covers all 15 backbones and neither `MSCStudent` nor `MSCLoss` |
 | 2026-08-04 | D-20 — **the D-19 verification cell cried wolf**: nine healthy checkpointed runs reported as "NOT ON HF ... closing means retraining". Safety has three states, not two |
 | 2026-08-04 | **D-19 — NB13 restarted completed MSC-KD runs from epoch 0.** Resume was never wired into the method notebooks: `run_all` recognised only one entry point, neither training function pulled its own checkpoint, and the zero-work ALARM was dead code. The worst defect so far — it destroys GPU-hours silently |

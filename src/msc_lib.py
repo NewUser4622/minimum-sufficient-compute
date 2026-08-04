@@ -4371,6 +4371,123 @@ def save_checkpoint(path, cfg, model, optimizer, scheduler, scaler, epoch: int,
     })
 
 
+_HISTORY_SET = frozenset(HISTORY_FIELDS)
+_HISTORY_WARNED: Set[str] = set()
+
+
+def msckd_history_row(run_id: str, cfg: Dict[str, Any], epoch: int,
+                      agg: Dict[str, float], nb: int, val: Dict[str, Any],
+                      acc: float, best_before: float, lr: float, amp: bool,
+                      dt: float, cum_time: float, cum_energy: float,
+                      n_train_images: int, alpha: float, beta: float,
+                      temperature: float) -> Dict[str, Any]:
+    """One MSC-KD epoch, as a `HISTORY_FIELDS`-valid row.
+
+    Extracted from the training loop so the self-test can validate its key set
+    **offline, with no GPU** (D-22). Previously the only way to discover that
+    this row used `f1_score` where the schema says `f1_macro` was to finish an
+    epoch of real training on a real teacher -- about an hour in.
+
+    It also now records the **three-term loss decomposition**, which the old row
+    computed every epoch and threw away. For a method notebook that is the most
+    important curve in the file: the whole argument is about how L_CE, L_KD and
+    L_MSC trade off, and none of it was being written down.
+    """
+    per = lambda k: agg[k] / max(1, nb)
+    return {
+        # identity -- the atlas rows carry these, so these must too or the
+        # combined table cannot be grouped by architecture or method.
+        "run_id": run_id, "epoch": int(epoch), "timestamp_utc": now_iso(),
+        "unix_ts": time.time(),
+        "arch": cfg.get("arch", NA), "family": cfg.get("family", NA),
+        "dataset": cfg.get("dataset", NA), "seed": cfg.get("seed", NA),
+        "phase": cfg.get("phase", NA), "method": cfg.get("method", NA),
+        "config_hash": cfg.get("config_hash", NA),
+
+        # learning
+        "train_loss": per("loss"), "val_loss": float(val["loss"]),
+        "train_accuracy": float("nan"), "val_accuracy": float(acc),
+        "val_accuracy_top5": float(val["accuracy_top5"]),
+        "f1_macro": float(val["f1"]),
+        "precision_macro": float(val["precision"]),
+        "recall_macro": float(val["recall"]),
+        "best_val_accuracy_so_far": float(max(best_before, acc)),
+        "is_best": bool(acc > best_before),
+
+        # the three-term decomposition -- the point of the whole notebook
+        "loss_total": per("loss"), "loss_ce": per("ce"),
+        "loss_kd": per("kd"), "loss_msc": per("msc"),
+        "alpha": float(alpha), "beta": float(beta),
+        "temperature": float(temperature),
+
+        # optimisation
+        "learning_rate": float(lr),
+        "batch_size": int(cfg["batch_size"]),
+        "effective_batch_size": int(cfg["batch_size"]),
+        "amp_enabled": bool(amp), "n_batches": int(nb),
+
+        # time
+        "epoch_time_sec": float(dt), "cumulative_time_sec": float(cum_time),
+        "throughput_train_img_s": n_train_images / max(1e-9, dt),
+        "samples_seen": int(nb) * int(cfg["batch_size"]),
+
+        # energy (MSC-KD does not run the power sampler; recorded as zero
+        # rather than omitted so the column stays type-stable across phases)
+        "epoch_energy_j": 0.0, "cumulative_energy_j": float(cum_energy),
+        "epoch_co2_kg": 0.0, "cumulative_co2_kg": 0.0, "peak_vram_mb": 0.0,
+    }
+
+
+def append_history_row(path, row: Dict[str, Any], strict: bool = True) -> None:
+    """Append one epoch to a run's `metrics/epochs.csv`, schema-checked.
+
+    **D-22.** The two training paths disagreed about what an unknown column
+    means, and both answers were wrong:
+
+    - `train_msc_kd` used `csv.DictWriter`'s default, which **raises** -- at the
+      END of the first epoch, after the work is done and unrecoverable. Five
+      misspelled keys (`f1_score` for `f1_macro`, `precision` for
+      `precision_macro`, `recall`, `grad_norm`, `throughput_img_s`) therefore
+      killed every MSC-KD run at epoch 0, an hour into setup, nine times over.
+    - `train_backbone` used `extrasaction="ignore"`, which **silently drops**
+      them. That is worse in the long run: a typo becomes a column of blanks in
+      a 171-column table nobody reads by eye, and the standing instruction on
+      this project is that we train once and collect everything.
+
+    So: `strict=True` fails loudly *and* names the column you probably meant.
+    `strict=False` still writes -- `train_backbone` merges dynamically-built GPU
+    and power dicts whose keys legitimately vary by machine -- but **logs what
+    it dropped**, once per key, so silent loss becomes visible loss.
+    """
+    unknown = [k for k in row if k not in _HISTORY_SET]
+    if unknown:
+        if strict:
+            hint = {}
+            for u in unknown:
+                stem = u.split("_")[0]
+                near = [c for c in HISTORY_FIELDS if c.startswith(stem)]
+                if near:
+                    hint[u] = near[:3]
+            raise KeyError(
+                f"{len(unknown)} column(s) are not in HISTORY_FIELDS: "
+                f"{sorted(unknown)}."
+                + (f" Did you mean: {hint}?" if hint else "")
+                + " Either use the documented name or add the column to "
+                  "HISTORY_FIELDS (and to 06_DATA_SCHEMA.md).")
+        fresh = [k for k in unknown if k not in _HISTORY_WARNED]
+        if fresh:
+            _HISTORY_WARNED.update(fresh)
+            log(f"dropping {len(fresh)} column(s) absent from HISTORY_FIELDS: "
+                f"{sorted(fresh)[:8]}. They will NOT be in epochs.csv.",
+                "SCHEMA")
+    new = not Path(path).exists()
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS, extrasaction="ignore")
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
 def ensure_run_local(hub, work, run_id: str, why: str = "") -> bool:
     """Pull a run's own artifacts back from HF before concluding it never ran.
 
@@ -4968,12 +5085,10 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
             for _c in HISTORY_FIELDS:
                 row.setdefault(_c, NA)
 
-            new = not history_path.exists()
-            with open(history_path, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS, extrasaction="ignore")
-                if new:
-                    w.writeheader()
-                w.writerow(row)
+            # strict=False: the merged GPU/system/power dicts legitimately vary
+            # by machine. Anything dropped is now LOGGED rather than silently
+            # lost -- see D-22.
+            append_history_row(history_path, row, strict=False)
 
             is_best = val_acc > best_metric
             if is_best:
@@ -6758,27 +6873,13 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
 
             val = evaluate(_Deepest(student), val_loader, device, amp)
             acc = float(val["accuracy"])
-            row = {"epoch": epoch, "train_loss": agg["loss"] / max(1, nb),
-                   "val_loss": float(val["loss"]), "train_accuracy": float("nan"),
-                   "val_accuracy": acc,
-                   "val_accuracy_top5": float(val["accuracy_top5"]),
-                   "f1_score": float(val["f1"]), "precision": float(val["precision"]),
-                   "recall": float(val["recall"]),
-                   "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                   "batch_size": int(cfg["batch_size"]),
-                   "effective_batch_size": int(cfg["batch_size"]),
-                   "amp_enabled": bool(amp), "grad_norm": float("nan"),
-                   "throughput_img_s": len(train_loader.dataset) / max(1e-9, dt),
-                   "epoch_time_sec": dt, "cumulative_time_sec": cum_time,
-                   "epoch_energy_j": 0.0, "cumulative_energy_j": cum_energy,
-                   "epoch_co2_kg": 0.0, "cumulative_co2_kg": 0.0,
-                   "peak_vram_mb": 0.0, "timestamp_utc": now_iso()}
-            new = not history_path.exists()
-            with open(history_path, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
-                if new:
-                    w.writeheader()
-                w.writerow(row)
+            row = msckd_history_row(
+                run_id=run_id, cfg=cfg, epoch=epoch, agg=agg, nb=nb, val=val,
+                acc=acc, best_before=best, lr=float(optimizer.param_groups[0]["lr"]),
+                amp=amp, dt=dt, cum_time=cum_time, cum_energy=cum_energy,
+                n_train_images=len(train_loader.dataset),
+                alpha=alpha, beta=beta, temperature=temperature)
+            append_history_row(history_path, row, strict=True)
 
             if acc > best:
                 best = acc
@@ -8333,6 +8434,58 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-22: the MSC-KD history row must match HISTORY_FIELDS -------------
+    # The old row used f1_score / precision / recall / grad_norm /
+    # throughput_img_s. None of those are column names. csv.DictWriter raises
+    # at the END of the first epoch, so the only way to find out was an hour of
+    # real training on a real teacher. This does it in microseconds.
+    _row = msckd_history_row(
+        run_id="p3-resnet8x4-cifar100-mscKDshuffromresnet32x4-s1",
+        cfg={"arch": "resnet8x4", "family": "resnet", "dataset": "cifar100",
+             "seed": 1, "phase": "p3", "method": "mscKDshuf-from-resnet32x4",
+             "config_hash": "deadbeef", "batch_size": 64},
+        epoch=3, agg={"loss": 8.0, "ce": 4.0, "kd": 2.0, "msc": 2.0}, nb=4,
+        val={"loss": 1.5, "accuracy_top5": 0.9, "f1": 0.7, "precision": 0.71,
+             "recall": 0.69},
+        acc=0.72, best_before=0.70, lr=0.05, amp=True, dt=30.0,
+        cum_time=120.0, cum_energy=1000.0, n_train_images=50000,
+        alpha=1.0, beta=1.0, temperature=4.0)
+    _bad = sorted(k for k in _row if k not in _HISTORY_SET)
+    check("D-22: every MSC-KD history column is in HISTORY_FIELDS",
+          not _bad, f"offenders: {_bad}" if _bad else f"{len(_row)} columns")
+    for _old in ("f1_score", "precision", "recall", "grad_norm",
+                 "throughput_img_s"):
+        check(f"D-22: the invalid name '{_old}' is gone", _old not in _row)
+    check("D-22: the three-term loss decomposition is now recorded",
+          all(k in _row for k in ("loss_ce", "loss_kd", "loss_msc",
+                                  "alpha", "beta", "temperature")),
+          "it was computed every epoch and thrown away")
+    check("D-22: and the components sum to the total",
+          abs((_row["loss_ce"] + _row["loss_kd"] + _row["loss_msc"])
+              - _row["loss_total"]) < 1e-9)
+    check("D-22: is_best compares against the PREVIOUS best, not the new one",
+          _row["is_best"] is True and _row["best_val_accuracy_so_far"] == 0.72)
+
+    _hp = Path(tmp) / "epochs.csv"
+    append_history_row(_hp, _row, strict=True)
+    append_history_row(_hp, _row, strict=True)
+    _lines = _hp.read_text(encoding="utf-8").strip().split("\n")
+    check("D-22: writes a header once, then one line per epoch",
+          len(_lines) == 3 and _lines[0].startswith("run_id,epoch,"),
+          f"{len(_lines)} lines")
+    try:
+        append_history_row(_hp, {**_row, "f1_score": 0.7}, strict=True)
+        check("D-22: strict mode rejects an unknown column", False, "no raise")
+    except KeyError as _e:
+        check("D-22: strict mode rejects an unknown column and suggests a fix",
+              "f1_macro" in str(_e), str(_e)[:70])
+    _before = _hp.read_text(encoding="utf-8")
+    append_history_row(_hp, {**_row, "gpu0_weird_vendor_metric": 1.0},
+                       strict=False)
+    check("D-22: non-strict mode still writes, dropping the unknown column",
+          len(_hp.read_text(encoding="utf-8")) > len(_before),
+          "train_backbone merges machine-dependent GPU dicts")
 
     # --- D-20: "safe" is not "finished" -------------------------------------
     # A paused run whose ckpt_last.pt is on HF loses NOTHING when the tab is
