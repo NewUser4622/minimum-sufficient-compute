@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **202** offline + **3 torch-gated** self-checks |
-| **Defects found** | 22 · 19 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-21+D-22 both blocked MSC-KD and both cost an hour each to surface — see O-19** |
+| **Library version** | `msc_lib` 1.0.0 · **207** offline + **3 torch-gated** self-checks |
+| **Defects found** | 23 · 20 fixed · **3 open** (D-14, D-15, D-18 re-run) · **O-19 dry run now shipped — D-21/D-22/D-23 would all have been caught in <1 s** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `9b18d2b`, 2026-08-04T06:1x Z |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -563,6 +563,74 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-23 · The teacher's exit heads were retrained on every MSC-KD run — D-16 was not cosmetic
+
+**Severity:** ~20 wasted epochs **per run**, nine times over · **Status:** **fixed**
+**Found:** 2026-08-04, from a user log showing `exits ep 19/20` on run 1 of 9
+
+```
+[MSCKD] teacher exit heads missing -- training them now (backbone frozen)
+exits ep 19/20:  51%
+```
+
+`run_oracle` **writes** the trained exit heads to `runs/{run}/exit_heads.pt`.
+`train_msc_kd` **read** `runs/{run}/checkpoints/exit_heads.pt`. The file was
+never found, so every MSC-KD run retrained the teacher's heads from scratch —
+for a file that has been sitting on HuggingFace since NB08. Confirmed directly:
+`runs/p1-resnet32x4-cifar100-base-s1/exit_heads.pt`, **360,048 bytes**, at the
+run root.
+
+**This is a repeat of a defect I closed as harmless.** D-16 recorded the same
+path split and concluded:
+
+> *"Contamination: none. Nothing reads the path by convention; the loader is
+> handed the same value the writer used. Purely a documentation/tidiness
+> defect."*
+
+**Three call sites read it by convention**, and one of them was in the hot path
+of the entire method. The claim was not checked — I read the writer, saw it was
+self-consistent, and never grepped for readers. Classifying a defect as
+cosmetic is a *finding*, and it needed the same evidence as any other.
+
+**Contamination analysis.**
+
+- **No number is wrong.** Retrained exit heads are *correct* exit heads — the
+  procedure is deterministic given the frozen backbone and the seed. This cost
+  time, not validity.
+- The waste is ~20 epochs of exit-head training per MSC-KD run. At 9 runs that
+  is a substantial fraction of the notebook's total budget, spent recomputing
+  one 360 KB file.
+- It also **masked D-21 and D-22**: both defects sit *after* the exit-head
+  block, so every debugging cycle paid the retraining cost before reaching the
+  actual bug. Three defects, three ~1-hour round trips, one of them entirely
+  self-inflicted.
+
+**Fix.**
+
+- `exit_heads_path(work, run_id)` — one canonical accessor, used by the writer
+  and every reader. There was no such function, which is *why* they diverged.
+- `find_exit_heads(work, run_id)` — returns the canonical path, or the legacy
+  `checkpoints/` one if that is what exists, so anything written before this fix
+  still loads instead of retraining.
+- `train_msc_kd` now pulls the teacher's run directory from HF before concluding
+  the heads are absent, and logs **where it looked** on both branches.
+- The two status reporters (`Session.run_report`, `preflight`) checked the wrong
+  path too, so they have been reporting `exit_heads: False` for every run in the
+  project. Both now accept either location.
+
+**Guard added:** 5 self-checks asserting the writer's path is what the reader
+finds, that the canonical location is the run root, that the legacy path is
+still honoured, and that canonical wins when both exist. Self-checks 202 → **207**.
+
+**Also shipped: O-19, the dry run.** `msckd_dry_run()` now executes the entire
+MSC-KD step — `MSCStudent` under `autocast`, `MSCLoss`, `backward`, and one
+`msckd_history_row` through `append_history_row` — on a **2-image synthetic
+batch** before any teacher work. Under a second, no dataset, no sweep. **It
+would have caught D-21 and D-22 immediately**, and it now fails the run with
+`no GPU time has been spent` rather than an hour in. This should have been added
+when O-19 was first opened rather than filed for later; filing it cost two more
+hour-long cycles.
 
 ### D-22 · Five wrong column names killed every MSC-KD run at the end of epoch 0
 
@@ -1488,7 +1556,7 @@ Draft, from the record:
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
 | ~~O-17~~ | ~~Confirm the nine `p3-*-mscKD*` runs survived~~ — **CLOSED.** All nine are checkpointed on HF and resumable; nothing was lost. The alarm that said otherwise was D-20 | — | — | done |
-| O-19 | **Dry-run one student batch — and one history write — before the teacher sweep** in `train_msc_kd`. ~1 h of setup precedes the first student step, and the history write is at the END of epoch 0 after that. D-21 and D-22 each cost an hour to surface; both were findable in milliseconds | fast failure | ~20 min | **highest engineering item** |
+| ~~O-19~~ | ~~Dry-run one student batch before the teacher sweep~~ — **DONE.** `msckd_dry_run()` runs the full step on a 2-image batch in <1 s, before any teacher work | — | — | shipped |
 | O-18 | **Add a cross-session resume test.** Five defects have now been about resume (D-05, D-06, D-09, D-12, D-19) and every test we have runs inside one session — which is precisely the case that works. The acceptance test must delete the local run directory to simulate a fresh Kaggle session | the next D-19 | ~1 h | **high** |
 | O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
 | O-12 | **Close D-14/D-15:** null the `mobilenetv2` reference; measure the 6 unmeasured runs + train `wrn_16_2-s1`; add the NB08 coverage ALARM and the parameter-count assertion | "15 architectures" being true | ~4 GPU-h | **high** |
@@ -1518,6 +1586,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | D-23 — **the teacher's exit heads were retrained on every MSC-KD run.** `run_oracle` writes to the run root, `train_msc_kd` read `checkpoints/`. D-16 closed this as "cosmetic — nothing reads the path by convention"; three things did. **O-19 dry run shipped at last** |
 | 2026-08-04 | D-22 — **five wrong column names killed every MSC-KD run at the end of epoch 0.** The two training paths disagreed about unknown columns: one raised, one silently dropped. Also recovered the three-term loss decomposition, which was being computed and thrown away |
 | 2026-08-04 | **D-21 — the MSC-KD loss cannot run under AMP.** `F.binary_cross_entropy` is banned under autocast, so the method's training step could never execute. The NB00 preflight covers all 15 backbones and neither `MSCStudent` nor `MSCLoss` |
 | 2026-08-04 | D-20 — **the D-19 verification cell cried wolf**: nine healthy checkpointed runs reported as "NOT ON HF ... closing means retraining". Safety has three states, not two |

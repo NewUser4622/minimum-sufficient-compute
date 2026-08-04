@@ -4371,6 +4371,97 @@ def save_checkpoint(path, cfg, model, optimizer, scheduler, scaler, epoch: int,
     })
 
 
+def msckd_dry_run(cfg: Dict[str, Any], teacher, device, amp: bool,
+                  alpha: float, beta: float, temperature: float
+                  ) -> Tuple[bool, str]:
+    """Exercise the whole MSC-KD step on two synthetic images, before any
+    expensive work. Returns (ok, reason).
+
+    **O-19**, opened after D-21 and D-22 each cost an hour of GPU time to
+    surface. `train_msc_kd` loads a teacher, trains exit heads and sweeps 50,000
+    images before the first student batch, and writes its first history row only
+    at the *end* of that epoch. Both defects were trivial and both hid behind
+    that hour.
+
+    This runs the same objects the real loop uses -- `MSCStudent` under
+    `autocast`, `MSCLoss`, `backward`, and one `msckd_history_row` through
+    `append_history_row` -- on a 2-image batch and a temp file. Under a second,
+    no dataset, no teacher sweep.
+    """
+    if not _TORCH_OK:
+        return True, "torch unavailable; dry run skipped"
+    import tempfile as _tf
+    try:
+        n_cls = int(cfg["num_classes"])
+        student = MSCStudent(build_model(cfg["arch"], n_cls), n_cls, 5).to(device)
+        x = torch.randn(2, 3, int(cfg.get("image_size", 32)),
+                        int(cfg.get("image_size", 32)), device=device)
+        y = torch.zeros(2, dtype=torch.long, device=device)
+        tgt = torch.zeros(2, 5, device=device)
+        tgt[:, 3:] = 1.0
+        opt = torch.optim.SGD(student.parameters(), lr=1e-4)
+        lossfn = MSCLoss(alpha=alpha, beta=beta, temperature=temperature)
+        with torch.amp.autocast(device_type=device.type, enabled=amp):
+            with torch.no_grad():
+                t_logits = teacher(x)
+            s_logits, suff, _ = student(x, suff_logits=True)
+            loss, parts = lossfn(s_logits[-1], t_logits, y, suff, tgt)
+        loss.backward()
+        opt.step()
+        if not bool(torch.isfinite(loss).item()):
+            return False, f"loss is not finite ({float(loss)})"
+
+        # The history write is the OTHER thing that only fails after an epoch.
+        with _tf.TemporaryDirectory() as td:
+            row = msckd_history_row(
+                run_id=cfg["run_id"], cfg=cfg, epoch=0,
+                agg={k: float(parts.get(k, 0.0)) for k in
+                     ("loss", "ce", "kd", "msc")},
+                nb=1,
+                val={"loss": 0.0, "accuracy_top5": 0.0, "f1": 0.0,
+                     "precision": 0.0, "recall": 0.0},
+                acc=0.0, best_before=0.0, lr=1e-4, amp=amp, dt=1.0,
+                cum_time=1.0, cum_energy=0.0, n_train_images=2,
+                alpha=alpha, beta=beta, temperature=temperature)
+            append_history_row(Path(td) / "epochs.csv", row, strict=True)
+        del student, opt
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return True, "ok"
+    except Exception as e:                                   # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+
+
+def exit_heads_path(work, run_id: str) -> Path:
+    """THE canonical location of a run's trained exit heads.
+
+    **D-23.** No such function existed, so the writer and every reader
+    hard-coded a path of their own -- and they disagreed. `run_oracle` writes to
+    the run root; `train_msc_kd` looked in `checkpoints/`. The teacher's heads
+    were therefore never found, and **every MSC-KD run retrained them from
+    scratch**: ~20 epochs of GPU time per run, nine times over, for a file
+    already sitting on HuggingFace.
+
+    D-16 recorded this split as *"cosmetic ... Contamination: none. Nothing
+    reads the path by convention."* That was wrong. Three call sites read it by
+    convention, and one of them was in the hot path of the entire method.
+    """
+    return run_layout(work, run_id)["base"] / "exit_heads.pt"
+
+
+def find_exit_heads(work, run_id: str) -> Optional[Path]:
+    """Canonical path, or the legacy `checkpoints/` one if that is what exists.
+
+    Reads tolerate both locations so runs written before D-23 still work;
+    writes only ever use `exit_heads_path`. Returns None if neither exists.
+    """
+    L = run_layout(work, run_id)
+    for p in (L["base"] / "exit_heads.pt", L["checkpoints"] / "exit_heads.pt"):
+        if p.exists():
+            return p
+    return None
+
+
 _HISTORY_SET = frozenset(HISTORY_FIELDS)
 _HISTORY_WARNED: Set[str] = set()
 
@@ -6091,7 +6182,9 @@ def check_inputs(data_dir, run_ids: Sequence[str], split: str = "test",
             "trained": (base / "summary.json").exists(),
             "checkpoint": (base / "checkpoints" / "ckpt_best.pt").exists(),
             "epochs_csv": (base / "metrics" / "epochs.csv").exists(),
-            "exit_heads": (base / "checkpoints" / "exit_heads.pt").exists(),
+            # D-23: canonical location is the run root; tolerate the legacy one.
+            "exit_heads": ((base / "exit_heads.pt").exists()
+                           or (base / "checkpoints" / "exit_heads.pt").exists()),
             "per_sample_test": _has_table(ps, split),
             "final_eval": (base / "metrics" / "final.csv").exists(),
         }
@@ -6726,16 +6819,52 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     for p in teacher.parameters():
         p.requires_grad_(False)
 
+    # ---- O-19 / D-21 / D-22: fail in seconds, not in an hour ---------------
+    # Everything below this point -- exit-head training, the 50,000-image sweep,
+    # the first epoch -- costs about an hour before the first student batch is
+    # attempted, and the history row is only written at the END of that epoch.
+    # D-21 (an AMP-illegal loss) and D-22 (five wrong column names) each hid
+    # behind that hour. One synthetic batch and one throwaway history row
+    # exercise both code paths in under a second.
+    _dry_amp = bool(cfg.get("amp_enabled", True)) and device.type == "cuda"
+    _dry_ok, _dry_why = msckd_dry_run(cfg, teacher, device, _dry_amp,
+                                      alpha, beta, temperature)
+    if not _dry_ok:
+        registry.fail(run_id, f"dry run failed: {_dry_why}")
+        raise RuntimeError(
+            f"MSC-KD dry run failed BEFORE any expensive work: {_dry_why}\n"
+            f"This is the same code path the real training loop uses, so fix "
+            f"it and re-run -- no GPU time has been spent.")
+
     # Teacher MSC targets, aligned to the TRAINING set. The oracle writes the
     # test set and a 5k train holdout; the router needs targets on the data the
     # student actually trains on, so we sweep the teacher's exits over train.
-    t_heads_p = tL["checkpoints"] / "exit_heads.pt"
+    # D-23: use the SAME accessor the writer uses. This used to hard-code
+    # `checkpoints/exit_heads.pt` while run_oracle writes to the run root, so
+    # the heads were never found and every one of the nine MSC-KD runs retrained
+    # them -- ~20 epochs each, for a file already on HuggingFace.
+    t_heads_p = find_exit_heads(work, teacher_run)
+    if t_heads_p is None and hub is not None and getattr(hub, "enabled", False):
+        log(f"teacher exit heads not local -- pulling {teacher_run} from HF "
+            f"before retraining them", "MSCKD")
+        try:
+            hub.hub.download(work, allow_patterns=[f"runs/{teacher_run}/**"],
+                             quiet=True)
+        except Exception as e:                               # noqa: BLE001
+            log(f"pull failed: {type(e).__name__}: {e}", "MSCKD")
+        t_heads_p = find_exit_heads(work, teacher_run)
+
     t_me = MultiExitModel(teacher, cfg["num_classes"], freeze=True).to(device)
-    if t_heads_p.exists():
+    if t_heads_p is not None:
+        log(f"reusing teacher exit heads from {t_heads_p.relative_to(work)}",
+            "MSCKD")
         t_me.heads.load_state_dict(torch.load(t_heads_p, map_location=device,
                                               weights_only=False)["heads"])
     else:
-        log("teacher exit heads missing -- training them now (backbone frozen)", "MSCKD")
+        log(f"teacher exit heads genuinely absent (looked at "
+            f"{exit_heads_path(work, teacher_run).relative_to(work)} and the "
+            f"legacy checkpoints/ path) -- training them now, backbone frozen. "
+            f"This happens ONCE; later runs reuse the file.", "MSCKD")
         t_me = train_exit_heads(cfg, teacher, train_loader, val_loader, device,
                                 hub, t_dir, show_progress)
 
@@ -7503,7 +7632,9 @@ class Session:
                 "confusion": f"{b}/metrics/confusion_matrix.csv" in files,
                 "ckpt_last": f"{b}/checkpoints/ckpt_last.pt" in files,
                 "ckpt_best": f"{b}/checkpoints/ckpt_best.pt" in files,
-                "exit_heads": f"{b}/checkpoints/exit_heads.pt" in files,
+                # D-23: canonical is the run root; the legacy path still counts.
+                "exit_heads": (f"{b}/exit_heads.pt" in files
+                               or f"{b}/checkpoints/exit_heads.pt" in files),
                 "energy": f"{b}/telemetry/energy_samples.csv" in files,
                 "system": f"{b}/telemetry/system_samples.csv" in files,
                 "steps": f"{b}/telemetry/step_traces.jsonl" in files,
@@ -8434,6 +8565,33 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-23: writer and readers must agree on the exit-heads path ---------
+    # run_oracle writes to the run ROOT; train_msc_kd read `checkpoints/`. The
+    # teacher's heads were never found, so all nine MSC-KD runs retrained them
+    # (~20 epochs each) from a file already on HuggingFace. D-16 called this
+    # "cosmetic, nothing reads the path by convention" -- three things did.
+    _ehw = Path(tmp) / "eh"
+    _er = "p1-resnet32x4-cifar100-base-s1"
+    _eL = run_layout(_ehw, _er)
+    for _s in RUN_SUBDIRS:
+        ensure_dir(_eL[_s])
+    check("D-23: nothing found when nothing is written",
+          find_exit_heads(_ehw, _er) is None)
+    _canon = exit_heads_path(_ehw, _er)
+    check("D-23: the canonical path is the run root, not checkpoints/",
+          _canon.parent == _eL["base"], str(_canon.relative_to(_ehw)))
+    _canon.write_bytes(b"heads")
+    check("D-23: the writer's path is what the reader finds",
+          find_exit_heads(_ehw, _er) == _canon)
+    _canon.unlink()
+    (_eL["checkpoints"] / "exit_heads.pt").write_bytes(b"legacy")
+    check("D-23: the legacy checkpoints/ location is still honoured",
+          find_exit_heads(_ehw, _er) == _eL["checkpoints"] / "exit_heads.pt",
+          "runs written before this fix must not retrain")
+    _canon.write_bytes(b"heads")
+    check("D-23: canonical wins when both exist",
+          find_exit_heads(_ehw, _er) == _canon)
 
     # --- D-22: the MSC-KD history row must match HISTORY_FIELDS -------------
     # The old row used f1_score / precision / recall / grad_norm /
