@@ -140,14 +140,21 @@ All ten share `sample_order_hash = 80031c23…`. `recipe_ok: true` on every CNN.
 
 **39 of 45 Phase 1 runs have `per_sample/test.parquet`.** The six that do not:
 
+**Re-audited 2026-08-04 (later):** `wrn_16_2-s3` has since been measured, so
+the state is now **44/45 trained, 40/45 measured**:
+
 | run | trained? | measured? | consequence |
 |---|---|---|---|
 | `p1-wrn_16_2-…-s1` | ❌ no | ❌ | — |
-| `p1-wrn_16_2-…-s2` | ✅ | ❌ | |
-| `p1-wrn_16_2-…-s3` | ✅ | ❌ | **`wrn_16_2` has 0 usable seeds — absent from Q1 entirely** |
+| `p1-wrn_16_2-…-s2` | ✅ | ❌ | **`wrn_16_2` has 1 measured seed — a ceiling needs 2, so it still contributes to nothing** |
+| ~~`p1-wrn_16_2-…-s3`~~ | ✅ | ✅ | measured since the first audit |
 | `p1-wrn_40_1-…-s3` | ✅ | ❌ | `wrn_40_1` ceiling rests on 2 seeds |
 | `p1-vgg8-…-s1` | ✅ | ❌ | `vgg8` ceiling uses s2/s3 |
 | `p1-mixer_nano-…-s3` | ✅ | ❌ | `mixer_nano` ceiling rests on 2 seeds |
+
+**`NB16_Fix_Gaps.ipynb` closes all of it** — 1 training run + 5 measurements,
+~3.5 GPU-h. It discovers the gaps from the ledger and the per-sample tables
+rather than hard-coding them, so it stays correct and is safe to re-run.
 
 See **D-15**. `wrn_16_2` is the material gap: it is one of the 15 pre-registered
 architectures and currently contributes nothing to any analysis.
@@ -1559,7 +1566,7 @@ Draft, from the record:
 | ~~O-19~~ | ~~Dry-run one student batch before the teacher sweep~~ — **DONE.** `msckd_dry_run()` runs the full step on a 2-image batch in <1 s, before any teacher work | — | — | shipped |
 | O-18 | **Add a cross-session resume test.** Five defects have now been about resume (D-05, D-06, D-09, D-12, D-19) and every test we have runs inside one session — which is precisely the case that works. The acceptance test must delete the local run directory to simulate a fresh Kaggle session | the next D-19 | ~1 h | **high** |
 | O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
-| O-12 | **Close D-14/D-15:** null the `mobilenetv2` reference; measure the 6 unmeasured runs + train `wrn_16_2-s1`; add the NB08 coverage ALARM and the parameter-count assertion | "15 architectures" being true | ~4 GPU-h | **high** |
+| O-12 | **Run `NB16_Fix_Gaps.ipynb`** — trains `wrn_16_2-s1` and measures the 5 outstanding runs. Takes the analysis from **13 architectures to 15**. Also still to do: null the `mobilenetv2` reference (D-14) and add the parameter-count assertion | "15 architectures" being true | **~3.5 GPU-h** | **high** |
 | O-5 | Read SAFE-KD (2602.03043); write the differentiation memo | Related work | ~1 day | **high, not started** |
 | O-9 | **Break the family/accuracy confound in §1.2** — train one non-CNN to CNN-level accuracy, or one CNN down to ~60%, so the low-ceiling finding does not rest on `convnext_femto` alone | the Q1 headline | ~3 GPU-h | **high** |
 | O-14 | **Test the `convnext_femto` explanation (§1.4)** — is low transfer a property of transformer-ised CNNs, or of that one model? One more modern CNN settles it | a quotable sub-finding | ~2 GPU-h | medium |

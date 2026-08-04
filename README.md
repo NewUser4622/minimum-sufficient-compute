@@ -177,6 +177,7 @@ in any architecture we tried.
 | 13 | MSC-KD training | T4 | 9 | ~30 | ~30 h |
 | 14 | Method comparison | T4 | — | ~5 | ~5 h |
 | 15 | Paper outputs | **off** | — | — | ~10 min |
+| 16 | **Fix — finish the atlas** | T4 | ≤6 | ~3.5 | ~3.5 h (1 session) |
 
 **Total ≈ 163 GPU-hours.** Every notebook defaults to `NUM_WORKERS = 1`, meaning
 one account does all of it. Raise it and run the same notebook on each account

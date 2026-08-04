@@ -2872,6 +2872,224 @@ print('\\n'.join(lines[:45]))
 
 
 # ---------------------------------------------------------------------------
+def nb16():
+    return notebook([
+        md(f"""
+        # NB16 — Fix: finish the atlas
+
+        {HEADER_NOTE}
+
+        ## What this notebook is for
+
+        The atlas is **one training run and a handful of measurements short of
+        complete**, and the shortfall is not random. The work scheduler packs
+        runs by estimated cost and places the *cheapest* ones last, so when a
+        Kaggle session hits its time limit the small architectures are what
+        gets dropped. `wrn_16_2` (cost 1.70) and `vgg8` (cost 1.34) are the two
+        least expensive models in the zoo, which is exactly why they are the
+        ones missing. See defect **D-15**.
+
+        ## Why it is worth ~3.5 GPU-hours
+
+        `wrn_16_2` currently has **one** measured seed. A noise ceiling needs
+        two, so it contributes to **nothing** — not Q1, not Q2, not Q3, not Q4.
+        The atlas is being described as fifteen architectures and analysed as
+        thirteen.
+
+        | run | state | what finishing it buys |
+        |---|---|---|
+        | `wrn_16_2` s1 | **not trained** | third seed |
+        | `wrn_16_2` s2 | trained, unmeasured | **the ceiling — this is the one that matters** |
+        | `wrn_40_1` s3 | trained, unmeasured | 2 seeds → 3, tighter ceiling |
+        | `vgg8` s1 | trained, unmeasured | 2 seeds → 3, tighter ceiling |
+        | `mixer_nano` s3 | trained, unmeasured | 2 → 3 on a **low-ceiling** model where the extra seed is worth most |
+
+        Measuring `wrn_16_2` s2 alone takes the atlas from 13 architectures to
+        14. Training s1 as well takes it to the full 15 with three seeds each.
+
+        ## It finds the gaps itself
+
+        Nothing below is hard-coded. The notebook reads the ledger and the
+        per-sample tables and works out what is missing, so it stays correct as
+        you run it — and it is safe to re-run at any time. If everything is
+        already done it says so and stops.
+
+        ## Cost
+
+        | stage | runs | estimate |
+        |---|---|---|
+        | train | ≤ 1 | ~0.9 GPU-h |
+        | measure | ≤ 5 | ~0.5 GPU-h each |
+        | **total** | | **~3.5 GPU-h — one session** |
+
+        Order matters: training comes first, because a run trained here must
+        also be measured here.
+        """),
+        md("## Step 0 — Library"),
+        code(bootstrap_cell()),
+        md("""
+        ## Step 1 — Session
+
+        `NUM_WORKERS = 1` by default: one account does all of it. This is a
+        small job — splitting it across accounts costs more in coordination
+        than it saves.
+        """),
+        code(worker_cell("p1", n_runs=6, hours=3.5,
+                         note="Gap-filling. Tiny job -- one account is fine.")),
+        md("## Step 2 — Dataset"),
+        code(DATA_CELL),
+        md("## Step 3 — Catch up with HuggingFace"),
+        code(SYNC_CELL),
+        md("""
+        ## Step 4 — Work out what is actually missing
+
+        Two questions per run, and they have different answers:
+
+        - **trained?** — does `summary.json` exist with a full epoch count
+        - **measured?** — does `per_sample/test.parquet` exist
+
+        A run can be trained and unmeasured, which is the common case here.
+        `train_dynamics.parquet` is written *during training*, so a `per_sample`
+        directory that contains only that file is **not** a measured run — that
+        is precisely how these five hid.
+        """),
+        code("""\
+import pandas as pd
+
+ZOO_ARCHS = list(msc.ZOO)
+SEEDS = (1, 2, 3)
+expected = [(a, s) for a in ZOO_ARCHS for s in SEEDS]
+
+rows = []
+for arch, seed in expected:
+    rid = msc.make_run_id('p1', arch, 'cifar100', 'base', seed)
+    rows.append({'arch': arch, 'seed': seed, 'run_id': rid,
+                 'trained': sess.trained(rid),
+                 'measured': sess.measured(rid)})
+state = pd.DataFrame(rows)
+
+to_train   = state[~state.trained]
+to_measure = state[state.trained & ~state.measured]
+
+print(f'atlas: {int(state.trained.sum())}/{len(state)} trained, '
+      f'{int(state.measured.sum())}/{len(state)} measured\\n')
+
+per_arch = (state.groupby('arch')['measured'].sum()
+            .sort_values().rename('measured_seeds').to_frame())
+per_arch['in_analysis'] = per_arch.measured_seeds >= 2
+print('measured seeds per architecture (>=2 needed for a noise ceiling):')
+display(per_arch)
+starved = per_arch[~per_arch.in_analysis]
+if len(starved):
+    print(f'>>> {len(starved)} architecture(s) contribute to NO analysis: '
+          f'{", ".join(starved.index)}')
+
+print(f'\\nTO TRAIN   ({len(to_train)}): '
+      f'{", ".join(to_train.run_id) if len(to_train) else "none"}')
+print(f'TO MEASURE ({len(to_measure)}): '
+      f'{", ".join(to_measure.run_id) if len(to_measure) else "none"}')
+
+if not len(to_train) and not len(to_measure):
+    print('\\n*** Nothing to do -- the atlas is complete. '
+          'Re-run NB09-NB12 to pick up any new seeds. ***')
+"""),
+        md("""
+        ## Step 5 — Train whatever is missing
+
+        Resumable and idempotent, like every other training cell. If a run was
+        part-trained by an earlier session it continues from its checkpoint
+        rather than restarting (D-19).
+        """),
+        code("""\
+if len(to_train):
+    cfgs_t = [sess.config(r.arch, seed=int(r.seed))
+              for r in to_train.itertuples()]
+    res_t = sess.run_all(cfgs_t, title='gap-fill training')
+    for x in res_t:
+        print(f"{x.get('run_id')}: {x.get('status')}  "
+              f"acc={x.get('best_accuracy')}")
+else:
+    print('nothing to train')
+"""),
+        md("""
+        ## Step 6 — Measure everything outstanding
+
+        Recomputed from scratch rather than reusing the list from Step 4,
+        because Step 5 may have just produced a newly-trained run that also
+        needs measuring. Reusing the stale list is how the newly-trained model
+        would end up trained-but-unmeasured all over again.
+        """),
+        code("""\
+pending = [r for r in
+           (msc.make_run_id('p1', a, 'cifar100', 'base', s)
+            for a, s in expected)
+           if sess.trained(r) and not sess.measured(r)]
+print(f'{len(pending)} run(s) to measure: {pending}\\n')
+
+if pending:
+    cfgs_m = []
+    for rid in pending:
+        meta = msc.parse_run_id(rid)
+        c = sess.config(meta['arch'], seed=int(meta['seed']))
+        c['run_id'] = rid
+        cfgs_m.append(c)
+    # stage='measure': the ledger says 'completed' because TRAINING finished,
+    # so completion here is decided by whether the tables exist.
+    res_m = sess.run_all(cfgs_m, fn=sess.oracle, title='gap-fill measurement',
+                         done_fn=sess.measured, stage='measure')
+    for x in res_m:
+        print(f"{x.get('run_id')}: {x.get('status')}")
+else:
+    print('nothing to measure')
+"""),
+        md("""
+        ## Step 7 — Did it actually close the gap?
+
+        The question that matters is not "did the cells run" but **"does every
+        architecture now have two measured seeds"**, because that is the
+        condition for entering the analysis at all.
+        """),
+        code("""\
+final = []
+for arch, seed in expected:
+    rid = msc.make_run_id('p1', arch, 'cifar100', 'base', seed)
+    final.append({'arch': arch, 'seed': seed,
+                  'trained': sess.trained(rid),
+                  'measured': sess.measured(rid)})
+fdf = pd.DataFrame(final)
+summary = (fdf.groupby('arch')[['trained', 'measured']].sum()
+           .rename(columns={'trained': 'trained_seeds',
+                            'measured': 'measured_seeds'}))
+summary['has_ceiling'] = summary.measured_seeds >= 2
+display(summary)
+
+n_arch = int(summary.has_ceiling.sum())
+print(f'\\n{int(fdf.trained.sum())}/{len(fdf)} trained, '
+      f'{int(fdf.measured.sum())}/{len(fdf)} measured')
+print(f'{n_arch}/{len(summary)} architectures have a noise ceiling '
+      f'(>=2 measured seeds)')
+
+if n_arch < len(summary):
+    missing = list(summary[~summary.has_ceiling].index)
+    msc.log(f'{len(missing)} architecture(s) still contribute to no analysis: '
+            f'{missing}. Re-run this notebook in a fresh session -- the most '
+            f'likely cause is simply that the 8.5 h limit was reached.', 'ALARM')
+else:
+    print('\\n*** All 15 architectures now have a noise ceiling. ***')
+    print('Next: re-run NB09 -> NB10 -> NB11 -> NB12 (CPU only, ~20 min) so')
+    print('the analysis picks up the new seeds, then NB15 for the tables.')
+"""),
+        md("""
+        ## Step 8 — Push and verify
+
+        `finish()` drains the upload queue; the verify cell asks HuggingFace
+        whether the files actually landed. Draining is not confirmation — see
+        **D-19** and **D-20**.
+        """),
+        code(FINISH_CELL),
+    ])
+
+
 NOTEBOOKS = {
     "NB00_Setup_And_Verify.ipynb": nb00,
     "NB01_Phase0_Train.ipynb": nb01,
@@ -2926,6 +3144,7 @@ NOTEBOOKS = {
     "NB13_Method_MSCKD_Train.ipynb": nb13,
     "NB14_Method_Comparison.ipynb": nb14,
     "NB15_Paper_Outputs.ipynb": nb15,
+    "NB16_Fix_Gaps.ipynb": nb16,
 }
 
 
