@@ -111,7 +111,7 @@ Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LA
 |---|---|
 | `msc_core.py` | Reference implementation: the MSC oracle plus every analysis statistic. numpy/scipy/pandas/sklearn only — no torch. Self-tested. |
 | `msc_torch.py` | Reference model-side components: exit heads, ordinal sufficiency head, three-term loss, Learn-then-Test calibration. |
-| `src/msc_lib.py` | The pipeline: HF sync with shared rate limiting, sharded registry, cost-balanced work splitting, 15-architecture zoo, FLOPs budgets, resumable instrumented training, three-axis oracle, MSC-KD, final evaluation, analysis. **157 offline self-checks.** |
+| `src/msc_lib.py` | The pipeline: HF sync with shared rate limiting, sharded registry, cost-balanced work splitting, 15-architecture zoo, FLOPs budgets, resumable instrumented training, three-axis oracle, MSC-KD, final evaluation, analysis. **168 offline self-checks.** |
 | `build_notebooks.py` | Regenerates the 16 Kaggle notebooks, embedding `msc_lib.py` and `msc_core.py` as base64. |
 | `notebooks/` | 16 self-contained Kaggle notebooks. |
 
@@ -162,7 +162,7 @@ This restructure makes three of the five research questions produce publishable 
 
 ```bash
 python msc_core.py                  # self-test: the oracle and every statistic
-python src/msc_lib.py --selftest    # 157 offline checks on the pipeline, no GPU
+python src/msc_lib.py --selftest    # 168 offline checks on the pipeline, no GPU
 python build_notebooks.py --check   # confirm the notebooks match the library
 ```
 

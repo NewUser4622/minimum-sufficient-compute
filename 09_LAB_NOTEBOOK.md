@@ -25,8 +25,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Analysis re-run on the atlas** | Q1 ✅ (14 archs) · Q2 ❌ · Q3 ❌ · Q4 ❌ — still Phase-0-only |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas training + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) |
-| **Library version** | `msc_lib` 1.0.0 · 157 offline self-checks |
-| **Defects found** | 16 · 13 fixed · **3 open** (D-11, D-14, D-15) · 2 affect reported numbers (D-11, D-14) |
+| **Library version** | `msc_lib` 1.0.0 · **168** offline self-checks |
+| **Defects found** | 17 · 14 fixed · **3 open** (D-11, D-14, D-15) · 2 affect reported numbers (D-11, D-14) |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `a4aef3a`, 2026-08-04T05:28Z |
 
 **Audit basis for this board:** HF repo-info API at revision `a4aef3ac`, plus
@@ -405,6 +405,107 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-17 · The shuffled control cried wolf — a sanity check that was itself unsound
+
+**Severity:** blocked NB11 · **Status:** **fixed** · **Found:** 2026-08-04 by NB11 halting
+
+NB11 stopped at the scrambled-target control:
+
+```
+[ALARM] SHUFFLED CONTROL FAILED: T=-0.0506 (expected ~0). This is a BUG, not a
+finding -- check sample_idx alignment between p1-convnext_femto-...-s1 and
+p1-resnet20-...-s1.
+24/25 pairs pass
+AssertionError: Scrambled control FAILED -- tables are misaligned. Bug.
+```
+
+**There was no misalignment.** The check was miscalibrated, and it announced a
+bug in the data when the bug was in itself.
+
+**The arithmetic.** T is the *disattenuated* statistic, so the underlying raw
+rank correlation was `T × √(c_a·c_b) = −0.0506 × 0.6747 = −0.0341`. Under a
+random permutation the correlation of two rank vectors has mean 0 and variance
+exactly `1/(n−1)`; at n ≈ 5,872 that is SD **0.0131**. So the observed value was
+**z = −2.61**, a two-tailed p of 0.009. Across 25 pairs the chance of seeing at
+least one such draw is **20%**; across the full 78 pairs it is **50%**. The
+control was a coin-flip away from firing on a perfectly healthy pipeline.
+
+**Three independent calibration errors.**
+
+1. **Sample-size blind.** `abs(T) < 0.05` is a constant. At n = 6,000 it is 2.6σ;
+   at n = 25,000 it is 5σ. The same threshold means completely different
+   strictness depending on how many samples survived the τ mask — and the mask
+   changes n by architecture.
+2. **Ceiling-dependent, in the worst possible direction.** T divides by
+   `√(c_a·c_b)`, so a *low-ceiling* pair reaches the same T at a *smaller* raw
+   correlation. Measured on our own ceilings:
+
+   | pair | denominator | trips at \|ρ\| | in σ | false-alarm rate |
+   |---|---|---|---|---|
+   | `vit_tiny` × `mixer_nano` | 0.5472 | 0.0274 | 2.10σ | **3.6%** |
+   | `convnext_femto` × `resnet20` | 0.6746 | 0.0337 | 2.58σ | 1.0% |
+   | `resnet32x4` × `vgg8` | 0.7252 | 0.0363 | 2.78σ | 0.5% |
+
+   The control was **~7× more likely to false-alarm on the low-ceiling pairs** —
+   which are exactly the ViT and Mixer pairs carrying the headline finding of
+   §1.2. A sanity check biased against your own most important result is worse
+   than no check.
+3. **Multiplicity blind.** ~1% per pair × 78 pairs. Not *whether*, only *when*.
+
+**A fourth problem, and the one that settles it.** The test was two-sided
+against a **one-sided failure mode**. Index leakage makes a shuffle behave like
+a non-shuffle — it drives the correlation *up*, toward the true transfer of
+~0.6. There is no mechanism by which misaligned tables produce a *small negative*
+correlation. The observed −0.0341 could not have been the thing being tested for,
+whatever threshold was used.
+
+**Contamination analysis.**
+
+- **No published number is affected.** The control gates Q3; it never enters one.
+  The Phase 0 shuffled control (T = 0.0072, §1.6) passes under old and new rules
+  alike, and its raw ρ of 0.0052 is z ≈ 0.5 — genuinely null.
+- **No result was wrongly accepted.** The failure mode was false-alarm, not
+  false-pass. Nothing got through that should not have.
+- **The cost was a stop, and nearly worse.** The real risk is the *other*
+  branch: a check that fires on healthy data trains you to dismiss it, and the
+  next alarm is the real one. That is the damage this defect could have done.
+
+**Fix.** `shuffled_control_verdict(rho, n, z_max=5.0, rho_floor=0.10)`:
+
+- operates on the **raw** correlation, so ceilings never enter the decision;
+- compares against the **exact** permutation null `1/√(n−1)` — exact rather than
+  asymptotic, which matters because MSC is heavily tied (it takes only K
+  distinct budget values, so a normal approximation would be the wrong tool);
+- requires **both** `|z| > 5` **and** `|ρ| > 0.10`. Both terms carry weight:
+  without the z term the rule is sample-size blind again; without the ρ floor,
+  n = 10⁶ makes ρ = 0.02 a 20σ "failure" that is true and meaningless.
+- Takes the **worst of 3 permutations**, so one lucky draw cannot certify a
+  broken pipeline.
+- Calls **`assert_aligned` directly.** This is the point. `analyse_q3_transfer`
+  has always called it (line 5978); the control was an indirect proxy for a
+  hash comparison that was already available and is definitive. The proxy now
+  sits behind the real check rather than in front of it.
+
+At 5σ with a 0.10 floor, a genuine leak lands at **z ≈ 46** and fails by a wide
+margin, while the family-wise false-alarm rate over ~100 pairs is ~10⁻⁴.
+
+**Also fixed in NB11 while here:**
+
+- the control ran on `pairs[:25]` of 78 — **53 pairs were never tested.** Now all.
+- `save_analysis` ran *after* the assert, so a genuine failure would have thrown
+  away the evidence needed to diagnose it. Now saves first, asserts second.
+- the cell printed a bare dict; it now reports ρ, z, n and the null SD, sorted
+  worst-first, so the reader can see how far from the threshold they are.
+- `disattenuated_transfer` gained an `n_boot <= 0` short-circuit — the control
+  never used the CI it was paying 200 resamples per pair for.
+
+**Guard added:** 11 self-checks pin the rule offline, including the exact
+(−0.0341, n=5872) case as a regression, a synthetic leak at ρ=0.60, and both
+degenerate corners (huge-n/tiny-ρ, tiny-n/moderate-ρ). Self-checks 157 → **168**.
+The decision rule was deliberately split into a pure function so it is testable
+without measured parquet files on disk — **the old rule was unreachable by any
+offline test, which is why it shipped wrong.**
 
 ### D-16 · `exit_heads.pt` is written outside the documented layout
 
@@ -845,6 +946,7 @@ produce is one CPU-only notebook away.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | **D-17 — the shuffled control was miscalibrated and halted NB11 on healthy data.** Rule rebuilt against the exact permutation null; 11 regression checks added; the control now tests all 78 pairs, not 25 |
 | 2026-08-04 | D-16 — `exit_heads.pt` written outside the documented layout |
 | 2026-08-04 | D-15 — **6 of 45 runs unmeasured; `wrn_16_2` has zero usable seeds.** The atlas is currently 14 architectures, not 15 |
 | 2026-08-04 | D-14 — **`mobilenetv2` +5.50 is against a half-width baseline.** Not a win; reference to be nulled |

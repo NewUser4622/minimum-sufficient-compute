@@ -205,13 +205,18 @@ def disattenuated_transfer(
     denom = np.sqrt(max(ceiling_a, 1e-9) * max(ceiling_b, 1e-9))
     t_point = raw / denom if denom > 0 else float("nan")
 
-    rng = np.random.default_rng(seed)
     n = a.size
-    boots = np.empty(n_boot)
-    for i in range(n_boot):
-        idx = rng.integers(0, n, n)
-        boots[i] = spearman(a[idx], b[idx]) / denom
-    lo, hi = np.nanpercentile(boots, [2.5, 97.5])
+    if n_boot <= 0:
+        # Callers that only need the point estimate -- the shuffled control, for
+        # one -- pass n_boot=0 rather than paying for a CI they discard.
+        lo = hi = float("nan")
+    else:
+        rng = np.random.default_rng(seed)
+        boots = np.empty(n_boot)
+        for i in range(n_boot):
+            idx = rng.integers(0, n, n)
+            boots[i] = spearman(a[idx], b[idx]) / denom
+        lo, hi = np.nanpercentile(boots, [2.5, 97.5])
 
     return {
         "spearman_raw": raw,

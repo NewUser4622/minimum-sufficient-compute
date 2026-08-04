@@ -1031,7 +1031,9 @@ print('\\nThese are excluded from all correlations. Reported separately in the p
 ctrl = msc.analyse_q3_shuffled_control(
     sess.data_dir, A1, B1, ceilings={A1: ceil_a, B1: ceil_b},
     budgets_by_run={A1: bud_a, B1: bud_b}, tau=0.1)
-print(ctrl)
+print(f"shuffled rho = {ctrl['spearman_raw']:+.4f}   z = {ctrl['z']:+.2f}   "
+      f"n = {ctrl['n']}   (null SD = {ctrl['null_sd']:.4f})")
+print(f"bug threshold: |z| > {ctrl['z_max']:.0f} AND |rho| > {ctrl['rho_floor']:.2f}")
 assert ctrl['passed'], ('Scrambled control FAILED. This is a bug, not a finding. '
                         'The per-image tables are not row-aligned.')
 print('\\nControl passed -- the numbers above are trustworthy.')
@@ -1819,18 +1821,31 @@ print(f'{len(seed1)} architectures available for the transfer matrix')
         md("""
         ## Step 3 — The sanity check, on every pair
 
-        Scramble one side, re-measure. Must be ≈ 0.
+        Scramble one side, re-measure. Agreement must collapse.
 
         Run this **before** looking at the real numbers. Misaligned tables
         produce entirely believable results.
+
+        **"Collapse" needs a number, and eyeballing one is how you build an
+        alarm that cries wolf.** A shuffle doesn't leave exactly zero — the
+        leftover correlation wobbles, with standard deviation `1/√n` ≈ 0.013
+        here. Across ~78 pairs you should *expect* two or three draws sitting
+        2–3 wobbles out. That is arithmetic, not a bug.
+
+        So a pair is flagged only when the leftover correlation is both
+        **impossible under shuffling** (|z| > 5) **and large enough to matter**
+        (|ρ| > 0.10). A real alignment bug doesn't squeak past that pair of
+        conditions — it lands near ρ ≈ 0.6, roughly 45σ out. The earlier
+        version of this check used a flat `|T| < 0.05` and failed a healthy
+        pair at 2.6σ; see **D-17**.
         """),
         code("""\
 import itertools
 pairs = list(itertools.combinations(sorted(seed1), 2))
-print(f'{len(pairs)} architecture pairs\\n')
+print(f'{len(pairs)} architecture pairs -- testing every one\\n')
 
 ctrl = []
-for a, b in pairs[:25]:
+for a, b in pairs:
     c = msc.analyse_q3_shuffled_control(sess.data_dir, seed1[a], seed1[b],
                                         ceilings, budgets, tau=0.1)
     c.update({'arch_a': a, 'arch_b': b})
@@ -1840,10 +1855,26 @@ if not len(ctrl):
     print('No architecture pairs available yet. Q3 needs at least two')
     print('architectures measured AND a noise ceiling for each (NB09).')
 else:
-    display(ctrl[['arch_a', 'arch_b', 'T_shuffled', 'passed']].round(4))
-    print(f'\\n{ctrl.passed.sum()}/{len(ctrl)} pairs pass')
-    assert ctrl.passed.all(), 'Scrambled control FAILED -- tables are misaligned. Bug.'
+    # Save BEFORE asserting. If the control ever does fail we want the evidence
+    # sitting on HuggingFace to diagnose from, not an exception and an empty
+    # analysis folder.
     msc.save_analysis(sess.data_dir, 'q3_shuffled_control', ctrl, sess.hub)
+
+    worst = ctrl.reindex(ctrl.z.abs().sort_values(ascending=False).index)
+    print('Ten largest deviations (everything else is smaller):')
+    display(worst[['arch_a', 'arch_b', 'spearman_raw', 'z', 'n', 'passed']]
+            .head(10).round(4))
+    zmax, rfloor = ctrl.z_max.iloc[0], ctrl.rho_floor.iloc[0]
+    print(f'\\n{ctrl.passed.sum()}/{len(ctrl)} pairs pass')
+    print(f'largest |rho| = {ctrl.spearman_raw.abs().max():.4f} '
+          f'(|z| = {ctrl.z.abs().max():.1f})')
+    print(f'bug threshold = |z| > {zmax:.0f} AND |rho| > {rfloor:.2f}')
+    print(f'null SD at this n is ~{ctrl.null_sd.mean():.4f}, so |z| of 2-3 on a '
+          f'few of {len(ctrl)} pairs is expected and is NOT a defect.')
+    assert ctrl.passed.all(), (
+        'Scrambled control FAILED -- shuffling did not destroy the correlation, '
+        'so the per-image tables are not paired by sample_idx. Bug, not a finding.')
+    print('\\nControl passed -- the transfer numbers below are trustworthy.')
 """),
         md("""
         ## Step 4 — The transfer matrix

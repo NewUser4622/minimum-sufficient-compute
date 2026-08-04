@@ -6068,29 +6068,113 @@ def analyse_q3_transfer(data_dir, pairs: Sequence[Tuple[str, str]],
     return pd.DataFrame(rows)
 
 
+def shuffled_control_verdict(rho: float, n: int, z_max: float = 5.0,
+                             rho_floor: float = 0.10) -> Tuple[bool, float, float]:
+    """Is a shuffled-control residual noise, or a bug? Returns (passed, z, sd).
+
+    Split out of `analyse_q3_shuffled_control` on purpose. The decision rule is
+    exactly where defect D-17 lived, and a rule reachable only through a full
+    analysis run -- needing measured parquet files, ceilings and budgets on disk
+    -- is a rule that never gets a unit test. Here it is a pure function of two
+    numbers and is checked offline on every self-test.
+
+    Under a random permutation the correlation of two rank vectors has mean 0
+    and variance exactly 1/(n-1). That is exact, not asymptotic, and holds with
+    arbitrary ties -- which matters because MSC takes only K distinct values.
+
+    A pair fails only if the residual is BOTH impossible under shuffling
+    (|z| > z_max) AND big enough to be worth acting on (|rho| > rho_floor).
+    Both conditions are load-bearing:
+
+      - Without the z term, the cutoff is sample-size blind (D-17 cause 1).
+      - Without the rho floor, a large enough n makes any trivial residual
+        "significant": at n = 1e6 a rho of 0.02 is 20 sigma and would fail,
+        which is statistically true and practically meaningless.
+    """
+    null_sd = 1.0 / math.sqrt(n - 1) if n > 2 else float("nan")
+    z = rho / null_sd if null_sd == null_sd and null_sd > 0 else float("nan")
+    passed = not (abs(z) > z_max and abs(rho) > rho_floor)
+    return bool(passed), float(z), float(null_sd)
+
+
 def analyse_q3_shuffled_control(data_dir, run_a: str, run_b: str,
                                 ceilings, budgets_by_run, axis="depth",
-                                tau: float = 0.1, seed: int = 0) -> Dict[str, Any]:
+                                tau: float = 0.1, seed: int = 0,
+                                z_max: float = 5.0, rho_floor: float = 0.10,
+                                n_shuffles: int = 3) -> Dict[str, Any]:
     """The pipeline sanity check, not a scientific result.
 
-    Shuffled transfer must be ~0. If it is not, there is a bug -- almost
-    certainly index misalignment between the two models' per-sample tables.
-    Catch it here, before any conclusion is drawn from a real number.
+    Shuffling one side must destroy the correlation. If it does not, the tables
+    are not really being paired by `sample_idx` and every Q3 number is void.
+
+    CALIBRATION -- see D-17. The original criterion was ``abs(T) < 0.05`` on the
+    DISATTENUATED statistic. It fired on a perfectly healthy pair, and it was
+    miscalibrated three separate ways:
+
+      1. SAMPLE-SIZE BLIND. Under a random permutation the rank correlation has
+         mean 0 and SD exactly ``1/sqrt(n-1)`` -- about 0.013 at our n~5,900. A
+         fixed 0.05 cutoff is 2.6 sigma at n=6,000 but 5 sigma at n=25,000. The
+         same constant means entirely different strictness at different n.
+      2. CEILING-DEPENDENT, IN THE WORST DIRECTION. ``T = rho / sqrt(ca*cb)``,
+         so a low-ceiling pair divides by a smaller number and trips the same
+         cutoff at a smaller rho. `vit_tiny` x `mixer_nano` trips at 2.10 sigma
+         (3.6% by chance); `resnet32x4` x `vgg8` needs 2.78 sigma (0.5%). The
+         control was ~7x more likely to false-alarm on precisely the
+         low-ceiling architectures that carry the project's headline finding.
+      3. MULTIPLICITY BLIND. At ~1% per pair, P(at least one failure) is 20%
+         over 25 pairs and 50% over the full 78. It was not a question of
+         whether this would fire, only when.
+
+    It was also two-sided against a one-sided failure mode. Index leakage
+    inflates correlation UPWARD -- it makes a shuffle look like a non-shuffle.
+    No misalignment mechanism produces a small NEGATIVE correlation, so failing
+    on one was never diagnostic of anything.
+
+    The test now runs on the RAW rank correlation against its exact permutation
+    null, and demands BOTH statistical and practical significance: ``|z| >
+    z_max`` AND ``|rho| > rho_floor``. A real leak gives rho near the true
+    transfer (~0.6, z ~ 45) and clears both by a mile; noise clears neither.
+    `assert_aligned` is also called directly -- the hash comparison is the real
+    check this control was only ever standing in for.
+
+    The permutation null is exact rather than asymptotic: for any fixed pair of
+    score vectors the permutation variance of the correlation of their ranks is
+    exactly ``1/(n-1)``, ties included. MSC is heavily tied (it takes only K
+    distinct budget values), so an asymptotic normal approximation would have
+    been the wrong tool here; this one is not affected.
     """
     core = _import_msc_core()
     da, db = load_per_sample(data_dir, run_a), load_per_sample(data_dir, run_b)
+    assert_aligned({run_a: da, run_b: db})   # the direct check, not a proxy for it
     ma = msc_for_run(da, budgets_by_run[run_a], axis, tau).clean()
     mb = msc_for_run(db, budgets_by_run[run_b], axis, tau).clean()
-    sh = core.disattenuated_transfer(ma, shuffle_msc_targets(mb, seed),
-                                     ceilings.get(run_a, 1.0),
-                                     ceilings.get(run_b, 1.0), n_boot=200)
-    passed = abs(sh["T"]) < 0.05
+
+    # Several permutations, judged on the worst, so a single lucky draw cannot
+    # certify a pipeline that is actually broken.
+    worst = None
+    for k in range(max(1, int(n_shuffles))):
+        sh = core.disattenuated_transfer(ma, shuffle_msc_targets(mb, seed + k),
+                                         ceilings.get(run_a, 1.0),
+                                         ceilings.get(run_b, 1.0), n_boot=0)
+        if worst is None or abs(sh["spearman_raw"]) > abs(worst["spearman_raw"]):
+            worst = sh
+
+    rho = float(worst["spearman_raw"])
+    n = int(worst.get("n", 0) or 0)
+    passed, z, null_sd = shuffled_control_verdict(rho, n, z_max, rho_floor)
     if not passed:
-        log(f"SHUFFLED CONTROL FAILED: T={sh['T']:.4f} (expected ~0). "
-            f"This is a BUG, not a finding -- check sample_idx alignment "
-            f"between {run_a} and {run_b}.", "ALARM")
-    return {"T_shuffled": sh["T"], "spearman_raw": sh["spearman_raw"],
-            "passed": bool(passed), "tau": tau, "axis": axis}
+        log(f"SHUFFLED CONTROL FAILED: rho={rho:+.4f} (z={z:+.1f}, n={n}). "
+            f"Shuffling did not destroy the correlation, so the tables are not "
+            f"being paired by sample_idx. This is a BUG, not a finding -- check "
+            f"{run_a} against {run_b}.", "ALARM")
+    elif abs(z) > 3.0:
+        log(f"shuffled control for {run_a} x {run_b}: rho={rho:+.4f} "
+            f"(z={z:+.1f}) -- larger than typical but far below the {z_max:.0f}"
+            f"-sigma / {rho_floor:.2f}-rho bug threshold, and expected "
+            f"occasionally across many pairs. Passing.", "INFO")
+    return {"T_shuffled": worst["T"], "spearman_raw": rho, "z": z,
+            "null_sd": null_sd, "n": n, "passed": bool(passed),
+            "tau": tau, "axis": axis, "z_max": z_max, "rho_floor": rho_floor}
 
 
 def analyse_q4_irreducibility(data_dir, run_a: str, run_b: str, budgets_by_run,
@@ -7972,6 +8056,53 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-17 regression: the verdict rule that used to cry wolf -------------
+    # The exact case that failed NB11: convnext_femto x resnet20, raw rho of
+    # -0.0341 at n=5872. That is 2.6 sigma -- a 1-in-113 draw, seen once across
+    # 78 pairs, which is precisely what "expected" looks like.
+    ok, z, sd = shuffled_control_verdict(-0.0341, 5872)
+    check("D-17: a healthy 2.6-sigma residual passes", ok, f"z={z:+.2f}")
+    check("D-17: null SD matches 1/sqrt(n-1)", abs(sd - 1 / math.sqrt(5871)) < 1e-12)
+    check("D-17: the old |T|<0.05 rule would have failed it",
+          abs(-0.0341 / math.sqrt(0.7084 * 0.6425)) > 0.05,
+          "this is the bug being regressed against")
+
+    # A real index leak: shuffling leaves the true transfer intact.
+    ok_leak, z_leak, _ = shuffled_control_verdict(0.60, 5872)
+    check("a genuine leak fails", not ok_leak, f"z={z_leak:+.1f}")
+    check("and fails by a wide margin, not marginally", abs(z_leak) > 40)
+
+    # The rho floor: significance without magnitude must not fire.
+    ok_big_n, z_big_n, _ = shuffled_control_verdict(0.02, 1_000_000)
+    check("huge n + trivial rho passes despite significance",
+          ok_big_n and abs(z_big_n) > 15, f"z={z_big_n:+.1f}, rho=0.02")
+
+    # The z term: magnitude without significance must not fire either.
+    ok_small_n, z_small_n, _ = shuffled_control_verdict(0.12, 30)
+    check("tiny n + moderate rho passes (not yet distinguishable)",
+          ok_small_n, f"z={z_small_n:+.2f}, rho=0.12")
+
+    # Both conditions together.
+    check("large rho at large n fails",
+          not shuffled_control_verdict(0.15, 5872)[0])
+
+    # Sample-size sensitivity -- the property the flat cutoff lacked.
+    _, z_a, _ = shuffled_control_verdict(0.03, 6_000)
+    _, z_b, _ = shuffled_control_verdict(0.03, 25_000)
+    check("the same rho is judged differently at different n",
+          abs(z_b) > 2 * abs(z_a), f"z(6k)={z_a:+.2f} vs z(25k)={z_b:+.2f}")
+
+    # Ceiling independence -- D-17 cause 2. The verdict must not see ceilings.
+    check("verdict is ceiling-independent by construction",
+          shuffled_control_verdict(-0.0341, 5872)[0]
+          is shuffled_control_verdict(-0.0341, 5872)[0],
+          "operates on raw rho, ceilings never enter")
+
+    # Symmetry: the rule is two-sided but a leak is one-sided; both must behave.
+    check("verdict is symmetric in the sign of rho",
+          shuffled_control_verdict(0.60, 5872)[0]
+          == shuffled_control_verdict(-0.60, 5872)[0])
 
     print("gate decision table")
     check("noise-dominated -> FAIL",
