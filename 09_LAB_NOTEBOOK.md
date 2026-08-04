@@ -18,14 +18,21 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 
 | | |
 |---|---|
-| **Phase** | 0 complete · Phase 1: **NB04 14/15 on HF** · NB05–NB07 **not yet on HF** |
+| **Phase** | 0 complete · Phase 1 **atlas trained 44/45, measured 39/45** · NB09 re-run atlas-wide |
 | **Verdict** | `FULL-PROGRAM` (2026-08-02) |
-| **Runs completed** | Phase 0: 4/4 trained + measured · NB04: 14/15 trained, **0 measured** · NB05/06/07: 0 on HF |
-| **GPU-hours spent** | ~42 (9.5 Phase 0 + ~32 atlas, incl. 2.9 wasted to D-12) |
-| **GPU-hours remaining** | ~120 |
-| **Library version** | `msc_lib` 1.0.0 · 143 offline self-checks |
-| **Defects found** | 13 · all fixed · 1 affects a reported number (D-11) · 1 cost GPU-time (D-12) |
-| **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` |
+| **Runs trained** | Phase 0 **4/4** · Phase 1 **44/45** — only `p1-wrn_16_2-…-s1` missing |
+| **Runs measured** | Phase 0 **4/4** · Phase 1 **39/45** — see D-15 for the six gaps |
+| **Analysis re-run on the atlas** | Q1 ✅ (14 archs) · Q2 ❌ · Q3 ❌ · Q4 ❌ — still Phase-0-only |
+| **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas training + ~20 measurement + 2.9 wasted to D-12) |
+| **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) |
+| **Library version** | `msc_lib` 1.0.0 · 157 offline self-checks |
+| **Defects found** | 16 · 13 fixed · **3 open** (D-11, D-14, D-15) · 2 affect reported numbers (D-11, D-14) |
+| **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `a4aef3a`, 2026-08-04T05:28Z |
+
+**Audit basis for this board:** HF repo-info API at revision `a4aef3ac`, plus
+direct `tree/` listings for every run whose state the truncated file list left
+ambiguous. Counts below are from files that actually exist on HF, not from the
+run ledger.
 
 ---
 
@@ -60,7 +67,7 @@ tables are index-aligned and may be correlated.
 ### 1.1b Phase 1 atlas — ResNet family (NB04)
 
 Same recipe. Four Kaggle accounts, workers 0–3, cost-balanced split.
-**14 of 15 complete.** All completed runs beat their published references.
+**15 of 15 complete.** All beat their published references.
 
 | arch | s1 | s2 | s3 | mean | published | Δ |
 |---|---|---|---|---|---|---|
@@ -68,14 +75,16 @@ Same recipe. Four Kaggle accounts, workers 0–3, cost-balanced split.
 | `resnet56` | 73.88 | 73.35 | 73.85 | **73.69** | 72.34 | **+1.35** |
 | `resnet110` | 74.31 | 74.57 | 74.26 | **74.38** | 74.31 | **+0.07** |
 | `resnet8x4` | 73.35 | 73.39 | 73.04 | **73.26** | 72.50 | **+0.76** |
-| `resnet32x4` | 79.72 | 80.03 | *incomplete* | **79.88**\* | 79.42 | **+0.46** |
+| `resnet32x4` | 79.72 | 80.03 | 79.46 | **79.74** | 79.42 | **+0.32** |
 
-\* two seeds only. `p1-resnet32x4-cifar100-base-s3` stopped at **epoch 79/240**
-(best 64.47% so far), resumable from its checkpoint. See D-12.
+`p1-resnet32x4-cifar100-base-s3` — the run D-12 abandoned at epoch 79/240 — was
+resumed and **completed 240/240 on 2026-08-03T21:10Z at 79.46%**. This is the
+first end-to-end proof that the resume path works on a real interrupted run
+rather than on the synthetic test of D-06. Open item O-1b is closed.
 
-Seed spread: resnet20 0.58 pts, resnet56 0.53, resnet110 0.31, resnet8x4 0.35.
-All four share `sample_order_hash = 80031c23…`, matching Phase 0 — the atlas and
-pilot tables are mutually correlatable.
+Seed spread: resnet20 0.58 pts, resnet56 0.53, resnet110 0.31, resnet8x4 0.35,
+resnet32x4 0.57. All share `sample_order_hash = 80031c23…`, matching Phase 0 —
+the atlas and pilot tables are mutually correlatable.
 
 Wall-clock: 11:51 → 20:31 (~8.7 h) across four accounts for ~32 GPU-hours of
 work, of which 2.9 h were wasted re-training a run another account had already
@@ -83,27 +92,169 @@ done (D-12).
 
 *source* `runs/p1-*/summary.json`, `registry/events/*.jsonl`
 
+### 1.1c Phase 1 atlas — remaining ten architectures (NB05–NB07)
+
+Completed 2026-08-03 → 2026-08-04. CNNs 240 epochs on the CRD recipe; the three
+modern architectures 300 epochs. One representative seed shown per architecture —
+these are the values read directly off HF, not seed means, because the combined
+table (`tables/`) is produced by NB15 and NB15 has not run.
+
+| arch | family | seed | top-1 | top-5 | published | Δ | params | GFLOPs | GPU-h | kWh | ep |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `wrn_40_2` | wrn | 1 | 76.06 | 93.46 | 75.61 | **+0.45** | 2.26 M | 0.658 | 1.94 | 0.146 | 240 |
+| `wrn_40_1` | wrn | 1 | 72.41 | 92.41 | 71.98 | **+0.43** | 0.57 M | 0.168 | 1.64 | 0.107 | 240 |
+| `wrn_16_2` | wrn | 2 | 73.79 | 93.56 | 73.26 | **+0.53** | 0.70 M | 0.203 | 0.94 | 0.071 | 240 |
+| `vgg13` | vgg | 1 | 75.70 | 92.85 | 74.64 | **+1.06** | 9.46 M | 0.458 | 1.12 | 0.082 | 240 |
+| `vgg8` | vgg | 2 | 71.73 | 91.26 | 70.36 | **+1.37** | 3.96 M | 0.136 | 0.74 | 0.055 | 240 |
+| `mobilenetv2` | mobile | 1 | 70.10 | 92.33 | 64.60 | **+5.50** ⚠ | 2.35 M | 0.183 | 2.20 | 0.166 | 240 |
+| `shufflenetv2` | mobile | 1 | 71.93 | 92.64 | 70.50 | **+1.43** | 1.36 M | 0.092 | 2.22 | 0.130 | 240 |
+| `convnext_femto` | convnext | 1 | 62.67 | 79.51 | — | — | 4.87 M | 0.126 | 1.99 | 0.148 | 300 |
+| `vit_tiny` | vit | 1 | 59.33 | 79.49 | — | — | 5.38 M | 0.694 | 2.65 | 0.199 | 300 |
+| `mixer_nano` | mixer | 1 | 60.23 | 79.96 | — | — | 2.50 M | 0.343 | 1.59 | 0.118 | 300 |
+
+⚠ **The `mobilenetv2` +5.50 is not a win — see D-14.** The 64.60 reference is
+for the *half-width* MobileNetV2 used in the CRD/mdistiller student tables;
+our model has 2.35 M parameters against roughly 0.81 M for that baseline. Do
+not report this row as beating a published number.
+
+The three modern architectures correctly carry `reference_accuracy: null` — no
+established from-scratch CIFAR-100 number exists for them, so no Δ is claimed.
+Their 59–63% top-1 is the expected range for attention/MLP models trained from
+scratch on 50 k images without heavy augmentation, and is **not** evidence of an
+under-trained run. It does, however, constrain what the atlas can claim about
+them — see §1.2.
+
+All ten share `sample_order_hash = 80031c23…`. `recipe_ok: true` on every CNN.
+
+*source* `runs/p1-{arch}-cifar100-base-s{n}/summary.json`
+
+### 1.1d Measurement coverage (NB08)
+
+**39 of 45 Phase 1 runs have `per_sample/test.parquet`.** The six that do not:
+
+| run | trained? | measured? | consequence |
+|---|---|---|---|
+| `p1-wrn_16_2-…-s1` | ❌ no | ❌ | — |
+| `p1-wrn_16_2-…-s2` | ✅ | ❌ | |
+| `p1-wrn_16_2-…-s3` | ✅ | ❌ | **`wrn_16_2` has 0 usable seeds — absent from Q1 entirely** |
+| `p1-wrn_40_1-…-s3` | ✅ | ❌ | `wrn_40_1` ceiling rests on 2 seeds |
+| `p1-vgg8-…-s1` | ✅ | ❌ | `vgg8` ceiling uses s2/s3 |
+| `p1-mixer_nano-…-s3` | ✅ | ❌ | `mixer_nano` ceiling rests on 2 seeds |
+
+See **D-15**. `wrn_16_2` is the material gap: it is one of the 15 pre-registered
+architectures and currently contributes nothing to any analysis.
+
 ---
 
-### 1.2 Q1 — noise ceiling (ρ_seed)
+### 1.2 Q1 — noise ceiling (ρ_seed) — **now atlas-wide, 14 architectures**
 
-Spearman between MSC of seed 1 and seed 2, same architecture, depth axis,
-irreducible samples masked.
+Spearman between MSC of two seeds of the *same* architecture, depth axis,
+irreducible samples masked. This is the denominator every transfer number gets
+divided by, so it is the single most important quantity in the project.
 
-| τ | resnet32x4 | wrn-40-2 | J₁₀ (r32x4) | J₁₀ (wrn) | n (r32x4) |
-|---|---|---|---|---|---|
-| 0.0 | 0.6844 | 0.6604 | 0.4212 | 0.6221 | 10000 |
-| **0.1** | **0.7172** | **0.7147** | 0.4599 | 0.6425 | 8549 |
-| 0.2 | 0.7248 | 0.7241 | 0.4783 | 0.6553 | 7766 |
-| 0.3 | 0.7217 | 0.7154 | 0.4894 | 0.6633 | 7194 |
-| 0.5 | 0.6962 | 0.6900 | 0.5044 | 0.6789 | 6267 |
+| arch | family | τ=0.0 | **τ=0.1** | τ=0.2 | τ=0.3 | τ=0.5 |
+|---|---|---|---|---|---|---|
+| `resnet32x4` | resnet | 0.6927 | **0.7256** | 0.7242 | 0.7202 | 0.6946 |
+| `vgg8` | vgg | 0.6576 | **0.7248** | 0.7285 | 0.7443 | 0.7295 |
+| `wrn_40_2` | wrn | 0.6671 | **0.7089** | 0.7032 | 0.7059 | 0.6788 |
+| `convnext_femto` | convnext | 0.6188 | **0.7084** | 0.7187 | 0.7198 | 0.7037 |
+| `mobilenetv2` | mobile | 0.6248 | **0.6880** | 0.7007 | 0.6951 | 0.6675 |
+| `shufflenetv2` | mobile | 0.6124 | **0.6698** | 0.6871 | 0.6894 | 0.6623 |
+| `vgg13` | vgg | 0.6019 | **0.6689** | 0.6821 | 0.6825 | 0.6666 |
+| `resnet8x4` | resnet | 0.6134 | **0.6671** | 0.6820 | 0.6795 | 0.6734 |
+| `wrn_40_1` | wrn | 0.6172 | **0.6559** | 0.6768 | 0.6765 | 0.6462 |
+| `resnet20` | resnet | 0.5784 | **0.6425** | 0.6512 | 0.6482 | 0.6268 |
+| `resnet110` | resnet | 0.5996 | **0.6339** | 0.6234 | 0.6099 | 0.5819 |
+| `resnet56` | resnet | 0.6104 | **0.6217** | 0.6156 | 0.5944 | 0.6013 |
+| `vit_tiny` | **vit** | 0.4775 | **0.5475** | 0.5831 | 0.6026 | 0.6056 |
+| `mixer_nano` | **mixer** | 0.5080 | **0.5470** | 0.5322 | 0.5034 | 0.4733 |
 
-*source* `analysis/q1_seed_ceiling.csv` · gate ≥ 0.60 · **pass at every τ**
+`wrn_16_2` is absent — it has no measured seed pair (D-15).
 
-Non-monotone in τ, peaking near 0.2. At τ=0 the margin requirement is vacuous so
-low-confidence noise enters; at τ=0.5 a quarter of the sample is excluded.
+*source* `analysis/q1_seed_ceilings_all.csv`, `analysis/ceilings.json` · gate ≥ 0.60
+
+#### The headline: MSC is measurably less seed-stable in non-convolutional models
+
+At the primary operating point τ=0.1 the split is **clean and total**:
+
+| | n | range | mean |
+|---|---|---|---|
+| convolutional | 12 | 0.6217 – 0.7256 | 0.6763 |
+| attention / MLP-mixing | 2 | 0.5470 – 0.5475 | 0.5473 |
+
+Separation margin **0.0742** — every CNN is above every non-CNN, with no overlap.
+Both non-CNNs **fail** the pre-registered ρ_seed ≥ 0.60 gate; all 12 CNNs pass.
+
+**This is not an accuracy artifact.** The obvious objection is that `vit_tiny`
+(59.33%) and `mixer_nano` (60.23%) are also the two least accurate models, so
+maybe low ceilings just mean under-converged models. Three things rule that out:
+
+1. **Within the 12 CNNs, ρ_seed and top-1 are uncorrelated** — Spearman **+0.035**,
+   Pearson **−0.007**. Accuracy carries essentially no information about ceiling
+   height once you are inside the convolutional family.
+2. **`convnext_femto` breaks the confound directly.** At 62.67% it is the least
+   accurate CNN — only **2.4 points** above `mixer_nano` — yet its ceiling is
+   **0.7084**, fourth-highest of all 14 and **0.161 above** `mixer_nano`. Moving
+   *17 points* of accuracy from `convnext_femto` up to `resnet32x4` buys only
+   **+0.017** of ceiling. The 2.4-point step across the architectural boundary is
+   ~10× larger than the 17-point step within it.
+3. `convnext_femto` and the two non-CNNs were trained on the *same* 300-epoch
+   schedule, so schedule length is not the difference either.
+
+**Honest caveat:** CNN accuracies (62.67–79.72) and non-CNN accuracies
+(59.33–60.23) do not overlap, so family and accuracy remain partly confounded at
+the level of the atlas as a whole. The `convnext_femto` comparison is the
+strongest available evidence and it rests on **one** architecture. A stronger
+test would train one non-CNN to CNN-level accuracy or one CNN down to ~60%.
+Logged as **O-9**.
+
+#### τ-dependence differs by family
+
+Every CNN is non-monotone in τ — rising to a peak near τ=0.2–0.3, then falling as
+the τ=0.5 mask removes a third of the sample. `vit_tiny` is **the only
+architecture that rises monotonically** (0.4775 → 0.6056), and consequently the
+clean CNN/non-CNN separation holds at τ ∈ {0, 0.1, 0.2} but **breaks at τ=0.3**,
+where `vit_tiny` (0.6026) overtakes `resnet56` (0.5944). `mixer_nano` is below
+every CNN at every τ without exception.
+
+So the correct claim is *"at τ ≤ 0.2"*, not *"at every τ"*. Any sentence in the
+paper asserting the separation must carry that qualifier.
+
+#### Rank agreement and top-decile agreement are not the same measurement
+
+J₁₀ (Jaccard overlap of the top-10% highest-MSC samples) at τ=0.1 ranges from
+**0.180** (`vit_tiny`) to **0.664** (`wrn_40_1`) — and it is **almost unrelated
+to ρ_seed**, Spearman **+0.130**. `vgg8` has the second-highest ρ_seed (0.7248)
+and nearly the lowest J₁₀ (0.2431); `wrn_40_1` is ninth on ρ_seed but first on J₁₀.
+
+What J₁₀ *does* track is mean MSC — Spearman **+0.780**, Pearson **+0.819**.
+Architectures whose samples sit near ρ=1.0 on average (`wrn_40_1` 0.859,
+`resnet110` 0.845) have a large tied group at the top of the distribution and
+therefore a stable top decile; architectures with low mean MSC (`vit_tiny` 0.519,
+`convnext_femto` 0.646) have a genuinely sparse hard tail that reshuffles easily.
+
+**Consequence for the paper:** reporting only one of these two statistics would
+mislead, in either direction. Both must appear in the Q1 and Q3 tables, and the
+mean-MSC confound on J₁₀ must be stated — otherwise a reviewer will read a low
+J₁₀ as a weak result when it is partly a property of where the architecture sits
+on the compute scale. Logged as **O-10**.
+
+#### What Phase 0 could not have told us
+
+Phase 0 measured exactly two architectures — `resnet32x4` (0.7256) and `wrn_40_2`
+(0.7089) — which turn out to be **the 1st and 3rd most seed-stable of all 14**.
+The Phase 0 ceiling of ~0.715 was therefore an optimistic sample, not a typical
+one. The atlas mean is 0.6763 for CNNs and 0.6579 across all 14. Every
+disattenuated transfer number computed against a Phase 0 ceiling is
+correspondingly conservative; every one computed against a `vit_tiny` or
+`mixer_nano` ceiling will be inflated by a *smaller* denominator and needs the
+wider CI that the low ceiling implies.
 
 ### 1.3 Q2 — axis structure (PC1)
+
+> ⚠ **Still Phase-0-only.** NB10 has *not* been re-run on the atlas — the file on
+> HF is still `q2_axis_structure_phase0.csv` and covers one architecture. The
+> data to redo it exists (39 measured runs). Open item **O-4**.
 
 PCA over per-sample MSC on {depth, res_proxy, precision}, resnet32x4 seed 1.
 
@@ -121,6 +272,15 @@ PC1 loadings at τ=0.1: depth 0.616, resolution 0.633, precision 0.469.
 
 ### 1.4 Q3 — transfer (T)
 
+> ⚠ **Still Phase-0-only — this is the biggest gap in the project.** `q3_transfer.csv`
+> on HF contains **one pair**: `p0-resnet32x4-s1 → p0-wrn_40_2-s1`. NB11 has not
+> been re-run. With 14 architectures measured there are **91 cross-architecture
+> pairs** available, including the CNN→Transformer pairs that Phase 0 explicitly
+> could not answer and that the atlas was built for. Open item **O-2**.
+>
+> The atlas-wide ceilings in §1.2 are the denominator NB11 needs, and they now
+> exist — so NB11 is unblocked for the 12 CNNs and runs on CPU in minutes.
+
 resnet32x4-s1 → wrn_40_2-s1, depth axis, 1000 bootstrap resamples.
 
 | τ | ρ_S raw | **T** | 95% CI | J₁₀ | n |
@@ -136,6 +296,10 @@ resnet32x4-s1 → wrn_40_2-s1, depth axis, 1000 bootstrap resamples.
 ### 1.5 Q4 — irreducibility (ΔR²)
 
 ⚠ **See D-11.** These ran on the `test` split with **5 of 7** battery scores.
+**Confirmed unchanged as of the 2026-08-04 audit** — `q4_irreducibility.csv` still
+records `battery = "msp,margin,entropy,ce_loss,pred_depth"` and still covers only
+the one Phase 0 pair. NB12 has not been re-run. O-1 remains open and still
+affects the ΔR² = 0.254 headline number.
 
 | τ | R² battery | R² +MSC | **ΔR²** | 95% CI | partial ρ |
 |---|---|---|---|---|---|
@@ -171,16 +335,69 @@ above is computed on paired images rather than a coincidental index match.
 Excluded from all correlations. The close agreement in *size* is suggestive but
 not evidence about *membership*; testable in the atlas.
 
-### 1.8 Measured cost model
+### 1.8 Measured cost model — all 13 measured architectures
 
-Used to calibrate the scheduler. See D-10.
+Used to calibrate the scheduler. See D-10. Cost unit = (s/epoch) ÷ 8.32.
+**These are observations, not scheduler inputs** — per D-12, `ARCH_COST_HINT`
+must stay static or ownership drifts between sessions.
 
-| arch | s/epoch | 240 ep | cost unit |
+| arch | s/epoch | GPU-h | kWh | cost unit | hint | error |
+|---|---|---|---|---|---|---|
+| `resnet32x4` | 43.26 | 2.88 | 0.216 | 5.20 | 5.20 | anchor |
+| `mobilenetv2` | 32.97 | 2.20 | 0.166 | 3.96 | — | — |
+| `shufflenetv2` | 33.29 | 2.22 | 0.130 | 4.00 | — | — |
+| `vit_tiny` | 31.85 | 2.65 | 0.199 | 3.83 | — | — |
+| `wrn_40_2` | 29.06 | 1.94 | 0.146 | 3.49 | 3.38 | +3.3% |
+| `wrn_40_1` | 24.66 | 1.64 | 0.107 | 2.96 | — | — |
+| `convnext_femto` | 23.88 | 1.99 | 0.148 | 2.87 | — | — |
+| `mixer_nano` | 19.05 | 1.59 | 0.118 | 2.29 | — | — |
+| `vgg13` | 16.78 | 1.12 | 0.082 | 2.02 | — | — |
+| `wrn_16_2` | 14.16 | 0.94 | 0.071 | 1.70 | — | — |
+| `vgg8` | 11.16 | 0.74 | 0.055 | 1.34 | — | — |
+
+`SECONDS_PER_COST_UNIT = 8.32`. The `wrn_40_2` hint is 3.3% low against the
+Phase 1 run — within tolerance, no change warranted.
+
+### 1.9 FLOPs are a poor predictor of time and energy across architectures
+
+Falls out of §1.8 for free, and it bears on how MSC may be described.
+
+| arch | GFLOPs | s/epoch | **s per GFLOP** |
 |---|---|---|---|
-| resnet32x4 | 43.29 | 2.89 h | 5.2 (anchor) |
-| wrn_40_2 | 28.16 | 1.88 h | 3.38 |
+| `shufflenetv2` | 0.0925 | 33.29 | **360.0** |
+| `convnext_femto` | 0.1264 | 23.88 | 188.9 |
+| `mobilenetv2` | 0.1828 | 32.97 | 180.4 |
+| `wrn_40_1` | 0.1680 | 24.66 | 146.7 |
+| `vgg8` | 0.1363 | 11.16 | 81.9 |
+| `wrn_16_2` | 0.2032 | 14.16 | 69.7 |
+| `mixer_nano` | 0.3430 | 19.05 | 55.5 |
+| `vit_tiny` | 0.6944 | 31.85 | 45.9 |
+| `wrn_40_2` | 0.6581 | 29.06 | 44.2 |
+| `vgg13` | 0.4576 | 16.78 | 36.7 |
+| `resnet32x4` | 2.1494 | 43.26 | **20.1** |
 
-`SECONDS_PER_COST_UNIT = 8.32`
+**A 17.9× spread.** The extremes are stark: `shufflenetv2` does **7.1× fewer
+FLOPs** than `wrn_40_2` yet takes **14.5% more wall-clock time** and 89% of the
+energy. Depthwise and grouped convolutions are memory-bandwidth-bound on a T4,
+not arithmetic-bound.
+
+**Does this threaten MSC?** No — ρ(c) = FLOPs(f,c)/FLOPs(f,c_full) is a ratio
+taken *within a single architecture*, so an architecture-level FLOPs/time
+mismatch cancels. But it constrains the language:
+
+- Never write "MSC of 0.65 means 35% less time" or "35% less energy." It means
+  35% fewer FLOPs. Those are different quantities and this table proves it.
+- Cross-architecture statements about *absolute* savings must be in FLOPs, or
+  must be re-measured in the unit actually claimed.
+- The open empirical question is whether the ratio holds *within* an
+  architecture across exits — i.e. does an early exit at ρ=0.5 on `mobilenetv2`
+  actually take half the time? Per-budget latency may already be in
+  `telemetry/`; if so this is a free extra result. Logged as **O-11**.
+
+This is a limitations paragraph the paper needs regardless, and we now have the
+measurement to write it rather than hedge it.
+
+*source* `runs/*/summary.json` — `total_time_sec`, `total_energy_kwh`, `full_flops`
 
 ---
 
@@ -188,6 +405,115 @@ Used to calibrate the scheduler. See D-10.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-16 · `exit_heads.pt` is written outside the documented layout
+
+**Severity:** cosmetic · **Status:** open, trivial · **Found:** 2026-08-04 audit
+
+`06_DATA_SCHEMA.md` documents trained exit heads at
+`runs/{run_id}/checkpoints/exit_heads.pt`. They are actually on HF at
+`runs/{run_id}/exit_heads.pt` — one level up. `run_oracle` passes `L["base"]`
+where it should pass `L["checkpoints"]`.
+
+**Contamination:** none. Nothing reads the path by convention; the loader is
+handed the same value the writer used. Purely a documentation/tidiness defect.
+
+**Fix:** either move the write into `checkpoints/` or correct the schema doc.
+Moving it is the better option but invalidates 43 already-pushed paths, so the
+cheaper correct action is to **document the real path** and leave the data alone.
+Deferred to the schema-doc pass, tracked as part of O-12.
+
+### D-15 · Six atlas runs trained but never measured; one architecture lost entirely
+
+**Severity:** medium — costs one of 15 pre-registered architectures
+**Status:** **open** · **Found:** 2026-08-04 audit
+
+NB08 measured 39 of the 45 Phase 1 runs. The gaps are not random — they cluster
+at the end of the work queue:
+
+| run | trained | measured |
+|---|---|---|
+| `p1-wrn_16_2-…-s1` | ❌ | ❌ |
+| `p1-wrn_16_2-…-s2` | ✅ 2026-08-04T04:32Z | ❌ |
+| `p1-wrn_16_2-…-s3` | ✅ | ❌ |
+| `p1-wrn_40_1-…-s3` | ✅ | ❌ |
+| `p1-vgg8-…-s1` | ✅ | ❌ |
+| `p1-mixer_nano-…-s3` | ✅ | ❌ |
+
+**Why it happened.** These are the *cheapest* runs in the zoo — `wrn_16_2` at
+cost 1.70 and `vgg8` at 1.34 are the two least expensive architectures. The LPT
+bin-packer places the smallest items last, so they land at the tail of every
+worker's queue and are the first casualties when a Kaggle session hits its
+time limit. `wrn_16_2-s2` finished training at 04:32Z and the repo's last write
+was 05:28Z — under an hour later. The session ended before measurement reached it.
+This is expected scheduler behaviour, not a scheduler bug.
+
+**Contamination analysis.**
+
+- **`wrn_16_2` contributes nothing to any analysis.** With zero measured seeds it
+  has no ceiling, appears in no Q1 row, and can enter no Q3 pair. The atlas is
+  effectively **14 architectures, not 15**, and every "15 architectures" claim in
+  the protocol, README and Q1 tables is currently false. This is the material
+  consequence.
+- `wrn_40_1`, `vgg8` and `mixer_nano` each still have the 2 seeds a ceiling
+  requires, so their §1.2 numbers are **valid but minimum-power** — a 2-seed
+  ceiling has a wider CI than a 3-seed one, and `mixer_nano` is one of the two
+  architectures carrying the headline low-ceiling finding. Strengthening it is
+  worth the 0.5 GPU-h.
+- No number already recorded is *wrong*. This is missing data, not bad data.
+
+**Fix:** re-run NB08. It is idempotent — `plan_work(..., done_fn=, stage=)` skips
+the 39 already-measured runs, so the marginal cost is training `wrn_16_2-s1`
+(~0.94 GPU-h) plus measuring six runs (~3 GPU-h). Under 4 GPU-hours to close.
+
+**Guard to add:** NB08 should end by printing measured-vs-trained coverage per
+architecture and **ALARM when any architecture has fewer than 2 measured seeds**,
+by exact analogy with the zero-work ALARM added for D-09. A silent 39/45 that
+looks like success is precisely the failure mode D-09 was about. Tracked as O-12.
+
+### D-14 · `mobilenetv2` is compared against a half-width baseline
+
+**Severity:** **affects a reported number** · **Status:** open · **Found:** 2026-08-04
+
+`ARCH_REFERENCE` records `reference_accuracy = 64.60` for `mobilenetv2`, and the
+trained model reaches **70.10%**, producing an apparent **+5.50** — by far the
+largest margin over a published reference in the whole atlas, and about 4×
+the next largest (`vgg8`, +1.37).
+
+That margin is an artifact. The 64.60 figure comes from the CRD/mdistiller
+student tables, where the entry labelled "MobileNetV2" is `mobile_half` —
+**MobileNetV2 at width multiplier 0.5**, roughly 0.81 M parameters. Our model has
+**2.35 M parameters**. We are comparing a full-width network against a
+half-width baseline and calling the difference a win.
+
+**How it was caught.** Not by a test — by noticing that +5.50 was implausible
+next to every other Δ in the table and checking the parameter count against the
+baseline's. Anomalously *good* results get less scrutiny than bad ones, which is
+exactly why this survived.
+
+**Contamination analysis.**
+
+- The **training is fine** and the **MSC measurement is fine.** `mobilenetv2`'s
+  ceiling (0.6880) and every per-sample quantity are unaffected — none of them
+  reference the published number.
+- What is wrong is one **claim**: the sentence "every architecture beats its
+  published reference." With `mobilenetv2` excluded that sentence is still true
+  of the other 9 CNNs with references, at margins of +0.32 to +1.43.
+- `08_PHASE0_RESULTS.md` and `README.md` are unaffected — neither mentions
+  `mobilenetv2`.
+- **`shufflenetv2` was checked and is sound**: 1.36 M parameters against the
+  ~1.36 M of the ShuffleNetV2 ×1.0 baseline, +1.43 over 70.50.
+
+**Fix, two options.** Either (a) set `reference_accuracy = null` for
+`mobilenetv2`, as already done for the three modern architectures, and claim no
+Δ; or (b) switch the zoo to `mobile_half` so the reference applies. **(a) is
+correct** — the wider model is the more useful atlas member, and an honest null
+beats a flattering comparison. Do not report the +5.50 anywhere.
+
+**Guard to add:** `recipe_ok` should also assert that the parameter count is
+within a tolerance of the reference model's, not just that accuracy cleared the
+reference. A reference number without a parameter count attached is unfalsifiable.
+Tracked as O-12.
 
 ### D-13 · NB08 crashed on `int(None)` — run identity read from the ledger
 **Found** user ran NB08: `TypeError: int() argument must be ... not 'NoneType'`
@@ -459,22 +785,59 @@ Draft, from the record:
   only 50.3% of the variance in per-sample compute requirements across reduction
   axes."* ← **the sentence a reviewer will remember**
 
+**Added by the 2026-08-04 atlas audit** (all supported by §1.2 and §1.9):
+
+- *"Across fourteen architectures, the seed-to-seed reliability of per-sample
+  minimum sufficient compute separates cleanly by architecture family: all twelve
+  convolutional networks fall in [0.622, 0.726], while both non-convolutional
+  models sit at 0.547 — below every CNN, and below our pre-registered
+  reliability threshold."* (τ ≤ 0.2; the separation does not hold at τ = 0.3.)
+- *"This is not explained by accuracy: within the convolutional family, ceiling
+  height and top-1 accuracy are uncorrelated (Spearman +0.035), and
+  `convnext_femto` — the least accurate CNN, only 2.4 points above `mixer_nano` —
+  attains a ceiling 0.161 higher."*
+- *"Measurement reliability is itself architecture-dependent, which means any
+  cross-architecture transfer study that does not disattenuate is comparing
+  quantities measured with unequal precision."* ← **the methodological
+  contribution, now demonstrated rather than argued**
+- *"Rank agreement and top-decile agreement are near-independent measures of the
+  same construct (Spearman +0.130 across architectures); top-decile overlap is
+  instead largely determined by an architecture's mean compute requirement
+  (+0.780). We therefore report both."*
+- *"Our pilot happened to select the two most reliably-measured architectures in
+  the zoo; the atlas mean ceiling is 0.676 against the pilot's 0.715, so pilot
+  transfer estimates should be read as conservative."* ← **pre-empts the
+  cherry-picking objection by raising it first**
+- *"Minimum sufficient compute is defined in floating-point operations. Across our
+  zoo the ratio of wall-clock time to FLOPs varies by a factor of eighteen, so
+  FLOPs-denominated savings should not be restated as time or energy savings."*
+
 ---
 
 ## 5. Open items
 
-| | Item | Blocks | Priority |
-|---|---|---|---|
-| O-1 | Recompute Q4 on `train_holdout` (D-11) | Q4 number in the paper | **high** |
-| O-1b | **Finish `p1-resnet32x4-cifar100-base-s3`** (epoch 79/240, resumable) | resnet32x4 3rd seed | **high** |
-| O-1c | **Verify NB05/NB06 actually pushed** — no WRN/VGG/Mobile runs on HF as of the last audit | the whole atlas | **high** |
-| O-2 | Run NB05–NB07 atlas training (~64 GPU-h remaining) | Q3 across families | **high** |
-| O-3 | Run NB08 measurement (~27 GPU-h) | Q1–Q4 at scale | high |
-| O-4 | Confirm Q2 non-one-dimensionality across the atlas | §4.2 claim | high |
-| O-5 | Read SAFE-KD (2602.03043); write the differentiation memo | Related work | **high, not started** |
-| O-6 | Verify the 2026 arXiv IDs cited in the protocol | Bibliography | medium |
-| O-7 | Test whether architectures agree on |U_τ| *membership*, not just size | free sub-finding | medium |
-| O-8 | Width axis (slimmable) — deferred | Q2 completeness | low |
+| | Item | Blocks | Cost | Priority |
+|---|---|---|---|---|
+| O-2 | **Run NB11 — Q3 transfer across the atlas.** 91 pairs available, 1 computed. The CNN→Transformer question the atlas was built for. Ceilings now exist, so it is unblocked and CPU-only | the central result | ~15 min | **highest** |
+| O-1 | Recompute Q4 on `train_holdout` with all 7 scores (D-11) | ΔR² = 0.254 headline | ~20 min | **high** |
+| O-4 | Run NB10 — Q2 axis structure across the atlas; confirm PC1 < 0.60 is not a `resnet32x4` quirk | the H2-refuted claim | ~15 min | **high** |
+| O-12 | **Close D-14/D-15/D-16:** null out the `mobilenetv2` reference; re-run NB08 for the 6 unmeasured runs + train `wrn_16_2-s1`; add the coverage ALARM and the parameter-count assertion; fix the `exit_heads.pt` path in the schema doc | "15 architectures" being true | ~4 GPU-h | **high** |
+| O-5 | Read SAFE-KD (2602.03043); write the differentiation memo | Related work | ~1 day | **high, not started** |
+| O-9 | **Break the family/accuracy confound in §1.2** — train one non-CNN to CNN-level accuracy, or one CNN down to ~60%, so the low-ceiling finding does not rest on `convnext_femto` alone | the headline Q1 claim | ~3 GPU-h | **high** |
+| O-10 | Report ρ_seed *and* J₁₀ in every table, and state the mean-MSC confound on J₁₀ | Q1/Q3 presentation | writing | high |
+| O-11 | Check whether `telemetry/` already holds per-budget latency; if so, test whether MSC-in-FLOPs predicts MSC-in-time within an architecture (§1.9) | free extra result + limitations | ~30 min | medium |
+| O-6 | Verify the 2026 arXiv IDs cited in the protocol | Bibliography | ~1 h | medium |
+| O-7 | Test whether architectures agree on \|U_τ\| *membership*, not just size — 14 architectures now available | free sub-finding | ~20 min | medium |
+| O-13 | Run NB15 to build `tables/` so per-seed means stop needing manual assembly from 45 `summary.json` files | writing efficiency | ~10 min | medium |
+| O-8 | Width axis (slimmable) — deferred | Q2 completeness | — | low |
+
+**Closed this audit:** O-1b (`resnet32x4-s3` completed 240/240 at 79.46%),
+O-1c (NB05–NB07 confirmed pushed — the earlier "missing" reading was a stale
+cached API response), O-3 (NB08 run; 39/45, remainder tracked as D-15).
+
+**The single highest-value action is O-2.** Everything expensive is done: 44
+models trained, 39 measured, ceilings computed. The result the project exists to
+produce is one CPU-only notebook away.
 
 ---
 
@@ -482,8 +845,16 @@ Draft, from the record:
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | D-16 — `exit_heads.pt` written outside the documented layout |
+| 2026-08-04 | D-15 — **6 of 45 runs unmeasured; `wrn_16_2` has zero usable seeds.** The atlas is currently 14 architectures, not 15 |
+| 2026-08-04 | D-14 — **`mobilenetv2` +5.50 is against a half-width baseline.** Not a win; reference to be nulled |
+| 2026-08-04 | **Q1 re-run atlas-wide: MSC is measurably less seed-stable in ViT/Mixer than in every CNN** (0.547 vs 0.622–0.726 at τ=0.1, clean separation). `convnext_femto` shows this is not an accuracy artifact |
+| 2026-08-04 | §1.9 — FLOPs predict wall-clock to within only 18× across the zoo; MSC language constrained accordingly |
+| 2026-08-04 | **Audit: atlas 44/45 trained, 39/45 measured.** NB09 re-run; NB10/NB11/NB12 still Phase-0-only |
+| 2026-08-04 | **`p1-resnet32x4-s3` resumed from epoch 79 and completed 240/240 at 79.46%** — first proof of resume on a genuinely interrupted run (O-1b closed) |
+| 2026-08-03 → 04 | NB05–NB07 completed: WRN, VGG, Mobile and the three modern architectures trained; NB08 measurement run |
+| 2026-08-02 | ~~**Audit: only NB04 runs are on HF.**~~ **Retracted 2026-08-04** — the HF tree API served a stale cached response; the runs were present. See the note below |
 | 2026-08-02 | D-13 found — NB08 crashed on a ledger event lacking arch/seed; identity now parsed from the run_id |
-| 2026-08-02 | **Audit: only NB04 runs are on HF.** No WRN/VGG/Mobile/Modern runs pushed |
 | 2026-08-02 | D-12 found auditing NB04 — assignment drift; ownership now uses a static cost table |
 | 2026-08-02 | **NB04 atlas: 14/15 ResNet runs complete**, all beating published references |
 | 2026-08-02 | **Phase 0 verdict `FULL-PROGRAM`.** All gates cleared at every τ. H2 refuted. |
@@ -497,6 +868,43 @@ Draft, from the record:
 | 2026-08-02 | Repos consolidated to `msc-cifar100` (DC-1); D-03 rate limiter |
 | 2026-08-02 | D-01a/b, D-02 found by the NB00 preflight before any GPU-hour was spent |
 | 2026-08-02 | Pipeline built: `msc_lib` 1.0.0, 16 notebooks |
+
+### A note on the retracted 2026-08-02 audit
+
+On 2026-08-02 an audit concluded that only the NB04 ResNet runs existed on HF and
+that NB05/NB06 had not pushed. **That conclusion was wrong**, and the way it was
+wrong is worth recording because it will recur.
+
+The audit used `GET /api/datasets/{repo}/tree/main/runs`. That endpoint is served
+from a cache, and it returned a response with **byte-identical `oid` values**
+across two audits taken hours apart — which was read as "nothing changed" when it
+actually meant "you were served the same cached page twice." The runs had been
+pushed the whole time.
+
+A second failure compounded it: the full repo-info endpoint returns ~69 KB for
+this repo and **was silently truncated mid-JSON**. Parsing the truncated body
+yielded a plausible-looking but short file list, alphabetically cut off just past
+`vgg8` — which is precisely where `vit_tiny` and `wrn_*` would have appeared.
+Two independent methods therefore agreed on the same wrong answer.
+
+**What to do instead**, and the rule this project now follows:
+
+1. Treat the recursive/aggregate listing endpoints as a *hint*, never as proof of
+   absence. Confirm any negative finding with a narrow `tree/main/runs/{run_id}`
+   call, which is small enough not to truncate.
+2. Check `lastModified` on the repo before concluding nothing has changed. It
+   read `2026-08-04T05:28:37Z` here — which alone would have falsified the
+   "nothing was pushed" conclusion.
+3. If a response is parsed programmatically, **assert it parses** rather than
+   working from a regex over a possibly-truncated body. The truncation announced
+   itself as a `JSONDecodeError`; that error was the signal, not a nuisance.
+4. Identical `oid`s across audits mean *identical content served*, which is
+   consistent with both "unchanged" and "cached." It is not evidence.
+
+Cost of the mistake: no GPU-time, but one incorrect entry stood in this notebook
+for two days and O-1c was tracked as a high-priority open item that had never
+been a real problem. Negative findings deserve the same verification standard as
+positive ones.
 
 ---
 

@@ -33,20 +33,58 @@ and resolution correlate at 0.38, precision is nearly independent at ~0.23. That
 is a result in its own right, and it says results on depth-based early exit do
 not license claims about the other axes.
 
-### Phase 1 in progress — NB04 (ResNets) 14/15
+## Phase 1 atlas — trained 44/45, measured 39/45
 
-| arch | mean top-1 | published | Δ |
-|---|---|---|---|
-| `resnet20` | 70.13 | 69.06 | +1.07 |
-| `resnet56` | 73.69 | 72.34 | +1.35 |
-| `resnet110` | 74.38 | 74.31 | +0.07 |
-| `resnet8x4` | 73.26 | 72.50 | +0.76 |
-| `resnet32x4` | 79.88 (2 seeds) | 79.42 | +0.46 |
+Audited against HuggingFace at revision `a4aef3a`, 2026-08-04.
 
-One run (`resnet32x4` seed 3) stopped at epoch 79/240 and is resumable — see
-defect D-12 in the lab notebook.
+| arch | family | top-1 | published | Δ | ρ_seed @τ=0.1 |
+|---|---|---|---|---|---|
+| `resnet32x4` | resnet | 79.74 | 79.42 | +0.32 | **0.7256** |
+| `wrn_40_2` | wrn | 76.06 | 75.61 | +0.45 | 0.7089 |
+| `vgg13` | vgg | 75.70 | 74.64 | +1.06 | 0.6689 |
+| `resnet110` | resnet | 74.38 | 74.31 | +0.07 | 0.6339 |
+| `wrn_16_2` | wrn | 73.79 | 73.26 | +0.53 | *not measured* |
+| `resnet56` | resnet | 73.69 | 72.34 | +1.35 | 0.6217 |
+| `resnet8x4` | resnet | 73.26 | 72.50 | +0.76 | 0.6671 |
+| `wrn_40_1` | wrn | 72.41 | 71.98 | +0.43 | 0.6559 |
+| `shufflenetv2` | mobile | 71.93 | 70.50 | +1.43 | 0.6698 |
+| `vgg8` | vgg | 71.73 | 70.36 | +1.37 | **0.7248** |
+| `resnet20` | resnet | 70.13 | 69.06 | +1.07 | 0.6425 |
+| `mobilenetv2` | mobile | 70.10 | — ⚠ | — | 0.6880 |
+| `convnext_femto` | convnext | 62.67 | — | — | 0.7084 |
+| `mixer_nano` | **mixer** | 60.23 | — | — | **0.5470** |
+| `vit_tiny` | **vit** | 59.33 | — | — | **0.5475** |
+
+ResNet rows are 3-seed means; the rest are a representative seed pending NB15.
+⚠ `mobilenetv2`'s published reference is for a half-width model — see D-14.
+
+### New finding: measurement reliability is architecture-dependent
+
+Every convolutional network lands in **[0.622, 0.726]**. Both non-convolutional
+models sit at **0.547** — below all twelve CNNs, and below the pre-registered
+0.60 reliability threshold. Separation margin 0.074, no overlap (τ ≤ 0.2).
+
+It is not an accuracy artifact: inside the CNN family, ceiling height and top-1
+accuracy are **uncorrelated** (Spearman +0.035). `convnext_femto` is the least
+accurate CNN — 2.4 points above `mixer_nano` — yet its ceiling is 0.161 higher,
+while the 17-point climb from `convnext_femto` to `resnet32x4` buys only +0.017.
+
+This matters beyond this project: **a cross-architecture difficulty study that
+does not divide by a per-architecture noise ceiling is comparing quantities
+measured with unequal precision.** The example-difficulty literature generally
+does not. Phase 0 also happened to pick the two *most* reliable architectures in
+the zoo, so its 0.715 was an optimistic sample against an atlas mean of 0.676.
 
 Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md)**.
+
+### What is not done yet
+
+| | |
+|---|---|
+| **Q3 transfer across the atlas** | **1 of 91 pairs computed.** NB11 has not been re-run — the CNN→Transformer question the atlas exists to answer is one CPU-only notebook away |
+| Q2 / Q4 across the atlas | still Phase-0-only |
+| `wrn_16_2` | trained but unmeasured — the atlas is currently **14** architectures, not 15 (D-15) |
+| Q4 battery | still 5 of 7 scores on the `test` split (D-11) — affects the ΔR² = 0.254 headline |
 
 ---
 
@@ -73,7 +111,7 @@ Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LA
 |---|---|
 | `msc_core.py` | Reference implementation: the MSC oracle plus every analysis statistic. numpy/scipy/pandas/sklearn only — no torch. Self-tested. |
 | `msc_torch.py` | Reference model-side components: exit heads, ordinal sufficiency head, three-term loss, Learn-then-Test calibration. |
-| `src/msc_lib.py` | The pipeline: HF sync with shared rate limiting, sharded registry, cost-balanced work splitting, 15-architecture zoo, FLOPs budgets, resumable instrumented training, three-axis oracle, MSC-KD, final evaluation, analysis. **138 offline self-checks.** |
+| `src/msc_lib.py` | The pipeline: HF sync with shared rate limiting, sharded registry, cost-balanced work splitting, 15-architecture zoo, FLOPs budgets, resumable instrumented training, three-axis oracle, MSC-KD, final evaluation, analysis. **157 offline self-checks.** |
 | `build_notebooks.py` | Regenerates the 16 Kaggle notebooks, embedding `msc_lib.py` and `msc_core.py` as base64. |
 | `notebooks/` | 16 self-contained Kaggle notebooks. |
 
@@ -124,7 +162,7 @@ This restructure makes three of the five research questions produce publishable 
 
 ```bash
 python msc_core.py                  # self-test: the oracle and every statistic
-python src/msc_lib.py --selftest    # 138 offline checks on the pipeline, no GPU
+python src/msc_lib.py --selftest    # 157 offline checks on the pipeline, no GPU
 python build_notebooks.py --check   # confirm the notebooks match the library
 ```
 
@@ -135,7 +173,14 @@ Then, in order:
 3. Run `notebooks/NB00_Setup_And_Verify` on every account. It ends with a kill-and-resume acceptance test; do not proceed past a failure there.
 4. ~~Run Phase 0 (NB01 → NB02 → NB03).~~ **Done — see `08_PHASE0_RESULTS.md`.**
 5. ~~Hold the decision meeting.~~ **Verdict: `FULL-PROGRAM`.**
-6. **Now:** NB04 → NB07 (atlas training), NB08 (measurement), NB09–NB12 (analysis).
+6. ~~NB04 → NB07 (atlas training).~~ **Done — 44/45 trained.**
+7. ~~NB08 (measurement).~~ **39/45 measured** — six gaps tracked as D-15.
+8. ~~NB09 (Q1).~~ **Done atlas-wide — see the ceiling table above.**
+9. **Now: NB11 (Q3).** This is the highest-value remaining action in the whole
+   project. All 91 cross-architecture pairs are measured and the ceilings NB11
+   needs as denominators now exist, so it runs on CPU in minutes and produces the
+   result the atlas was built for. Then NB10 (Q2), NB12 (Q4 on `train_holdout`),
+   NB15 (tables and figures).
 
 Phase 0 cost 9.5 GPU-hours and cleared every gate, so the remaining ~150 are
 justified. The two open questions it could not answer — does transfer survive the

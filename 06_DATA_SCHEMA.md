@@ -55,8 +55,10 @@ runs/{run_id}/
 │
 ├── checkpoints/
 │   ├── ckpt_last.pt                model+optim+sched+scaler+ALL RNG+energy+wall
-│   ├── ckpt_best.pt
-│   └── exit_heads.pt                                                (NB02)
+│   └── ckpt_best.pt
+│
+├── exit_heads.pt                   trained exit heads          (NB02 / NB08)
+│                                   ^ NOTE: at the run root, NOT in checkpoints/
 │
 └── env/
     ├── environment.json            pip freeze, CUDA, driver, GPU models, hostname
