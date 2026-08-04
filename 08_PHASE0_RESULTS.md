@@ -14,7 +14,7 @@ Machine-readable record: [`analysis/phase0_decision.json`](https://huggingface.c
 |---|---|---|---|
 | ρ_seed — noise ceiling | ≥ 0.6 | **0.715** | pass |
 | T — disattenuated transfer | ≥ 0.7 | **0.946** | pass, comfortably |
-| ΔR² — irreducibility | ≥ 0.05 | **0.254** | **5× the threshold** |
+| ~~ΔR² — irreducibility~~ | ≥ 0.05 | ~~0.254~~ | ⚠ **WITHDRAWN — corrected to ~0.10, see §Q4** |
 | Shuffled control | ≈ 0 | **0.0072** | pass |
 
 This is the best of the five outcomes in `01_PHASE0_GO_NOGO.md` §6.
@@ -94,6 +94,29 @@ Adding MSC nearly doubles the explained variance in the target model's compute-n
 **MSC is not difficulty renamed.** It carries substantial information those scores do not.
 
 > **Caveat, honestly stated.** This ran with **5 of 7** scores: `msp`, `margin`, `entropy`, `ce_loss`, `pred_depth`. EL2N and forgetting events are *training-set* quantities — they index training images, and the test set's `sample_idx` refers to different images entirely, so attaching them there would be meaningless. Those two are available on the `train_holdout` split, and Q4 is re-run there in NB12 with the full seven-score battery. The margin here (0.254 against a 0.05 threshold) is large enough that the conclusion is not in doubt, but the complete battery is the number that goes in the paper.
+
+> ### ⚠ RESOLVED 2026-08-04 — and the caveat above understated the problem
+>
+> NB12 has now run on `train_holdout` with all seven scores. **ΔR² fell from
+> 0.254 to ~0.10** and partial ρ from 0.489 to **~0.295**.
+>
+> | | this page | corrected |
+> |---|---|---|
+> | split | `test` | `train_holdout` |
+> | battery | 5 of 7 | 7 of 7 |
+> | ΔR² | 0.254 | **0.1009** (median) |
+> | partial ρ | 0.489 | **0.2954** (median) |
+>
+> The prediction *"the conclusion is not in doubt"* was half right. ΔR² still
+> clears its gate, at 2× rather than 5×. But **partial ρ now sits just under
+> H4's 0.30 threshold**, so that arm of the hypothesis is genuinely marginal —
+> which the 0.489 reported here concealed entirely.
+>
+> Running an incomplete battery does not add noise; it *biases in one
+> direction*, because a handicapped battery leaves more variance for MSC to
+> explain. **Do not cite 0.254 or 0.489.** See D-11 and §1.5 of
+> `09_LAB_NOTEBOOK.md`. Those corrected figures are themselves provisional
+> pending the D-18 re-run, and are likely a lower bound.
 
 ---
 
