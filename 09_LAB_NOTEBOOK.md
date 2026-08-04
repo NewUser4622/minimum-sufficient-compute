@@ -18,16 +18,24 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 
 | | |
 |---|---|
-| **Phase** | 0 complete · Phase 1 **atlas trained 44/45, measured 39/45** · NB09 re-run atlas-wide |
+| **Phase** | **All five research questions answered.** NB13 (MSC-KD) running |
 | **Verdict** | `FULL-PROGRAM` (2026-08-02) |
 | **Runs trained** | Phase 0 **4/4** · Phase 1 **44/45** — only `p1-wrn_16_2-…-s1` missing |
-| **Runs measured** | Phase 0 **4/4** · Phase 1 **39/45** — see D-15 for the six gaps |
-| **Analysis re-run on the atlas** | Q1 ✅ (14 archs) · Q2 ❌ · Q3 ❌ · Q4 ❌ — still Phase-0-only |
-| **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas training + ~20 measurement + 2.9 wasted to D-12) |
-| **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) |
-| **Library version** | `msc_lib` 1.0.0 · **168** offline self-checks |
-| **Defects found** | 17 · 14 fixed · **3 open** (D-11, D-14, D-15) · 2 affect reported numbers (D-11, D-14) |
-| **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `a4aef3a`, 2026-08-04T05:28Z |
+| **Runs measured** | Phase 0 **4/4** · Phase 1 **39/45** — see D-15 |
+| **Analysis on the atlas** | Q1 ✅ 14 archs · Q2 ✅ 13 · Q3 ✅ **78 pairs** · Q4 ⚠ 15 biased pairs (D-18) |
+| **Q3 — the central result** | within-family **0.920** > across-CNN **0.878** > CNN→transformer **0.710**, no overlap |
+| **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
+| **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
+| **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
+| **Library version** | `msc_lib` 1.0.0 · **176** offline self-checks |
+| **Defects found** | 18 · 15 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-11 confirmed and corrected: ΔR² was 2.5× too high** |
+| **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `9b18d2b`, 2026-08-04T06:1x Z |
+
+> **⚠ Two numbers in older documents are now known to be wrong.**
+> **ΔR² = 0.254** (README, `08_PHASE0_RESULTS.md`) was measured on the wrong
+> split with 5 of 7 difficulty scores; the corrected value is **~0.10** (§1.5).
+> **`mobilenetv2` +5.50** is against a half-width baseline (D-14). Neither may
+> be published.
 
 **Audit basis for this board:** HF repo-info API at revision `a4aef3ac`, plus
 direct `tree/` listings for every run whose state the truncated file list left
@@ -250,11 +258,46 @@ correspondingly conservative; every one computed against a `vit_tiny` or
 `mixer_nano` ceiling will be inflated by a *smaller* denominator and needs the
 wider CI that the low ceiling implies.
 
-### 1.3 Q2 — axis structure (PC1)
+### 1.3 Q2 — axis structure (PC1) — **atlas-wide, 13 architectures**
 
-> ⚠ **Still Phase-0-only.** NB10 has *not* been re-run on the atlas — the file on
-> HF is still `q2_axis_structure_phase0.csv` and covers one architecture. The
-> data to redo it exists (39 measured runs). Open item **O-4**.
+**H2 is refuted across the entire atlas, not just one architecture.** PC1 at
+τ=0.1, PCA over per-sample MSC on {depth, res_proxy, precision}:
+
+| arch | PC1 | | arch | PC1 |
+|---|---|---|---|---|
+| `shufflenetv2` | 0.5316 | | `resnet110` | 0.5015 |
+| `resnet8x4` | 0.5264 | | `resnet32x4` | 0.4989 |
+| `mobilenetv2` | 0.5245 | | `wrn_40_2` | 0.4950 |
+| `vgg13` | 0.5139 | | `vit_tiny` | 0.4800 |
+| `resnet56` | 0.5109 | | `convnext_femto` | 0.4536 |
+| `resnet20` | 0.5106 | | `mixer_nano` | **0.4407** |
+| `wrn_40_1` | 0.5077 | | | |
+
+**0 of 15 runs clear the pre-registered PC1 ≥ 0.60.** Range 0.4407–0.5316, mean
+0.4996, sd 0.0252. The *highest* PC1 anywhere in the atlas is 0.068 below the
+threshold — this is not a marginal miss, and the Phase 0 value of 0.503 was
+typical rather than a fluke. **O-4 closed.**
+
+That the spread is only 0.09 wide across 13 architectures spanning ResNets,
+VGG, depthwise-separable nets, a modern CNN, a ViT and an MLP-Mixer is itself
+the point: compute-need is *reliably* three-dimensional, in every architecture
+we tried.
+
+#### Sub-finding: the axes decouple further in non-convolutional models
+
+| | depth↔precision | res↔precision | PC1 loading on precision |
+|---|---|---|---|
+| ViT + Mixer | **0.143** | **0.141** | 0.385 |
+| the 11 CNNs | 0.260 | 0.248 | 0.483 |
+
+`mixer_nano` is the extreme: depth↔precision **0.096**, res↔precision **0.085** —
+precision-need is very nearly *independent* of the other two axes, and its PC1
+loading on precision falls to 0.308. So the one-dimensionality assumption is
+worst exactly where the field is now moving.
+
+*source* `analysis/q2_axis_structure_all.csv` · H2 predicted ≥ 0.60 · **REFUTED 15/15**
+
+#### The original Phase 0 measurement, for reference
 
 PCA over per-sample MSC on {depth, res_proxy, precision}, resnet32x4 seed 1.
 
@@ -270,16 +313,79 @@ PC1 loadings at τ=0.1: depth 0.616, resolution 0.633, precision 0.469.
 
 *source* `analysis/q2_axis_structure_phase0.csv` · H2 predicted ≥ 0.60 · **REFUTED**
 
-### 1.4 Q3 — transfer (T)
+### 1.4 Q3 — transfer (T) — **THE CENTRAL RESULT**, 78 pairs, 13 architectures
 
-> ⚠ **Still Phase-0-only — this is the biggest gap in the project.** `q3_transfer.csv`
-> on HF contains **one pair**: `p0-resnet32x4-s1 → p0-wrn_40_2-s1`. NB11 has not
-> been re-run. With 14 architectures measured there are **91 cross-architecture
-> pairs** available, including the CNN→Transformer pairs that Phase 0 explicitly
-> could not answer and that the atlas was built for. Open item **O-2**.
->
-> The atlas-wide ceilings in §1.2 are the denominator NB11 needs, and they now
-> exist — so NB11 is unblocked for the 12 CNNs and runs on CPU in minutes.
+This is the number the project exists to produce. τ=0.1, depth axis, 1000
+bootstrap resamples, disattenuated by the per-architecture ceilings in §1.2.
+
+| pair type | n | **mean T** | sd | range | mean J₁₀ | mean ρ_raw |
+|---|---|---|---|---|---|---|
+| within-family | 12 | **0.920** | 0.041 | 0.877 – 1.005 | 0.480 | 0.608 |
+| across-CNN-family | 43 | **0.878** | 0.070 | 0.732 – 0.966 | 0.374 | 0.592 |
+| CNN → transformer | 22 | **0.710** | 0.034 | 0.657 – 0.777 | 0.267 | 0.430 |
+| transformer → transformer | 1 | 0.886 | — | — | 0.147 | 0.485 |
+
+*source* `analysis/q3_transfer_matrix.csv` · shuffled control: **78/78 pass**
+
+#### H3: the ordering is confirmed, the magnitude is refuted — favourably
+
+H3 pre-registered *within-family > across-CNN-family > CNN→transformer*.
+
+- **Ordering holds**: 0.920 > 0.878 > 0.710, with **complete separation** —
+  the weakest within-family pair (0.877) still beats the strongest
+  CNN→transformer pair (0.777). No overlap at all.
+- **H3 predicted within-family > 0.8** → measured **0.920**. ✓
+- **H3 predicted CNN→transformer < 0.6** → measured **0.710**. ✗ **REFUTED.**
+
+The refutation is the good kind. H3 expected compute-need to become
+*architecture-specific* across the CNN/Transformer boundary; instead it stays
+at 71% of the measurement ceiling — far above the 0.5 line the protocol set for
+"architecture-specific, the field assumption is wrong."
+
+> **The project's central question has a positive answer.** How much computation
+> an input needs is substantially a property of the *input*, and it survives the
+> largest architectural gap in the zoo. A large teacher genuinely can supervise
+> a small student's compute-allocation policy — the premise the adaptive-inference
+> literature assumed, now measured, corrected for measurement noise, across 78
+> architecture pairs.
+
+#### `resnet110` × `resnet56` reaches T = 1.005
+
+CI [0.979, 1.029], which **includes 1.0**. For that pair, cross-architecture
+agreement is statistically indistinguishable from same-architecture,
+different-seed agreement: *which* of the two networks you measure makes no
+detectable difference to per-sample MSC. That is the strongest possible form of
+the result, and it is a single sentence in the paper.
+
+T slightly above 1.0 is not an error — disattenuation divides by an *estimated*
+ceiling, so T can exceed 1 when that estimate is a little low. It should be
+reported with the CI, never as a bare 1.005.
+
+#### `convnext_femto` transfers like a transformer, not like a CNN
+
+| across-CNN-family pairs | n | mean T | range |
+|---|---|---|---|
+| **including** `convnext_femto` | 10 | **0.766** | 0.732 – 0.808 |
+| **excluding** `convnext_femto` | 33 | **0.912** | 0.824 – 0.966 |
+
+A gap of **0.146**. Ranked by mean T over all its pairs, `convnext_femto`
+(0.766) sits below every other CNN and just above `vit_tiny` (0.725) and
+`mixer_nano` (0.724) — the bottom three of thirteen.
+
+The candidate explanation is that ConvNeXt is a deliberately *transformer-ised*
+CNN: large depthwise kernels, LayerNorm, inverted bottlenecks, GELU, few
+activations. If per-sample compute-need tracks those design choices rather than
+the convolution/attention label, this is what it would look like. **That is a
+hypothesis, not a finding** — n=1 architecture, and it is confounded with the
+300-epoch schedule and 62.67% accuracy. It is also cheap to test: add one more
+modern CNN. Logged as **O-14**.
+
+Note this cuts *against* the §1.2 grouping: `convnext_femto` has a high, very
+CNN-like *ceiling* (0.7084) but a low, transformer-like *transfer*. Reliability
+and transferability are separate properties, and this architecture separates
+them. Worth a sentence, because it stops the two findings being read as one.
+
+#### The original Phase 0 pair, for reference
 
 resnet32x4-s1 → wrn_40_2-s1, depth axis, 1000 bootstrap resamples.
 
@@ -293,13 +399,65 @@ resnet32x4-s1 → wrn_40_2-s1, depth axis, 1000 bootstrap resamples.
 
 *source* `analysis/q3_transfer.csv` · gate ≥ 0.70 · **pass at every τ** · H3 predicted within-family > 0.8
 
-### 1.5 Q4 — irreducibility (ΔR²)
+### 1.5 Q4 — irreducibility (ΔR²) — **corrected; the headline number was 2.5× too high**
 
-⚠ **See D-11.** These ran on the `test` split with **5 of 7** battery scores.
-**Confirmed unchanged as of the 2026-08-04 audit** — `q4_irreducibility.csv` still
-records `battery = "msp,margin,entropy,ce_loss,pred_depth"` and still covers only
-the one Phase 0 pair. NB12 has not been re-run. O-1 remains open and still
-affects the ΔR² = 0.254 headline number.
+NB12 has now run on `train_holdout` with the **full 7-score battery**
+(`msp, margin, entropy, ce_loss, el2n, forget_events, pred_depth`). **D-11 is
+confirmed, and it mattered:**
+
+| | Phase 0 (reported) | corrected | |
+|---|---|---|---|
+| split | `test` | `train_holdout` | |
+| battery | 5 of 7 | **7 of 7** | |
+| **ΔR²** | **0.254** | **0.1009** (median) | **−60%** |
+| partial ρ | 0.489 | **0.2954** (median) | −40% |
+
+**The 0.254 in `08_PHASE0_RESULTS.md` and the README overstates irreducibility
+by a factor of 2.5 and must not be published.** Running Q4 without `el2n` and
+`forget_events` handicapped the battery, which is exactly the direction that
+flatters MSC. The prediction in D-11 was right.
+
+The gate still passes, but the margin is now 2× not 5×:
+
+| | value | gate | |
+|---|---|---|---|
+| median ΔR² | **0.1009** | ≥ 0.05 | ✓ 2× |
+| median partial ρ | **0.2954** | ≥ 0.30 | ✗ **marginally under** |
+| pairs clearing ΔR² ≥ 0.05 | 13/15 | — | |
+| pairs clearing partial ≥ 0.30 | 7/15 | — | |
+
+**H4's partial-correlation arm now fails by 0.0046.** That is too close to call
+either way and must be reported as such rather than rounded into a pass.
+
+#### The split that explains most of it
+
+| pairs | n | median ΔR² | median partial ρ |
+|---|---|---|---|
+| CNN-only | 10 | **0.1211** | **0.3165** |
+| involving `vit_tiny` or `mixer_nano` | 5 | **0.0504** | **0.1752** |
+
+Transformer pairs carry less than half the unique information. This is **not a
+separate finding** — §1.2 showed MSC is measured less reliably in those two
+architectures, and a noisier measurement necessarily explains less variance.
+The two results have to be reported together or a reader will double-count them.
+
+#### ⚠ These 15 pairs are not a sample of the atlas — see D-18
+
+`pairs[:15]` over an alphabetically sorted list gave **12 `convnext_femto` pairs
++ 3 `mixer_nano` pairs**. Every number in this section is therefore dominated by
+the two most atypical architectures in the zoo: `convnext_femto` is the
+transfer outlier (§1.4) and `mixer_nano` has the lowest ceiling (§1.2) *and* the
+lowest PC1 (§1.3).
+
+Both atypicalities push ΔR² **down**, so the corrected figures above are
+probably a **lower bound** — the true atlas median is likely higher than 0.1009,
+and the partial correlation likely clears 0.30. **Do not quote these numbers
+until NB12 has been re-run on all 78 pairs.** The fix is committed; the re-run
+is O-15 and costs minutes on CPU.
+
+*source* `analysis/q4_irreducibility_all.csv` · **supersedes** `q4_irreducibility.csv`
+
+#### The superseded Phase 0 measurement
 
 | τ | R² battery | R² +MSC | **ΔR²** | 95% CI | partial ρ |
 |---|---|---|---|---|---|
@@ -405,6 +563,80 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-18 · Analysis sampled alphabetically, not representatively
+
+**Severity:** **affects reported numbers (Q4)** · **Status:** fixed in code,
+**re-run pending** · **Found:** 2026-08-04 auditing the NB10–NB12 outputs
+
+Two separate bugs with the same root cause: *code that silently selects a
+subset, and a subset that is not a sample.*
+
+**(a) The truncation caps.** NB12 ran Q4 on `pairs[:15]` and NB11 ran its τ-curve
+check on `pairs[:8]`, both over `sorted(seed1)`. Alphabetically the first
+architecture in our zoo is `convnext_femto`, so:
+
+- Q4's "atlas" result = **12 `convnext_femto` pairs + 3 `mixer_nano` pairs**.
+- The τ-stability check = **8 `convnext_femto` pairs**, i.e. one architecture,
+  and no CNN→transformer pair at all — the check could not have detected a
+  τ-dependence in the pair type the paper cares most about.
+
+This is worse than a small sample: it is a **biased** one, and biased toward the
+two most atypical members of the zoo. `convnext_femto` is the transfer outlier
+(§1.4, mean T 0.766 vs 0.912 for other across-CNN pairs) and `mixer_nano` has
+the lowest ceiling (§1.2) and lowest PC1 (§1.3). Both push ΔR² down.
+
+**(b) `seed1` dropped an architecture silently.** All three analysis notebooks
+selected runs with
+
+```python
+seed1 = {m['arch']: r for r, m in runs.items() if m['seed'] == 1}
+```
+
+`vgg8` has two measured seeds and the **second-highest noise ceiling in the
+atlas** (0.7248) — but its seed 1 was never measured (D-15). So `vgg8` was
+excluded from Q2, Q3 and Q4 for a bookkeeping reason rather than a data reason,
+and a dict comprehension cannot announce what it skipped. The atlas analysis
+covered **13 architectures while reporting itself as the atlas**.
+
+**Contamination analysis.**
+
+- **§1.5 (Q4) is affected and is flagged in place.** The median ΔR² of 0.1009
+  and median partial ρ of 0.2954 are computed on the biased 15. Because both
+  atypicalities depress ΔR², these are most likely a **lower bound** — which
+  matters, because the partial correlation currently misses its gate by 0.0046.
+  A biased-low estimate sitting 0.005 under a threshold is not a result.
+- **§1.4 (Q3) is NOT affected.** The transfer matrix ran on all 78 pairs; only
+  the τ-curve *robustness check* was truncated. The headline T values stand.
+- **§1.3 (Q2) is NOT affected.** Q2 is per-run, not per-pair, so no cap applied.
+- **§1.2 (Q1) is NOT affected** — same reason.
+- `vgg8`'s absence costs one architecture from all three analyses. Nothing
+  computed is wrong; the coverage is smaller than claimed.
+
+**Why it survived review.** Both caps look like deliberate cost control, and
+they were — Q4 with 500 bootstraps over 78 pairs is slower than over 15. The
+error was pairing a defensible *budget* with an indefensible *selection rule*.
+`[:15]` is only a sample if the list order is unrelated to the quantity being
+measured, and `sorted()` guarantees it is not.
+
+**Fix.**
+
+- `representative_runs(runs, require=ceilings)` — picks the lowest **usable**
+  seed per architecture instead of insisting on seed 1, and takes an explicit
+  membership test for "measured". NB11 now also *prints which architectures are
+  missing and why*, so the next omission is loud instead of silent.
+- `stratified_pairs(pairs, kind_fn, per_kind=3)` — samples up to N pairs from
+  **each** pair type. The τ check now covers all four pair types by construction.
+- The Q4 cap is removed entirely; it now runs all pairs and additionally reports
+  the CNN-only vs transformer-involving split, so the §1.2 reliability effect and
+  the §1.5 irreducibility effect cannot be silently confounded.
+- 8 self-checks pin all of this, including an assertion that the *old* idiom
+  would have dropped `vgg8` and that plain truncation yields a single kind.
+  Self-checks 168 → **176**.
+
+**Still to do:** re-run NB10, NB11 and NB12 with the fixed selection (O-15).
+All three are CPU-only and take minutes. Until then §1.5's numbers are
+provisional and are marked as such.
 
 ### D-17 · The shuffled control cried wolf — a sanity check that was itself unsound
 
@@ -886,6 +1118,35 @@ Draft, from the record:
   only 50.3% of the variance in per-sample compute requirements across reduction
   axes."* ← **the sentence a reviewer will remember**
 
+**The abstract sentence, now that Q3 is in** (§1.4):
+
+- *"Across 78 architecture pairs spanning ResNets, VGG, depthwise-separable
+  networks, a modern CNN, a vision transformer and an MLP-Mixer, per-sample
+  minimum sufficient compute transfers at 92% of the measurement ceiling within
+  an architecture family, 88% across convolutional families, and **71% across
+  the convolution/attention boundary** — with no overlap between the three
+  distributions. How much computation an input requires is substantially a
+  property of the input."* ← **the result the project exists to produce**
+- *"Contrary to our pre-registered prediction that transfer would collapse below
+  0.6 across the convolution/attention boundary, it remained at 0.71. We record
+  this as a refuted hypothesis in the favourable direction."* ← **pre-registration
+  paying off; report it exactly this way**
+- *"For `resnet110` and `resnet56`, disattenuated transfer reaches 1.005
+  [0.979, 1.029]: cross-architecture agreement is statistically
+  indistinguishable from same-architecture, different-seed agreement."*
+- *"Compute-need is reliably three-dimensional: no architecture in our atlas
+  reaches a first principal component above 0.532, against a pre-registered
+  threshold of 0.60, and the spread across thirteen architectures is only 0.09
+  wide."* ← **H2 refuted 15/15, far stronger than the pilot's single value**
+
+**Sentences the record now forbids** — both were true-looking and both are wrong:
+
+- ~~*"MSC explains 25% of variance beyond classical difficulty scores."*~~
+  Measured on the wrong split with 5 of 7 scores. The corrected figure is ~0.10
+  and the partial correlation is marginal (§1.5, D-11).
+- ~~*"Every architecture in the atlas beats its published reference."*~~
+  `mobilenetv2`'s reference is a half-width model (D-14).
+
 **Added by the 2026-08-04 atlas audit** (all supported by §1.2 and §1.9):
 
 - *"Across fourteen architectures, the seed-to-seed reliability of per-sample
@@ -919,26 +1180,27 @@ Draft, from the record:
 
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
-| O-2 | **Run NB11 — Q3 transfer across the atlas.** 91 pairs available, 1 computed. The CNN→Transformer question the atlas was built for. Ceilings now exist, so it is unblocked and CPU-only | the central result | ~15 min | **highest** |
-| O-1 | Recompute Q4 on `train_holdout` with all 7 scores (D-11) | ΔR² = 0.254 headline | ~20 min | **high** |
-| O-4 | Run NB10 — Q2 axis structure across the atlas; confirm PC1 < 0.60 is not a `resnet32x4` quirk | the H2-refuted claim | ~15 min | **high** |
-| O-12 | **Close D-14/D-15/D-16:** null out the `mobilenetv2` reference; re-run NB08 for the 6 unmeasured runs + train `wrn_16_2-s1`; add the coverage ALARM and the parameter-count assertion; fix the `exit_heads.pt` path in the schema doc | "15 architectures" being true | ~4 GPU-h | **high** |
+| O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
+| O-12 | **Close D-14/D-15:** null the `mobilenetv2` reference; measure the 6 unmeasured runs + train `wrn_16_2-s1`; add the NB08 coverage ALARM and the parameter-count assertion | "15 architectures" being true | ~4 GPU-h | **high** |
 | O-5 | Read SAFE-KD (2602.03043); write the differentiation memo | Related work | ~1 day | **high, not started** |
-| O-9 | **Break the family/accuracy confound in §1.2** — train one non-CNN to CNN-level accuracy, or one CNN down to ~60%, so the low-ceiling finding does not rest on `convnext_femto` alone | the headline Q1 claim | ~3 GPU-h | **high** |
+| O-9 | **Break the family/accuracy confound in §1.2** — train one non-CNN to CNN-level accuracy, or one CNN down to ~60%, so the low-ceiling finding does not rest on `convnext_femto` alone | the Q1 headline | ~3 GPU-h | **high** |
+| O-14 | **Test the `convnext_femto` explanation (§1.4)** — is low transfer a property of transformer-ised CNNs, or of that one model? One more modern CNN settles it | a quotable sub-finding | ~2 GPU-h | medium |
 | O-10 | Report ρ_seed *and* J₁₀ in every table, and state the mean-MSC confound on J₁₀ | Q1/Q3 presentation | writing | high |
-| O-11 | Check whether `telemetry/` already holds per-budget latency; if so, test whether MSC-in-FLOPs predicts MSC-in-time within an architecture (§1.9) | free extra result + limitations | ~30 min | medium |
+| O-16 | Correct **ΔR² = 0.254** in `README.md` and `08_PHASE0_RESULTS.md` to the §1.5 value once O-15 fixes the sample | published numbers | ~15 min | **high** |
+| O-11 | Check whether `telemetry/` already holds per-budget latency; if so, test whether MSC-in-FLOPs predicts MSC-in-time within an architecture (§1.9) | free extra result | ~30 min | medium |
+| O-7 | Test whether architectures agree on \|U_τ\| *membership*, not just size — 13 architectures now available | free sub-finding | ~20 min | medium |
+| O-13 | Run NB15 to build `tables/` so per-seed means stop needing manual assembly | writing efficiency | ~10 min | medium |
 | O-6 | Verify the 2026 arXiv IDs cited in the protocol | Bibliography | ~1 h | medium |
-| O-7 | Test whether architectures agree on \|U_τ\| *membership*, not just size — 14 architectures now available | free sub-finding | ~20 min | medium |
-| O-13 | Run NB15 to build `tables/` so per-seed means stop needing manual assembly from 45 `summary.json` files | writing efficiency | ~10 min | medium |
 | O-8 | Width axis (slimmable) — deferred | Q2 completeness | — | low |
 
-**Closed this audit:** O-1b (`resnet32x4-s3` completed 240/240 at 79.46%),
-O-1c (NB05–NB07 confirmed pushed — the earlier "missing" reading was a stale
-cached API response), O-3 (NB08 run; 39/45, remainder tracked as D-15).
+**Closed this audit:** O-1 (Q4 re-run on `train_holdout` with all 7 scores —
+and the D-11 prediction was correct, see §1.5), O-2 (Q3 across 78 pairs — **the
+central result is in**), O-4 (H2 refuted 15/15, not a `resnet32x4` quirk),
+O-3/O-1b/O-1c earlier.
 
-**The single highest-value action is O-2.** Everything expensive is done: 44
-models trained, 39 measured, ceilings computed. The result the project exists to
-produce is one CPU-only notebook away.
+**The expensive half of the project is finished.** 44 models trained, 39
+measured, all five questions answered. Everything on this list except O-9,
+O-12 and O-14 is now writing or minutes of CPU.
 
 ---
 
@@ -946,6 +1208,11 @@ produce is one CPU-only notebook away.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | D-18 — **analysis sampled alphabetically**; Q4's 15 pairs were 12 convnext + 3 mixer, and `vgg8` was silently dropped from all three analyses |
+| 2026-08-04 | **Q4 corrected on `train_holdout` with 7 scores: ΔR² 0.254 → ~0.10.** D-11's prediction confirmed; the published number overstated irreducibility 2.5× |
+| 2026-08-04 | **Q3 across 78 pairs — THE CENTRAL RESULT.** within-family 0.920 > across-CNN 0.878 > CNN→transformer 0.710, complete separation. H3's ordering confirmed, its "< 0.6" magnitude refuted **favourably**: compute-need transfers across the CNN/Transformer boundary |
+| 2026-08-04 | **H2 refuted across the whole atlas** — 0 of 15 runs reach PC1 ≥ 0.60; highest is 0.532. Axes decouple further in ViT/Mixer |
+| 2026-08-04 | NB11 re-run after the D-17 fix: **78/78 shuffled controls pass**, max \|z\| = 3.30 against a 5σ threshold |
 | 2026-08-04 | **D-17 — the shuffled control was miscalibrated and halted NB11 on healthy data.** Rule rebuilt against the exact permutation null; 11 regression checks added; the control now tests all 78 pairs, not 25 |
 | 2026-08-04 | D-16 — `exit_heads.pt` written outside the documented layout |
 | 2026-08-04 | D-15 — **6 of 45 runs unmeasured; `wrn_16_2` has zero usable seeds.** The atlas is currently 14 architectures, not 15 |

@@ -21,8 +21,14 @@ Decided 2026-08-02. Full write-up: **[`08_PHASE0_RESULTS.md`](08_PHASE0_RESULTS.
 |---|---|---|---|
 | ρ_seed (noise ceiling) | ≥ 0.6 | **0.715** | ✓ |
 | T (transfer, disattenuated) | ≥ 0.7 | **0.946** | ✓ |
-| ΔR² (irreducibility) | ≥ 0.05 | **0.254** | ✓ 5× |
+| ~~ΔR² (irreducibility)~~ | ≥ 0.05 | ~~0.254~~ | ⚠ **superseded — see below** |
 | Shuffled control | ≈ 0 | **0.007** | ✓ |
+
+> ⚠ **The pilot's ΔR² = 0.254 is withdrawn.** It was computed on the `test`
+> split with 5 of 7 difficulty scores, because EL2N and forgetting-events are
+> training-set quantities. Re-run correctly on `train_holdout` with the full
+> battery, ΔR² is **~0.10** — still clearing the 0.05 gate, but at 2× not 5×.
+> Defect D-11 in the lab notebook. Do not cite 0.254.
 
 Every gate holds across the whole τ grid. All four backbones beat their published
 references (resnet32x4 79.59% vs 79.42; wrn-40-2 76.89% vs 75.61).
@@ -77,14 +83,53 @@ the zoo, so its 0.715 was an optimistic sample against an atlas mean of 0.676.
 
 Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md)**.
 
+## ✅ The central result — compute-need transfers across architectures
+
+**78 architecture pairs, 13 architectures, disattenuated by per-architecture
+noise ceilings.** τ = 0.1, depth axis, 1000 bootstrap resamples.
+
+| pair type | n | **mean T** | range |
+|---|---|---|---|
+| within-family | 12 | **0.920** | 0.877 – 1.005 |
+| across-CNN-family | 43 | **0.878** | 0.732 – 0.966 |
+| **CNN → transformer** | 22 | **0.710** | 0.657 – 0.777 |
+
+The three distributions **do not overlap** — the weakest within-family pair
+(0.877) still beats the strongest CNN→transformer pair (0.777).
+
+We pre-registered that transfer would *collapse below 0.6* across the
+convolution/attention boundary. **It did not: it held at 0.71**, far above the
+0.5 line we set for "compute-need is architecture-specific." That hypothesis is
+refuted in the favourable direction, and it is the answer to the question this
+project was built to ask:
+
+> **How much computation an input requires is substantially a property of the
+> input, not of the model** — and it survives the largest architectural gap in
+> the zoo. A large teacher genuinely can supervise a small student's
+> compute-allocation policy.
+
+For `resnet110` × `resnet56`, T = **1.005** [0.979, 1.029] — cross-architecture
+agreement is statistically indistinguishable from same-architecture,
+different-seed agreement.
+
+### H2 refuted across the whole atlas
+
+**0 of 15 runs** reach the pre-registered PC1 ≥ 0.60; the highest anywhere is
+**0.532** and the spread across 13 architectures is only 0.09 wide. Compute-need
+is *reliably* three-dimensional. The axes decouple further in the
+non-convolutional models — for `mixer_nano`, depth↔precision is **0.096**.
+
+Results on depth-based early exit do not license claims about the other axes,
+in any architecture we tried.
+
 ### What is not done yet
 
 | | |
 |---|---|
-| **Q3 transfer across the atlas** | **1 of 91 pairs computed.** NB11 has not been re-run — the CNN→Transformer question the atlas exists to answer is one CPU-only notebook away |
-| Q2 / Q4 across the atlas | still Phase-0-only |
-| `wrn_16_2` | trained but unmeasured — the atlas is currently **14** architectures, not 15 (D-15) |
-| Q4 battery | still 5 of 7 scores on the `test` split (D-11) — affects the ΔR² = 0.254 headline |
+| **Q4 re-run** | Q4's 15 pairs were selected alphabetically and are dominated by the two most atypical architectures (D-18). The fix is committed; the numbers are provisional until NB10→NB11→NB12 re-run (~20 min, CPU) |
+| `wrn_16_2`, `vgg8` | not in the analysis — `wrn_16_2` unmeasured (D-15), `vgg8` dropped by the seed-1 selector (D-18, now fixed). The atlas analysis is **13** architectures, not 15 |
+| `mobilenetv2` Δ | compared against a half-width baseline (D-14); reference to be nulled |
+| NB13–NB15 | MSC-KD training, method comparison, paper outputs |
 
 ---
 
@@ -111,7 +156,7 @@ Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LA
 |---|---|
 | `msc_core.py` | Reference implementation: the MSC oracle plus every analysis statistic. numpy/scipy/pandas/sklearn only — no torch. Self-tested. |
 | `msc_torch.py` | Reference model-side components: exit heads, ordinal sufficiency head, three-term loss, Learn-then-Test calibration. |
-| `src/msc_lib.py` | The pipeline: HF sync with shared rate limiting, sharded registry, cost-balanced work splitting, 15-architecture zoo, FLOPs budgets, resumable instrumented training, three-axis oracle, MSC-KD, final evaluation, analysis. **168 offline self-checks.** |
+| `src/msc_lib.py` | The pipeline: HF sync with shared rate limiting, sharded registry, cost-balanced work splitting, 15-architecture zoo, FLOPs budgets, resumable instrumented training, three-axis oracle, MSC-KD, final evaluation, analysis. **176 offline self-checks.** |
 | `build_notebooks.py` | Regenerates the 16 Kaggle notebooks, embedding `msc_lib.py` and `msc_core.py` as base64. |
 | `notebooks/` | 16 self-contained Kaggle notebooks. |
 
@@ -162,7 +207,7 @@ This restructure makes three of the five research questions produce publishable 
 
 ```bash
 python msc_core.py                  # self-test: the oracle and every statistic
-python src/msc_lib.py --selftest    # 168 offline checks on the pipeline, no GPU
+python src/msc_lib.py --selftest    # 176 offline checks on the pipeline, no GPU
 python build_notebooks.py --check   # confirm the notebooks match the library
 ```
 
@@ -176,7 +221,7 @@ Then, in order:
 6. ~~NB04 → NB07 (atlas training).~~ **Done — 44/45 trained.**
 7. ~~NB08 (measurement).~~ **39/45 measured** — six gaps tracked as D-15.
 8. ~~NB09 (Q1).~~ **Done atlas-wide — see the ceiling table above.**
-9. **Now: NB11 (Q3).** This is the highest-value remaining action in the whole
+9. ~~NB10–NB12 (Q2, Q3, Q4).~~ **Done — see the central result above.**
    project. All 91 cross-architecture pairs are measured and the ceilings NB11
    needs as denominators now exist, so it runs on CPU in minutes and produces the
    result the atlas was built for. Then NB10 (Q2), NB12 (Q4 on `train_holdout`),

@@ -6068,6 +6068,57 @@ def analyse_q3_transfer(data_dir, pairs: Sequence[Tuple[str, str]],
     return pd.DataFrame(rows)
 
 
+def representative_runs(runs: Dict[str, Dict[str, Any]],
+                        require=None) -> Dict[str, str]:
+    """One run per architecture -- the lowest seed that is actually usable.
+
+    Replaces the idiom this codebase used in three notebooks:
+
+        seed1 = {m['arch']: r for r, m in runs.items() if m['seed'] == 1}
+
+    which silently drops any architecture whose seed 1 happens to be missing.
+    `vgg8` has two measured seeds and the second-highest noise ceiling in the
+    whole atlas, but its seed 1 was never measured (D-15), so it vanished from
+    Q2, Q3 and Q4 for a bookkeeping reason rather than a data reason -- and it
+    vanished silently, because a dict comprehension cannot report what it
+    skipped. See D-18.
+
+    `require` is an optional membership test (pass the ceilings dict): an
+    architecture is only represented by a run that appears in it, which is how
+    callers say "measured" without needing to re-read every parquet file.
+    """
+    cand: Dict[str, List[Tuple[int, str]]] = {}
+    for rid, m in runs.items():
+        if require is not None and rid not in require:
+            continue
+        arch = m.get("arch")
+        if not arch:
+            continue
+        seed = m.get("seed")
+        cand.setdefault(arch, []).append(
+            (10 ** 6 if seed is None else int(seed), rid))
+    return {arch: sorted(v)[0][1] for arch, v in cand.items()}
+
+
+def stratified_pairs(pairs: Sequence[Tuple[str, str]], kind_fn,
+                     per_kind: int = 3) -> List[Tuple[str, str]]:
+    """Up to `per_kind` pairs from each kind -- not the alphabetical head.
+
+    Exists because `pairs[:8]` and `pairs[:15]`, over an alphabetically sorted
+    pair list, are not samples of the atlas. They are samples of whichever
+    architecture sorts first. In our zoo that is `convnext_femto`, which turns
+    out to be the single most atypical CNN in the transfer matrix. See D-18.
+    """
+    out: List[Tuple[str, str]] = []
+    seen: Dict[Any, int] = {}
+    for p in pairs:
+        k = kind_fn(p)
+        if seen.get(k, 0) < per_kind:
+            seen[k] = seen.get(k, 0) + 1
+            out.append(p)
+    return out
+
+
 def shuffled_control_verdict(rho: float, n: int, z_max: float = 5.0,
                              rho_floor: float = 0.10) -> Tuple[bool, float, float]:
     """Is a shuffled-control residual noise, or a bug? Returns (passed, z, sd).
@@ -8056,6 +8107,40 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-18: representative run selection ---------------------------------
+    _runs = {"p1-vgg8-cifar100-base-s2": {"arch": "vgg8", "seed": 2},
+             "p1-vgg8-cifar100-base-s3": {"arch": "vgg8", "seed": 3},
+             "p1-resnet20-cifar100-base-s1": {"arch": "resnet20", "seed": 1},
+             "p1-resnet20-cifar100-base-s2": {"arch": "resnet20", "seed": 2},
+             "p1-wrn_16_2-cifar100-base-s2": {"arch": "wrn_16_2", "seed": 2}}
+    _ceil = {"p1-vgg8-cifar100-base-s2", "p1-vgg8-cifar100-base-s3",
+             "p1-resnet20-cifar100-base-s1", "p1-resnet20-cifar100-base-s2"}
+    rep = representative_runs(_runs, require=_ceil)
+    check("D-18: vgg8 is represented even with no seed 1",
+          rep.get("vgg8") == "p1-vgg8-cifar100-base-s2", str(rep.get("vgg8")))
+    check("D-18: the old seed==1 idiom would have dropped it",
+          not [r for r, m in _runs.items() if m["arch"] == "vgg8" and m["seed"] == 1])
+    check("D-18: lowest seed wins when several qualify",
+          rep.get("resnet20") == "p1-resnet20-cifar100-base-s1")
+    check("D-18: `require` excludes unmeasured architectures",
+          "wrn_16_2" not in rep, str(sorted(rep)))
+    check("D-18: without `require`, nothing is excluded",
+          "wrn_16_2" in representative_runs(_runs))
+
+    _pairs = [("a", "b"), ("a", "c"), ("a", "d"), ("a", "e"),
+              ("b", "c"), ("b", "d"), ("x", "y")]
+    _kinds = {("a", "b"): "K1", ("a", "c"): "K1", ("a", "d"): "K1",
+              ("a", "e"): "K1", ("b", "c"): "K2", ("b", "d"): "K2",
+              ("x", "y"): "K3"}
+    strat = stratified_pairs(_pairs, lambda p: _kinds[p], per_kind=2)
+    check("D-18: stratified sampling caps each kind",
+          sum(1 for p in strat if _kinds[p] == "K1") == 2, str(strat))
+    check("D-18: and reaches kinds the alphabetical head would miss",
+          {"K1", "K2", "K3"} == {_kinds[p] for p in strat})
+    check("D-18: plain truncation would have missed them",
+          {_kinds[p] for p in _pairs[:4]} == {"K1"},
+          "pairs[:4] is entirely one kind -- the real bug")
 
     # --- D-17 regression: the verdict rule that used to cry wolf -------------
     # The exact case that failed NB11: convnext_femto x resnet20, raw rho of

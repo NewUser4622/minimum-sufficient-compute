@@ -1814,7 +1814,12 @@ ceilings = msc.read_json(sess.data_dir / 'analysis' / 'ceilings.json', default=N
 assert ceilings, 'No ceilings found. Run NB09 first.'
 print(f'{len(ceilings)} runs have a noise ceiling')
 
-seed1 = {m['arch']: r for r, m in runs.items() if m['seed'] == 1 and r in ceilings}
+seed1 = msc.representative_runs(runs, require=ceilings)
+_missing = sorted(set(msc.ZOO) - set(seed1))
+if _missing:
+    print(f'[NOTE] {len(_missing)} architecture(s) absent from the transfer '
+          f'matrix (no measured seed pair): {", ".join(_missing)}')
+    print('       Run NB08 for those runs to include them. See D-15/D-18.')
 fam = {m['arch']: m['family'] for m in runs.values()}
 print(f'{len(seed1)} architectures available for the transfer matrix')
 """),
@@ -1968,7 +1973,24 @@ plt.show()
         conclusion. Slower (bootstraps over the full τ grid).
         """),
         code("""\
-sample_pairs = pairs[:8]
+def _kind(ab):
+    fa, fb = fam[ab[0]], fam[ab[1]]
+    if fa == fb:
+        return '1_within-family'
+    if (fa in TOKEN) != (fb in TOKEN):
+        return '3_CNN->transformer'
+    if fa in TOKEN and fb in TOKEN:
+        return '4_transformer->transformer'
+    return '2_across-CNN-family'
+
+# Up to 3 pairs from EACH pair type. The old `pairs[:8]` took the alphabetical
+# head, which was eight convnext_femto pairs -- so the "does it hold at every
+# tau" check only ever tested one architecture, and the most atypical one at
+# that. See D-18.
+sample_pairs = msc.stratified_pairs(pairs, _kind, per_kind=3)
+print(f'tau curves on {len(sample_pairs)} pairs, stratified by pair type:')
+for _k in sorted({_kind(p) for p in sample_pairs}):
+    print(f'   {_k}: {sum(1 for p in sample_pairs if _kind(p) == _k)}')
 q3t = msc.analyse_q3_transfer(
     sess.data_dir, [(seed1[a], seed1[b]) for a, b in sample_pairs],
     ceilings, budgets, axis='depth', taus=msc.TAU_GRID, n_boot=300)
@@ -2070,8 +2092,11 @@ else:
         code("""\
 import itertools
 ceilings = msc.read_json(sess.data_dir / 'analysis' / 'ceilings.json', default={}) or {}
-seed1 = {m['arch']: r for r, m in runs.items() if m['seed'] == 1}
-pairs = list(itertools.combinations(sorted(seed1), 2))[:15]
+seed1 = msc.representative_runs(runs, require=ceilings)
+pairs = list(itertools.combinations(sorted(seed1), 2))
+print(f'{len(seed1)} architectures -> {len(pairs)} pairs (ALL of them; the old '
+      f'pairs[:15] cap took the alphabetical head, which was 12 convnext_femto '
+      f'pairs + 3 mixer_nano pairs -- see D-18)')
 
 q4_all = []
 for a, b in pairs:
@@ -2087,14 +2112,25 @@ q4 = pd.concat(q4_all, ignore_index=True) if q4_all else pd.DataFrame()
 if not len(q4):
     print('No pairs analysed. Q4 needs at least two measured architectures.')
 if len(q4):
+    TOKEN_ARCH = {'vit_tiny', 'mixer_nano'}
+    q4['has_transformer'] = (q4.arch_a.isin(TOKEN_ARCH)
+                             | q4.arch_b.isin(TOKEN_ARCH))
     msc.save_analysis(sess.data_dir, 'q4_irreducibility_all', q4, sess.hub)
     display(q4[['arch_a', 'arch_b', 'partial_spearman', 'r2_difficulty_only',
                 'r2_difficulty_plus_msc', 'delta_r2', 'delta_r2_lo',
                 'delta_r2_hi']].round(4))
-    print(f"\\n  median delta R2       = {q4.delta_r2.median():.4f}   (H4 wants >= 0.05)")
+    print(f"\\n  n pairs               = {len(q4)}")
+    print(f"  median delta R2       = {q4.delta_r2.median():.4f}   (H4 wants >= 0.05)")
     print(f"  median partial corr   = {q4.partial_spearman.median():.4f}   (H4 wants >= 0.30)")
-    frac = (q4.delta_r2 >= 0.05).mean()
-    print(f"  pairs clearing H4     = {frac:.0%}")
+    print(f"  pairs clearing dR2    = {(q4.delta_r2 >= 0.05).mean():.0%}")
+    print(f"  pairs clearing partial= {(q4.partial_spearman >= 0.30).mean():.0%}")
+    print('\\n  split by whether the pair involves a non-convolutional model:')
+    display(q4.groupby('has_transformer')[['delta_r2', 'partial_spearman']]
+              .agg(['median', 'min', 'max', 'count']).round(4))
+    print('  Q1 found MSC is measured less reliably in ViT/Mixer, so a lower')
+    print('  delta R2 for those pairs is expected -- a noisier measurement')
+    print('  carries less unique information. Report the split, not just the')
+    print('  pooled median, or the two effects get confounded.')
 """),
         md("## Step 4 — Plot"),
         code("""\
