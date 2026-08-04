@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **190** offline self-checks |
-| **Defects found** | 20 · 17 fixed · **3 open** (D-14, D-15, D-18 re-run) · D-19 cost 0 in the end — the runs were checkpointed (D-20) |
+| **Library version** | `msc_lib` 1.0.0 · **190** offline + **3 torch-gated** self-checks |
+| **Defects found** | 21 · 18 fixed · **3 open** (D-14, D-15, D-18 re-run) · **D-21 blocked MSC-KD entirely — the method's own loss was never tested** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `9b18d2b`, 2026-08-04T06:1x Z |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -563,6 +563,72 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-21 · The MSC-KD loss cannot run under AMP — the method's own training step was never tested
+
+**Severity:** **blocked NB13 entirely** — the method could not train at all
+**Status:** **fixed** · **Found:** 2026-08-04, ~1 h into a real multi-account run
+
+```
+File "msc_lib.py", line 5652, in forward
+    bce = F.binary_cross_entropy(suff_pred.clamp(1e-6, 1 - 1e-6), ...)
+RuntimeError: torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss
+are unsafe to autocast. ... combine the two layers using
+torch.nn.functional.binary_cross_entropy_with_logits
+```
+
+`F.binary_cross_entropy` is on PyTorch's **banned list** under AMP autocast, and
+every training path in this project runs under `torch.amp.autocast`. So
+`MSCLoss` — the loss the entire method rests on — **could never have executed**.
+Not "was slow", not "was wrong": it raised on the first batch.
+
+**The fix is the one torch's own error message gives.** The head already
+computes `sigmoid(theta_k - u(x))`, so a clean logit was sitting right there:
+
+- `OrdinalSufficiencyHead.logits(feat)` returns `theta_k - u(x)`;
+  `forward()` is now `sigmoid(logits())` and is bit-identical to before.
+- `MSCStudent.forward(x, suff_logits=False)` — the training loop opts in, and
+  routing/inference keep getting probabilities, so no other call site moves.
+- `MSCLoss` uses `binary_cross_entropy_with_logits`.
+
+This is strictly better than a workaround. The `.clamp(1e-6, 1 - 1e-6)` the old
+code needed was papering over the `log(0)` that the fused logit kernel avoids by
+construction, so the fix removes a numerical hack as well as the crash.
+**Monotonicity is untouched** — `thresholds()` is increasing and sigmoid is
+monotone, so `s_k` is non-decreasing in `k` whether or not the sigmoid is
+applied. The architectural guarantee in §3 still holds. Same change applied to
+the reference implementation in `msc_torch.py`.
+
+**Contamination analysis.** None. No MSC-KD run ever completed, so no number
+anywhere derives from this code path. Q1–Q4 do not touch `MSCLoss`.
+
+**Why it survived — and this is the part that matters.** The NB00 preflight
+builds every architecture, runs `forward_features`, `forward_prefix`, a
+backward pass, and checks the budget tables. It is a genuinely good preflight.
+**It never constructs `MSCStudent`, never calls `MSCLoss`, and never enters an
+autocast block.** So the one component that is the project's actual
+contribution — the three-term loss and the ordinal head — had **zero** test
+coverage, while the fifteen backbones we did not write had thorough coverage.
+
+That inversion is the lesson. Testing effort had gone where the code was
+unfamiliar, not where it was load-bearing. The failure surfaced only after a
+teacher checkpoint, exit heads, and a full multi-exit sweep over 50,000
+training images had been paid for — about an hour of GPU time before the first
+student batch is even attempted, which is why it took a real run to find.
+
+**Guard added:** the torch-gated self-test now builds an `MSCStudent`, runs a
+full forward → `MSCLoss` → `backward` **inside `torch.amp.autocast`**, and
+asserts the loss is finite. CPU autocast enforces the same ban as CUDA, so this
+reproduces the failure with no GPU and runs in NB00 on every account. Two more
+checks pin that `forward()` is exactly `sigmoid(logits())` and that the
+sufficiency curve is still monotone in `k`, so the refactor cannot have changed
+what the head computes.
+
+**Related open item.** `train_msc_kd` does roughly an hour of expensive setup —
+teacher checkpoint load, exit-head training, full training-set sweep — *before*
+the first student step. A one-batch dry run of the student+loss immediately
+after the teacher is ready would have failed in seconds instead of an hour.
+Logged as **O-19**.
 
 ### D-20 · The D-19 verification cell raised a false alarm on healthy runs
 
@@ -1350,6 +1416,7 @@ Draft, from the record:
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
 | ~~O-17~~ | ~~Confirm the nine `p3-*-mscKD*` runs survived~~ — **CLOSED.** All nine are checkpointed on HF and resumable; nothing was lost. The alarm that said otherwise was D-20 | — | — | done |
+| O-19 | **Dry-run one student batch before the teacher sweep** in `train_msc_kd`. It currently does ~1 h of setup (checkpoint load, exit heads, 50k-image sweep) before the first student step, so D-21 took an hour to surface instead of seconds | fast failure | ~20 min | **high** |
 | O-18 | **Add a cross-session resume test.** Five defects have now been about resume (D-05, D-06, D-09, D-12, D-19) and every test we have runs inside one session — which is precisely the case that works. The acceptance test must delete the local run directory to simulate a fresh Kaggle session | the next D-19 | ~1 h | **high** |
 | O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
 | O-12 | **Close D-14/D-15:** null the `mobilenetv2` reference; measure the 6 unmeasured runs + train `wrn_16_2-s1`; add the NB08 coverage ALARM and the parameter-count assertion | "15 architectures" being true | ~4 GPU-h | **high** |
@@ -1379,6 +1446,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | **D-21 — the MSC-KD loss cannot run under AMP.** `F.binary_cross_entropy` is banned under autocast, so the method's training step could never execute. The NB00 preflight covers all 15 backbones and neither `MSCStudent` nor `MSCLoss` |
 | 2026-08-04 | D-20 — **the D-19 verification cell cried wolf**: nine healthy checkpointed runs reported as "NOT ON HF ... closing means retraining". Safety has three states, not two |
 | 2026-08-04 | **D-19 — NB13 restarted completed MSC-KD runs from epoch 0.** Resume was never wired into the method notebooks: `run_all` recognised only one entry point, neither training function pulled its own checkpoint, and the zero-work ALARM was dead code. The worst defect so far — it destroys GPU-hours silently |
 | 2026-08-04 | D-18 — **analysis sampled alphabetically**; Q4's 15 pairs were 12 convnext + 3 mixer, and `vgg8` was silently dropped from all three analyses |

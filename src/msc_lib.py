@@ -2990,9 +2990,21 @@ if _TORCH_OK:
             steps = F.softplus(self.deltas) + 1e-4
             return torch.cat([self.theta_0, self.theta_0 + torch.cumsum(steps, 0)])
 
-        def forward(self, feat):
+        def logits(self, feat):
+            """The pre-sigmoid score `theta_k - u(x)`, shape (B, K).
+
+            Exposed because the loss must not be given probabilities. D-21:
+            `F.binary_cross_entropy` refuses to run under AMP autocast, and the
+            fix is not to disable autocast but to use the logit form, which is
+            both autocast-safe and numerically stable. Monotonicity is
+            unaffected -- `thresholds()` is increasing and sigmoid is monotone,
+            so s_k is non-decreasing in k whether or not you apply the sigmoid.
+            """
             u = self.mlp(self._pool(feat))                       # (B, 1)
-            return torch.sigmoid(self.thresholds().unsqueeze(0) - u)
+            return self.thresholds().unsqueeze(0) - u
+
+        def forward(self, feat):
+            return torch.sigmoid(self.logits(feat))
 
         @torch.no_grad()
         def route(self, feat, gamma: float):
@@ -5644,13 +5656,22 @@ if _TORCH_OK:
             self.ignore_irreducible = ignore_irreducible
 
         def forward(self, student_logits, teacher_logits, labels,
-                    suff_pred, suff_target, irreducible=None):
+                    suff_logits, suff_target, irreducible=None):
+            """`suff_logits` is PRE-SIGMOID -- see D-21.
+
+            `F.binary_cross_entropy` raises under AMP autocast ("unsafe to
+            autocast"), and torch's own advice is to use the logit form rather
+            than to disable autocast. That is strictly better anyway: the
+            `.clamp(1e-6, 1-1e-6)` this used to need was papering over the
+            log(0) that the fused kernel avoids by construction.
+            """
             ce = F.cross_entropy(student_logits, labels)
             kd = F.kl_div(F.log_softmax(student_logits / self.T, dim=1),
                           F.softmax(teacher_logits / self.T, dim=1),
                           reduction="batchmean") * (self.T ** 2)
-            bce = F.binary_cross_entropy(suff_pred.clamp(1e-6, 1 - 1e-6),
-                                         suff_target, reduction="none").mean(dim=1)
+            bce = F.binary_cross_entropy_with_logits(
+                suff_logits, suff_target.to(suff_logits.dtype),
+                reduction="none").mean(dim=1)
             if self.ignore_irreducible and irreducible is not None:
                 keep = ~irreducible
                 # Samples where the teacher itself was unconfident carry a
@@ -5681,10 +5702,14 @@ if _TORCH_OK:
             self.suff = OrdinalSufficiencyHead(backbone.feature_dims[0], n_budgets,
                                                token_model=self.token_model)
 
-        def forward(self, x):
+        def forward(self, x, suff_logits: bool = False):
+            """`suff_logits=True` returns the sufficiency head's pre-sigmoid
+            scores, which is what `MSCLoss` needs (D-21). Inference and routing
+            want probabilities and get the default."""
             feats = self.backbone.forward_features(x)
             logits = [h(f) for h, f in zip(self.heads, feats)]
-            return logits, self.suff(feats[0]), feats
+            s = self.suff.logits(feats[0]) if suff_logits else self.suff(feats[0])
+            return logits, s, feats
 
         @torch.no_grad()
         def route_and_predict(self, x, gamma: float):
@@ -6701,7 +6726,8 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                 with torch.amp.autocast(device_type=device.type, enabled=amp):
                     with torch.no_grad():
                         t_logits = teacher(x)
-                    s_logits, suff, _ = student(x)
+                    # D-21: the loss needs pre-sigmoid scores, not probabilities.
+                    s_logits, suff, _ = student(x, suff_logits=True)
                     targets = sufficiency_targets(msc_t[idx], rho_t)
                     # Supervise the deepest exit for CE/KD; the shallower heads
                     # are trained by the mean CE below so every route is usable.
@@ -8494,6 +8520,46 @@ def _selftest() -> bool:
                       f"dims={m.feature_dims}")
             except Exception as e:
                 check(f"{a} builds and runs", False, f"{type(e).__name__}: {e}")
+
+        # --- D-21: the MSC-KD training step must survive AMP autocast -------
+        # This is the loss the entire method rests on, and NO test had ever run
+        # it under autocast -- the preflight built models and ran forward
+        # passes, which is exactly the part that was fine. So
+        # F.binary_cross_entropy, an op torch explicitly bans under autocast,
+        # reached a real multi-account run and failed 1 hour in.
+        #
+        # CPU autocast enforces the same ban as CUDA, so this catches it with
+        # no GPU.
+        try:
+            _st = MSCStudent(build_model("resnet20", 10), 10, n_budgets=5)
+            _x = torch.randn(4, 3, 32, 32)
+            _tl, _y = torch.randn(4, 10), torch.tensor([0, 1, 2, 3])
+            _tg = torch.zeros(4, 5)
+            _tg[:, 3:] = 1.0
+            with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
+                _sl, _suff, _ = _st(_x, suff_logits=True)
+                _loss, _ = MSCLoss()(_sl[-1], _tl, _y, _suff, _tg)
+            _loss.backward()
+            check("D-21: the MSC-KD loss runs under AMP autocast",
+                  torch.isfinite(_loss).item(), f"loss={float(_loss):.4f}")
+        except Exception as e:
+            check("D-21: the MSC-KD loss runs under AMP autocast", False,
+                  f"{type(e).__name__}: {e}")
+
+        # The refactor must not have changed what the head computes.
+        try:
+            _st.eval()
+            with torch.no_grad():
+                _f = _st.backbone.forward_features(torch.randn(4, 3, 32, 32))[0]
+                _p, _lg = _st.suff(_f), _st.suff.logits(_f)
+            check("D-21: forward() is exactly sigmoid(logits())",
+                  torch.allclose(_p, torch.sigmoid(_lg), atol=1e-6))
+            check("D-21: the sufficiency curve is still monotone in k",
+                  bool((_p[:, 1:] >= _p[:, :-1] - 1e-6).all()),
+                  "architectural monotonicity must survive the logit split")
+        except Exception as e:
+            check("D-21: forward() is exactly sigmoid(logits())", False,
+                  f"{type(e).__name__}: {e}")
     else:
         print("  [SKIP] torch unavailable -- model checks run in notebook 00")
 

@@ -158,10 +158,20 @@ class OrdinalSufficiencyHead(nn.Module):
         steps = F.softplus(self.deltas) + 1e-4
         return torch.cat([self.theta_0, self.theta_0 + torch.cumsum(steps, 0)])
 
+    def logits(self, feat: torch.Tensor) -> torch.Tensor:
+        """Returns (B, K) PRE-SIGMOID scores `theta_k - u(x)`.
+
+        The loss takes these, not probabilities: `F.binary_cross_entropy`
+        refuses to run under AMP autocast, and the logit form is both
+        autocast-safe and numerically stable. Monotonicity is unaffected --
+        `thresholds()` is increasing and sigmoid is monotone. See D-21.
+        """
+        u = self.trunk(feat)                               # (B, 1)
+        return self.thresholds().unsqueeze(0) - u
+
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         """Returns (B, K) sufficiency probabilities, non-decreasing along K."""
-        u = self.trunk(feat)                               # (B, 1)
-        return torch.sigmoid(self.thresholds().unsqueeze(0) - u)
+        return torch.sigmoid(self.logits(feat))
 
     @torch.no_grad()
     def route(self, feat: torch.Tensor, gamma: float) -> torch.Tensor:
@@ -214,7 +224,7 @@ class MSCLoss(nn.Module):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         labels: torch.Tensor,
-        suff_pred: torch.Tensor,          # (B, K) from OrdinalSufficiencyHead
+        suff_logits: torch.Tensor,        # (B, K) PRE-SIGMOID, from .logits()
         suff_target: torch.Tensor,        # (B, K) from sufficiency_targets
         irreducible: torch.Tensor | None = None,   # (B,) bool
     ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -227,8 +237,11 @@ class MSCLoss(nn.Module):
             reduction="batchmean",
         ) * (self.T ** 2)
 
-        bce = F.binary_cross_entropy(
-            suff_pred.clamp(1e-6, 1 - 1e-6), suff_target, reduction="none"
+        # D-21: the logit form, not F.binary_cross_entropy on probabilities.
+        # The latter raises under AMP autocast, and the `.clamp(1e-6, 1-1e-6)`
+        # it needed was papering over a log(0) the fused kernel avoids.
+        bce = F.binary_cross_entropy_with_logits(
+            suff_logits, suff_target.to(suff_logits.dtype), reduction="none"
         ).mean(dim=1)
 
         if self.ignore_irreducible and irreducible is not None:
