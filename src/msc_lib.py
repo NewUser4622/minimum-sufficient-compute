@@ -7464,6 +7464,34 @@ class Session:
         ps = run_layout(self.work, run_id)["per_sample"]
         return any((ps / f"{split}.{e}").exists() for e in ("parquet", "csv"))
 
+    def msckd_valid(self, run_id: str) -> bool:
+        """Trained **and still compatible** — the stage predicate NB13 must use.
+
+        **D-31.** The D-29 validity check was placed inside `train_msc_kd`. But
+        `run_all` -> `plan_work` filters "done" runs out **before** the training
+        function is ever called, so the check sat downstream of the very thing
+        that skips the work and could never fire. NB13 reported
+        `already finished (GLOBAL, from HF): 9 ... MY REMAINING WORK: 0` and
+        exited, leaving the nine invalid students exactly as they were.
+
+        A compatibility test has to live in the predicate that decides whether
+        to do the work, not in the code that does it.
+        """
+        if not self.trained(run_id):
+            return False
+        try:
+            m = parse_run_id(run_id)
+            cfg = {"arch": m["arch"],
+                   "num_classes": 10 if "cifar10" == self.dataset else 100}
+            ok, why = msckd_router_ok(self.work, run_id, cfg, self.data_dir,
+                                      self.hub)
+        except Exception:                                    # noqa: BLE001
+            return True          # unverifiable -> leave it alone
+        if not ok:
+            log(f"{run_id}: complete but INVALID -- {why}. Queued for retrain.",
+                "MSCKD")
+        return ok
+
     def trained(self, run_id: str) -> bool:
         """Has TRAINING finished for this run?"""
         st = self.registry.latest().get(run_id, {})
@@ -8718,6 +8746,24 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-31: the compatibility check must sit in the PREDICATE -------------
+    # D-29 put the router check inside train_msc_kd. plan_work filters "done"
+    # runs out before that function is ever called, so the check was
+    # unreachable: NB13 printed "already finished: 9 ... REMAINING WORK: 0".
+    # A test that decides whether to redo work cannot live inside the code that
+    # does the work.
+    def _plan_todo(mine, done_fn):
+        return [r for r in mine if not done_fn(r)]
+
+    _mine = ["a", "b", "c"]
+    check("D-31: a presence-only predicate skips invalid runs",
+          _plan_todo(_mine, lambda r: True) == [],
+          "this is what actually happened -- 0 work planned")
+    check("D-31: a validity-aware predicate re-plans them",
+          _plan_todo(_mine, lambda r: r == "a") == ["b", "c"])
+    check("D-31: and leaves the valid ones alone",
+          _plan_todo(_mine, lambda r: r != "c") == ["c"])
 
     # --- D-29: a completion cache needs a COMPATIBILITY predicate ------------
     # already_finished answers "did it complete?". After D-28 the honest answer

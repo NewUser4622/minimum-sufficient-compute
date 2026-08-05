@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **226** offline + **3 torch-gated** self-checks |
-| **Defects found** | 29 · 27 fixed · **2 open** (D-14, O-21 B11) · NB13 now **auto-detects and retrains** the D-28 students |
+| **Library version** | `msc_lib` 1.0.0 · **229** offline + **3 torch-gated** self-checks |
+| **Defects found** | 31 · 29 fixed · **2 open** (D-14, O-21 B11) · NB13 now re-plans the D-28 students (D-31) |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,45 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-31 · The D-29 validity check was unreachable — wrong layer
+
+**Severity:** made two consecutive fixes no-ops · **Status:** **fixed**
+**Found:** 2026-08-05 from NB13 output I should have read the first time
+
+```
+  already finished (GLOBAL, from HF): 9   <- for the 'train' stage
+  MY REMAINING WORK                 : 0
+[PLAN] nothing to do -- stage 'train' is complete for this worker's 2 run(s)
+9/9 REAL-method students trained -- NB14 needs all of them
+```
+
+NB13 ran, planned **zero** work, and declared success. The nine invalid
+students were untouched.
+
+**Why.** D-29 put the router-compatibility check inside `train_msc_kd`. But
+`run_all` → `plan_work` filters "done" runs out **before** the training
+function is ever called, using `done_fn=self.trained` — which asks only
+whether a `summary.json` exists. So the check sat *downstream of the thing that
+skips the work* and could never execute.
+
+**A test that decides whether to redo work cannot live inside the code that
+does the work.** D-29 identified the right condition and installed it at the
+wrong layer, which made it indistinguishable from not having written it.
+
+**Fix.** `Session.msckd_valid(run_id)` — trained **and** router-compatible —
+passed as `done_fn` in NB13. The decision now happens where the skipping
+happens.
+
+**Guard added:** 3 self-checks showing a presence-only predicate plans zero
+work (the observed failure) while a validity-aware one re-plans exactly the
+invalid runs. Self-checks 226 → **229**.
+
+**Fourth in the sequence.** D-19, D-26, D-29, D-31 are all one defect wearing
+different clothes: **something asked "do I have it?" when it needed to ask "is
+what I have still correct?"** The first three were about which artifact to
+trust. This one is about *where the question gets asked* — and it cost the
+user a session because I fixed the predicate without checking who calls it.
 
 ### D-29 · A completion cache with no compatibility check — "finished" is not "valid"
 
@@ -1876,6 +1915,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-05 | **D-31 — the D-29 check was unreachable.** `plan_work` skips "done" runs before `train_msc_kd` runs, so NB13 planned zero work and declared success. Fourth defect in the "do I have it?" vs "is it still correct?" family |
 | 2026-08-05 | **D-29 — the completion cache had no compatibility check.** My D-28 remedy ("re-run NB13") was impossible: `already_finished` would have skipped all nine. Third time a fix has been blocked by a cache that only knew presence (D-19, D-26, D-29) |
 | 2026-08-05 | **D-28 — the router was sized from the TEACHER's budget grid.** A 5-column router on a 3-exit `resnet8x4`. A modelling error, not a shape bug: routing spends the *student's* compute. **All 9 MSC-KD students must be retrained** |
 | 2026-08-05 | **NB09 re-run: `ceilings.json` now has all 15 architectures.** `wrn_16_2` = 0.6328 sits inside the CNN band, so the §1.2 CNN/non-CNN separation survives the full atlas |

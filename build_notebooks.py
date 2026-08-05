@@ -2335,7 +2335,11 @@ for arm in ARMS:
                                 shuffle_targets=_shuf)
 
     print(f'\\n{"#"*74}\\n### {label}\\n{"#"*74}')
-    results += sess.run_all(cfgs, fn=_train,
+    # D-31: "done" for this stage means trained AND still compatible. The
+    # default predicate (sess.trained) only asks whether a summary exists, so
+    # students invalidated by D-28 were filtered out as finished before
+    # train_msc_kd -- and its validity check -- could ever run.
+    results += sess.run_all(cfgs, fn=_train, done_fn=sess.msckd_valid,
                             title=f'MSC-KD training ({label})')
 
 done = pd.DataFrame([{k: r.get(k) for k in
