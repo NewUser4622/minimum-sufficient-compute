@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **223** offline + **3 torch-gated** self-checks |
-| **Defects found** | 28 · 26 fixed · **2 open** (D-14, O-21 B11) · **D-28 invalidates the 9 MSC-KD students — retrain** |
+| **Library version** | `msc_lib` 1.0.0 · **226** offline + **3 torch-gated** self-checks |
+| **Defects found** | 29 · 27 fixed · **2 open** (D-14, O-21 B11) · NB13 now **auto-detects and retrains** the D-28 students |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,53 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-29 · A completion cache with no compatibility check — "finished" is not "valid"
+
+**Severity:** made the D-28 fix unreachable · **Status:** **fixed**
+**Found:** 2026-08-05 · **This one is a process failure of mine, not just a code defect**
+
+After D-28 I told the user: *"This invalidates your nine MSC-KD students. NB13
+needs re-running."* **That instruction could not be followed.**
+`already_finished()` — the D-19 guard — reads `summary.json`, sees
+`num_epochs_run == 240`, returns `cached`, and NB13 **skips the run**. The nine
+broken students would have been skipped forever, and the same
+teacher-shaped routers kept flowing into NB14.
+
+I shipped a fix, declared the remedy, and never checked that the remedy was
+possible. The user then ran NB13, reported it complete, and hit the identical
+error — which is exactly what my own code guaranteed would happen.
+
+**The general defect.** `already_finished` answers *"did this run complete?"*.
+That was the right question for D-19, where the failure mode was losing
+finished work. It is the wrong question after a change to what a valid artifact
+*is*. **A completion cache needs a compatibility predicate as well as a
+presence predicate**, or every future correctness fix is unreachable for every
+artifact produced before it.
+
+**Fix.** `msckd_router_ok(work, run_id, cfg, data_out, hub)` compares the router
+width stored with the checkpoint against the number of depth budgets the
+student actually has. `train_msc_kd` consults it before accepting the cache; on
+a mismatch it logs *"complete but INVALID"*, deletes the stale checkpoint and
+history, sets `force_rerun`, and retrains. **Nothing to delete by hand and no
+flag to remember** — the D-27 lesson applied.
+
+Deliberately defensive: when validity cannot be established (no checkpoint, no
+stored `rho`, budgets unreadable) it returns *valid*, because forcing retrains
+on uncertainty is its own kind of damage.
+
+NB14 now **skips** stale students and reports them together at the end, instead
+of aborting the whole notebook on the first one.
+
+**Guard added:** 3 self-checks — a teacher-sized router is rejected, a correct
+one accepted, and equal-width architectures (`resnet20`, `vgg8`, both 5 exits)
+are unaffected. Self-checks 223 → **226**.
+
+**The lesson worth keeping.** Three times now a fix has been blocked by a cache
+that only knew about presence: D-19 (ledger vs artifact), D-26 (history vs
+summary), and now D-29 (finished vs valid). Every caching layer in this project
+should be able to answer *"is what I have still what I want?"*, not only
+*"do I have something?"*
 
 ### D-28 · The router was sized from the teacher's budget grid, not the student's
 
@@ -1829,6 +1876,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-05 | **D-29 — the completion cache had no compatibility check.** My D-28 remedy ("re-run NB13") was impossible: `already_finished` would have skipped all nine. Third time a fix has been blocked by a cache that only knew presence (D-19, D-26, D-29) |
 | 2026-08-05 | **D-28 — the router was sized from the TEACHER's budget grid.** A 5-column router on a 3-exit `resnet8x4`. A modelling error, not a shape bug: routing spends the *student's* compute. **All 9 MSC-KD students must be retrained** |
 | 2026-08-05 | **NB09 re-run: `ceilings.json` now has all 15 architectures.** `wrn_16_2` = 0.6328 sits inside the CNN band, so the §1.2 CNN/non-CNN separation survives the full atlas |
 | 2026-08-05 | **Real MSC-KD arm training** — `p3-resnet20-…-s1` completed 240/240 at 71.04%, and its summary carries `num_epochs_planned`, confirming the D-24 fix is live |

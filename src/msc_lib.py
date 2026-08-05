@@ -4621,6 +4621,45 @@ def ensure_run_local(hub, work, run_id: str, why: str = "") -> bool:
     return False
 
 
+def msckd_router_ok(work, run_id: str, cfg: Dict[str, Any], data_out,
+                    hub=None) -> Tuple[bool, str]:
+    """Is this finished MSC-KD checkpoint still *valid*, not merely present?
+
+    **D-29.** `already_finished` answers "did this run complete?". After D-28
+    changed how the router is shaped, the honest answer for nine existing
+    students was "yes, and the result is unusable" -- their sufficiency head
+    was sized from the teacher's budget grid. The completion cache had no way
+    to know that, so re-running NB13 skipped all nine and the same broken
+    checkpoints kept flowing into NB14.
+
+    **A completion cache needs a compatibility predicate, not just a presence
+    predicate.** This is that predicate: the router width stored with the
+    checkpoint must equal the number of depth budgets the student actually has.
+
+    Returns (ok, reason). Defensive: when validity cannot be established it
+    returns True, because forcing a retrain on uncertainty is its own kind of
+    damage.
+    """
+    ck = run_layout(work, run_id)["checkpoints"] / "ckpt_best.pt"
+    if not ck.exists() or not _TORCH_OK:
+        return True, "no checkpoint to check"
+    try:
+        blob = torch.load(ck, map_location="cpu", weights_only=False)
+        stored = blob.get("rho")
+        if not stored:
+            return True, "checkpoint stores no rho"
+        b = load_or_build_budgets(cfg["arch"], data_out,
+                                  int(cfg["num_classes"]), hub=hub)
+        want = len(b["axes"]["depth"]["rho"])
+    except Exception as e:                                   # noqa: BLE001
+        return True, f"could not verify ({type(e).__name__}: {e})"
+    if len(stored) != want:
+        return False, (f"router has {len(stored)} outputs but {cfg['arch']} has "
+                       f"{want} depth budgets -- trained against the TEACHER's "
+                       f"grid, before D-28")
+    return True, "ok"
+
+
 def already_finished(hub, work, run_id: str, cfg: Dict[str, Any],
                      registry=None) -> Optional[Dict[str, Any]]:
     """Has this run already finished, on the evidence of its own artifacts?
@@ -6794,7 +6833,20 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     # images. Discovering "already done" after paying for that is no use.
     _cached = already_finished(hub, work, run_id, cfg, registry)
     if _cached is not None:
-        return _cached
+        # D-29: "finished" is not "valid". Check the router width before
+        # accepting the cache, or a checkpoint invalidated by D-28 is skipped
+        # forever and keeps flowing downstream into NB14.
+        _ok, _why = msckd_router_ok(work, run_id, cfg, data_out, hub)
+        if _ok:
+            return _cached
+        log(f"{run_id} is complete but INVALID: {_why}. Retraining from "
+            f"scratch -- the stored weights cannot be reused.", "MSCKD")
+        cfg = {**cfg, "force_rerun": True}
+        for _p in (ckpt_last, ckpt_best, history_path):
+            try:
+                _p.unlink(missing_ok=True)
+            except Exception:                                # noqa: BLE001
+                pass
 
     atomic_write_yaml(run_dir / "config.yaml", cfg)
     atomic_write_json(L["env"] / "environment.json", environment_report())
@@ -7125,10 +7177,13 @@ def evaluate_routing_methods(student, val_loader, device, rho: Sequence[float],
     if not (L.shape[1] == S.shape[1] == len(rho)):
         raise ValueError(
             f"routing shapes disagree: {L.shape[1]} exit heads, "
-            f"{S.shape[1]} sufficiency outputs, {len(rho)} budgets. "
-            f"All three must match. A student trained before the D-28 fix has "
-            f"a head sized from the TEACHER's budget grid -- retrain it, or "
-            f"pass the rho it was trained with.")
+            f"{S.shape[1]} sufficiency outputs, {len(rho)} budgets.\n"
+            f"This student was trained BEFORE the D-28 fix, with its router "
+            f"sized from the teacher's budget grid. The weights cannot be "
+            f"reused.\n"
+            f"FIX: re-run NB13 with the current library. It now detects this "
+            f"(D-29) and retrains the affected students automatically -- you "
+            f"do not need to delete anything by hand.")
 
     correct_at = (L.argmax(2) == Y[:, None]).astype(float)     # (N, K)
     probs = np.exp(L - L.max(2, keepdims=True))
@@ -8643,6 +8698,18 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-29: a completion cache needs a COMPATIBILITY predicate ------------
+    # already_finished answers "did it complete?". After D-28 the honest answer
+    # for nine students was "yes, and unusable". Presence is not validity.
+    def _router_ok(stored_width, arch_width):
+        return stored_width == arch_width
+
+    check("D-29: a teacher-sized router is rejected as invalid",
+          not _router_ok(5, 3), "resnet8x4 with a resnet32x4-shaped head")
+    check("D-29: a correctly-sized router is accepted", _router_ok(3, 3))
+    check("D-29: equal-width architectures are unaffected",
+          _router_ok(5, 5), "resnet20/vgg8 also have 5 exits")
 
     # --- D-28: the router lives on the STUDENT's budget grid -----------------
     # A resnet8x4 student has 3 adaptive depth exits; a resnet32x4 teacher has

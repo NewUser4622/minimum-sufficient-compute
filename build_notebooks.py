@@ -2462,6 +2462,7 @@ if not students:
     print('='*70)
 
 comparisons = []
+stale = []
 for rid, arch, seed in students:
     print(f'\\n>>> {rid}')
     # D-23/D-25: checkpoints live in runs/{rid}/checkpoints/, not the run root.
@@ -2490,6 +2491,14 @@ for rid, arch, seed in students:
     except Exception:
         print('  no per-image table for this student -- B11 ceiling unavailable')
 
+    # D-29: skip students whose router predates the D-28 fix, and say so once
+    # at the end, instead of aborting the whole notebook on the first one.
+    ok, why = msc.msckd_router_ok(sess.work, rid, cfg, sess.data_dir, sess.hub)
+    if not ok:
+        print(f'  SKIPPED -- {why}')
+        stale.append(rid)
+        continue
+
     out = msc.evaluate_routing_methods(student, val_loader, device, rho,
                                        sb['full_flops'], oracle_msc)
     cmp_ = out.get('matched_flops_comparison', {})
@@ -2501,6 +2510,17 @@ for rid, arch, seed in students:
     for name, curve in out['curves'].items():
         curve.insert(0, 'run_id', rid); curve.insert(1, 'method', name)
         msc.save_analysis(sess.data_dir, f'curve_{rid}_{name}', curve, sess.hub)
+
+if stale:
+    print('\\n' + '='*70)
+    print(f'{len(stale)} of {len(students)} students SKIPPED as invalid (D-28).')
+    print('Their router was sized from the teacher\\'s budget grid, so the')
+    print('weights cannot be reused.')
+    print('')
+    print('FIX: re-run NB13 with the current library. It detects these')
+    print('automatically (D-29) and retrains only the affected students --')
+    print('nothing to delete by hand.')
+    print('='*70)
 
 cmp_df = pd.DataFrame(comparisons)
 msc.save_analysis(sess.data_dir, 'q5_matched_flops', cmp_df, sess.hub)
