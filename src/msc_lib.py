@@ -7296,7 +7296,21 @@ class Session:
             claimed = int(summ.get("num_epochs_run", 0) or 0)
             target = planned or claimed
             status_ok = summ.get("status") == "completed"
-            done = status_ok and target > 0 and (last_ep + 1) >= 0.9 * target
+            # D-26: `summary.json` is written AFTER the training loop exits, so
+            # a summary claiming a full run IS the completion record.
+            # `epochs.csv` is telemetry pushed on a 30-minute timer, and a
+            # session that ended between its last history push and its summary
+            # push leaves a SHORT HISTORY FOR A RUN THAT GENUINELY FINISHED.
+            #
+            # Judging on history alone demoted five completed atlas runs --
+            # resnet110-s1 at "161 epochs", resnet32x4-s2 at "40" -- all of
+            # which have summaries saying 240/240 and a best checkpoint on HF.
+            # Trust the summary when it is self-consistent; fall back to the
+            # history only when the summary cannot answer.
+            if status_ok and target > 0 and claimed >= 0.9 * target:
+                done = True
+            else:
+                done = status_ok and target > 0 and (last_ep + 1) >= 0.9 * target
             cur = known.get(rd.name, {})
             ident = parse_run_id(rd.name)
             if (not done) and status_ok and target <= 0:
@@ -8589,6 +8603,34 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-26: summary.json outranks epochs.csv ------------------------------
+    # epochs.csv is telemetry pushed on a 30-min timer; summary.json is written
+    # AFTER the loop exits. A session ending between the two leaves a short
+    # history for a run that genuinely finished -- which demoted five completed
+    # atlas runs ("resnet110-s1 at only 161 epochs") that have 240/240
+    # summaries and best checkpoints on HF.
+    def _verdict2(summ, last_ep):
+        planned = int(summ.get("num_epochs_planned", 0) or 0)
+        claimed = int(summ.get("num_epochs_run", 0) or 0)
+        target = planned or claimed
+        ok = summ.get("status") == "completed"
+        if ok and target > 0 and claimed >= 0.9 * target:
+            return True
+        return ok and target > 0 and (last_ep + 1) >= 0.9 * target
+
+    _c240 = {"status": "completed", "num_epochs_planned": 240,
+             "num_epochs_run": 240}
+    check("D-26: a 240/240 summary survives a truncated history",
+          _verdict2(_c240, 160), "the exact resnet110-s1 case")
+    check("D-26: and survives an empty history",
+          _verdict2(_c240, -1))
+    check("D-26: a summary that admits a short run is still demoted",
+          not _verdict2({"status": "completed", "num_epochs_planned": 240,
+                         "num_epochs_run": 40}, 39),
+          "the genuine broken stub must still be caught")
+    check("D-26: history can still rescue a summary with no counts",
+          _verdict2({"status": "completed", "num_epochs_run": 240}, 239))
 
     # --- D-24: repair_ledger must not demote on a MISSING field --------------
     # train_msc_kd's summary has no `num_epochs_planned`, so `planned` was 0,

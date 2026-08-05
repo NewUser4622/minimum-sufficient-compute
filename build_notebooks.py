@@ -327,7 +327,7 @@ sess.finish()
 # paused at epoch 120 whose ckpt_last.pt is on HF loses nothing when you close
 # the tab. Only AT RISK (no summary.json AND no checkpoint) needs action.
 try:
-    _ids = [c['run_id'] for c in cfgs]
+    _ids = [c['run_id'] for c in (all_cfgs if 'all_cfgs' in dir() else cfgs)]
 except NameError:
     _ids = []
 if _ids:
@@ -2281,7 +2281,11 @@ ALPHA, BETA, TEMPERATURE = 1.0, 1.0, 4.0
 TAU          = 0.1
 EPOCHS       = 240
 
-SHUFFLE_ABLATION = True     # <<< RUN True FIRST, then re-run with False
+# Both arms, in one run. The control (scrambled targets) goes first so that if
+# it trains as well as the real thing you find out before spending the rest.
+# This used to be a single flag you had to flip and re-run by hand, which is
+# why the real arm kept not existing when NB14 asked for it.
+ARMS = [True, False]        # True = scrambled control, False = the method
 
 teacher_run = msc.make_run_id('p1', TEACHER_ARCH, 'cifar100', 'base', TEACHER_SEED)
 tstate = sess.registry.latest().get(teacher_run, {})
@@ -2290,11 +2294,20 @@ assert tstate.get('state') == 'completed', 'Train the teacher first (NB04).'
 
 sess.sync_state(run_ids=[teacher_run], include_checkpoints=True, verbose=True)
 
-method = 'mscKDshuf' if SHUFFLE_ABLATION else 'mscKD'
-cfgs = [sess.config(a, seed=s, method=f'{method}-from-{TEACHER_ARCH}',
-                    num_epochs=EPOCHS)
-        for a in STUDENTS for s in SEEDS]
-display(msc.shard_report([c['run_id'] for c in cfgs], NUM_WORKERS, mode='cost'))
+def arm_cfgs(shuffled):
+    m = 'mscKDshuf' if shuffled else 'mscKD'
+    return [sess.config(a, seed=s, method=f'{m}-from-{TEACHER_ARCH}',
+                        num_epochs=EPOCHS)
+            for a in STUDENTS for s in SEEDS]
+
+for _arm in ARMS:
+    _c = arm_cfgs(_arm)
+    _done = sum(1 for c in _c if sess.trained(c['run_id']))
+    print(f"{'SCRAMBLED control' if _arm else 'REAL method   '}: "
+          f"{_done}/{len(_c)} already done")
+all_cfgs = [c for arm in ARMS for c in arm_cfgs(arm)]
+display(msc.shard_report([c['run_id'] for c in all_cfgs], NUM_WORKERS,
+                         mode='cost'))
 """),
         md("""
         ## Step 5 — Train
@@ -2304,19 +2317,35 @@ display(msc.shard_report([c['run_id'] for c in cfgs], NUM_WORKERS, mode='cost'))
         isn't the compute-need of the image), then trains the student.
         """),
         code("""\
-def _train(cfg):
-    return msc.train_msc_kd(cfg, sess.hub, sess.registry, teacher_run, TEACHER_ARCH,
-                            work_root=sess.work, data_root_out=sess.data_dir,
-                            alpha=ALPHA, beta=BETA, temperature=TEMPERATURE,
-                            tau=TAU, shuffle_targets=SHUFFLE_ABLATION)
-
-results = sess.run_all(cfgs, fn=_train,
-                       title=f'MSC-KD training ({"SCRAMBLED" if SHUFFLE_ABLATION else "real"})')
-
 import pandas as pd
-pd.DataFrame([{k: r.get(k) for k in
-               ('run_id', 'arch', 'seed', 'best_accuracy', 'shuffled_targets',
-                'num_epochs_run')} for r in results if r.get('status') == 'completed'])
+results = []
+
+# Whether a run is scrambled is a property of its OWN run_id, not of a global
+# flag -- so both arms can train in one pass without the two ever mixing.
+for arm in ARMS:
+    label = 'SCRAMBLED control' if arm else 'REAL method'
+    cfgs = arm_cfgs(arm)
+
+    def _train(cfg, _shuf=arm):
+        return msc.train_msc_kd(cfg, sess.hub, sess.registry, teacher_run,
+                                TEACHER_ARCH, work_root=sess.work,
+                                data_root_out=sess.data_dir,
+                                alpha=ALPHA, beta=BETA,
+                                temperature=TEMPERATURE, tau=TAU,
+                                shuffle_targets=_shuf)
+
+    print(f'\\n{"#"*74}\\n### {label}\\n{"#"*74}')
+    results += sess.run_all(cfgs, fn=_train,
+                            title=f'MSC-KD training ({label})')
+
+done = pd.DataFrame([{k: r.get(k) for k in
+                      ('run_id', 'arch', 'seed', 'best_accuracy',
+                       'shuffled_targets', 'num_epochs_run')}
+                     for r in results if r.get('status') == 'completed'])
+n_real = sum(1 for c in arm_cfgs(False) if sess.trained(c['run_id']))
+print(f'\\n{n_real}/{len(SEEDS)*len(STUDENTS)} REAL-method students trained '
+      f'-- NB14 needs all of them')
+display(done)
 """),
         md("""
         ## Step 6 — Real vs scrambled

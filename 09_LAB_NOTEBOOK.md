@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **213** offline + **3 torch-gated** self-checks |
-| **Defects found** | 25 · 23 fixed · **2 open** (D-14, O-20 NB09 re-run) · D-24 would have cost 30 GPU-h if D-19 had not shipped first |
+| **Library version** | `msc_lib` 1.0.0 · **217** offline + **3 torch-gated** self-checks |
+| **Defects found** | 27 · 25 fixed · **2 open** (D-14, O-20) · **run the REBUILT notebooks — stale copies on Kaggle re-ran D-21/D-23** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,79 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-27 · NB13 required a manual flag flip, so the real arm kept not existing
+
+**Severity:** wasted three user sessions · **Status:** fixed · **Found:** 2026-08-04
+
+NB13 shipped with:
+
+```python
+SHUFFLE_ABLATION = True     # <<< RUN True FIRST, then re-run with False
+```
+
+The user ran NB13 four times. Every run trained the **scrambled control**,
+because the flag defaults to `True` and nothing in the notebook tracks that the
+control is already finished. NB14 then correctly reported zero real students —
+and I explained the flag *again* instead of removing it.
+
+**A comment is not a mechanism.** The design put a required state transition in
+a code comment and depended on the operator to remember it across sessions,
+days and five Kaggle accounts. That is the same class of error as D-19 (resume
+depending on a cell near the top of the notebook) — **an invariant that lives
+in prose rather than in code.**
+
+**Fix.** `ARMS = [True, False]` and a loop. Both arms train in one pass, the
+control first so a null result stops you early. Whether a run is scrambled is
+now derived from its own `run_id`, so the two arms cannot mix, and the cell
+prints `n/9 REAL-method students trained -- NB14 needs all of them`. Nothing to
+remember, nothing to flip.
+
+### D-26 · `epochs.csv` was outranking `summary.json`, demoting completed atlas runs
+
+**Severity:** **corrupted ledger state for five completed atlas runs**
+**Status:** fixed · **Found:** 2026-08-04 in NB13 output
+
+```
+[REPAIR] broken stub: p1-resnet110-cifar100-base-s1 marked completed at only 161 epochs
+[REPAIR] broken stub: p1-resnet32x4-cifar100-base-s2 marked completed at only 40 epochs
+[REPAIR] broken stub: p1-vgg13-cifar100-base-s2  ... 102 epochs
+[REPAIR] broken stub: p1-vit_tiny-cifar100-base-s1 ... 55 epochs
+[REPAIR] broken stub: p1-wrn_16_2-cifar100-base-s2 ... 121 epochs
+```
+
+All five have `summary.json` reporting **240/240** and a best checkpoint on HF.
+They finished. `repair_ledger` demoted them anyway.
+
+**Why.** The check measured completion by counting rows in `metrics/epochs.csv`.
+But **`epochs.csv` is telemetry pushed on a 30-minute timer, while
+`summary.json` is written after the training loop exits.** A session that ends
+between its last history push and its summary push leaves a short history for a
+run that genuinely completed. The history is a lagging indicator; the summary is
+the completion record.
+
+This is distinct from D-24 (a *missing* field) — here the field was present and
+the wrong artifact was being trusted.
+
+**Contamination analysis.** No training lost, again because `already_finished()`
+reads `summary.json` (D-19). But the ledger on HF now carries spurious `paused`
+events for five atlas runs, and any tool reading ledger state rather than
+artifacts would have mis-reported the atlas as incomplete.
+
+**Fix.** When the summary is self-consistent — status `completed` and
+`num_epochs_run >= 0.9 × planned` — it is believed outright. The history check
+remains as a fallback for summaries that cannot answer. A genuine stub, whose
+summary *admits* a short run, is still demoted; asserted directly.
+
+**Guard added:** 4 self-checks, including the exact `resnet110-s1` case
+(240/240 summary, history truncated at 161) and an empty history. Self-checks
+213 → **217**.
+
+**Operational note.** The user's NB13 output also showed D-21 and D-23 firing —
+defects fixed two turns earlier. **They were running a stale notebook.** Kaggle
+does not re-read `notebooks/` on its own; the rebuilt `.ipynb` has to be
+re-uploaded. Worth stating in the runbook, because "I fixed it" and "the fix is
+running" are different claims and only the second one matters.
 
 ### D-25 · NB14 could never have loaded a student checkpoint
 
@@ -1696,6 +1769,8 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | D-27 — **NB13 needed a manual flag flip**, so four runs all trained the control and the real arm never existed. Both arms now run in one pass. An invariant in a comment is not a mechanism |
+| 2026-08-04 | **D-26 — `epochs.csv` outranked `summary.json`**, demoting five completed atlas runs. History is telemetry on a 30-min timer; the summary is the completion record |
 | 2026-08-04 | D-25 — **NB14 could never have loaded a student checkpoint**: wrong local path, wrong repo prefix, wrong download destination. Third defect from hand-spelled paths (D-16, D-23, D-25) |
 | 2026-08-04 | **D-24 — `repair_ledger` demoted every completed MSC-KD run**, because `train_msc_kd` omits `num_epochs_planned` and the repair read a missing field as proof of failure. The D-19 fix is the only reason 30 GPU-h of training survived |
 | 2026-08-04 | **NB16: atlas complete — 45/45 trained, 45/45 measured.** `wrn_16_2-s1` trained at 73.64% (+0.38 over reference). D-15 closed |
