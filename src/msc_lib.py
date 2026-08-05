@@ -4424,6 +4424,26 @@ def msckd_dry_run(cfg: Dict[str, Any], teacher, device, amp: bool,
                 cum_time=1.0, cum_energy=0.0, n_train_images=2,
                 alpha=alpha, beta=beta, temperature=temperature)
             append_history_row(Path(td) / "epochs.csv", row, strict=True)
+        # D-30: go all the way through EVALUATION, not just training.
+        # The dry run as first written covered the training step and would have
+        # caught D-21 and D-22 -- but not D-28, whose shape mismatch is
+        # invisible until routing indexes the exit logits. Every stage the real
+        # pipeline uses has to appear here, or the dry run just moves the
+        # boundary of what can hide behind an hour of setup.
+        n_heads = len(student.heads)
+        rho_probe = [(i + 1) / n_heads for i in range(n_heads)]
+
+        class _Loader:                      # two batches, no dataset needed
+            def __iter__(self):
+                for _ in range(2):
+                    yield x.cpu(), y.cpu()
+
+        ev = evaluate_routing_methods(student, _Loader(), device, rho_probe,
+                                      full_flops=1e9, oracle_msc=None,
+                                      amp=amp)
+        if int(ev.get("K", 0)) != n_heads:
+            return False, f"eval reports K={ev.get('K')} for {n_heads} heads"
+
         del student, opt
         if device.type == "cuda":
             torch.cuda.empty_cache()
