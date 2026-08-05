@@ -2409,14 +2409,39 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 students = [(r['run_id'], r['arch'], r['seed'])
             for r in sess.completed_runs()
             if 'mscKD' in r['run_id'] and 'shuf' not in r['run_id']]
-print(f'{len(students)} trained students to evaluate')
+shuffled = [r['run_id'] for r in sess.completed_runs()
+            if 'mscKDshuf' in r['run_id']]
+print(f'{len(students)} REAL-target students to evaluate')
+print(f'{len(shuffled)} scrambled-ablation runs present (not used here)')
+
+if not students:
+    print('\\n' + '='*70)
+    print('NOTHING TO COMPARE -- and this is almost certainly not a bug.')
+    print('='*70)
+    if shuffled:
+        print(f'You have {len(shuffled)} runs of the SCRAMBLED ablation')
+        print('(`mscKDshuf`), which is the control, not the method.')
+        print('')
+        print('NB13 defaults to SHUFFLE_ABLATION = True so the control runs')
+        print('first -- if scrambled targets train as well as real ones, the')
+        print('mechanism claim is wrong and there is no point comparing.')
+        print('')
+        print('TO PROCEED: open NB13, set  SHUFFLE_ABLATION = False,  and run')
+        print('it again. That produces the `mscKD` runs this notebook needs.')
+    else:
+        print('No MSC-KD runs of any kind found. Run NB13 first.')
+    print('='*70)
 
 comparisons = []
 for rid, arch, seed in students:
     print(f'\\n>>> {rid}')
-    ck = sess.runs_dir / rid / 'ckpt_best.pt'
+    # D-23/D-25: checkpoints live in runs/{rid}/checkpoints/, not the run root.
+    ck = msc.run_layout(sess.work, rid)['checkpoints'] / 'ckpt_best.pt'
     if not ck.exists() and sess.hub.enabled:
-        sess.hub.models.download(sess.runs_dir, allow_patterns=[f'{rid}/**'])
+        # D-25: repo paths are `runs/{rid}/...` and downloads land in
+        # sess.work, not sess.runs_dir. Both were wrong here, so the fallback
+        # pull could never have recovered a checkpoint.
+        sess.hub.hub.download(sess.work, allow_patterns=[f'runs/{rid}/**'])
     if not ck.exists():
         print('  checkpoint unavailable'); continue
 
@@ -2484,6 +2509,10 @@ if len(cmp_df) and 'gap_points' in cmp_df.columns:
         code("""\
 import matplotlib.pyplot as plt
 
+if not students:
+    print('No real-target students yet -- the figure below will be empty.')
+    print('See Step 4: run NB13 with SHUFFLE_ABLATION = False first.')
+
 fig, ax = plt.subplots(figsize=(9, 6))
 for rid, arch, seed in students:
     for name, style, lbl in (('B2_confidence', '--', 'B2 confidence (field)'),
@@ -2501,7 +2530,9 @@ ax.set_xlabel('average compute used (fraction of full)')
 ax.set_ylabel('top-1 accuracy')
 ax.set_title('Q5: accuracy vs compute\\n'
              'the gap B10 closes between B2 and B11 is the result')
-ax.grid(alpha=.3); ax.legend(fontsize=7)
+ax.grid(alpha=.3)
+if ax.get_legend_handles_labels()[0]:
+    ax.legend(fontsize=7)          # only when something was actually plotted
 plt.tight_layout()
 msc.save_figure(fig, sess.data_dir, 'q5_central_figure', sess.hub)
 plt.show()
@@ -2534,7 +2565,8 @@ print('   CIFAR-100 test set: 10,000    our training holdout: 5,000\\n')
 EPSILON, DELTA = 0.03, 0.05
 rows = []
 for rid, arch, seed in students:
-    ck = sess.runs_dir / rid / 'ckpt_best.pt'
+    # D-23/D-25: checkpoints live in runs/{rid}/checkpoints/, not the run root.
+    ck = msc.run_layout(sess.work, rid)['checkpoints'] / 'ckpt_best.pt'
     if not ck.exists():
         continue
     blob = torch.load(ck, map_location=device, weights_only=False)

@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **207** offline + **3 torch-gated** self-checks |
-| **Defects found** | 23 · 21 fixed · **2 open** (D-14, D-18 partially — see O-20) · D-15 **closed by NB16** |
+| **Library version** | `msc_lib` 1.0.0 · **213** offline + **3 torch-gated** self-checks |
+| **Defects found** | 25 · 23 fixed · **2 open** (D-14, O-20 NB09 re-run) · D-24 would have cost 30 GPU-h if D-19 had not shipped first |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,89 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-25 · NB14 could never have loaded a student checkpoint
+
+**Severity:** would have blocked NB14 · **Status:** fixed · **Found:** 2026-08-04
+
+Two wrong paths in the same three lines, both latent because NB14 had never
+reached a real student:
+
+```python
+ck = sess.runs_dir / rid / 'ckpt_best.pt'                    # wrong: no checkpoints/
+sess.hub.models.download(sess.runs_dir, allow_patterns=[f'{rid}/**'])  # wrong twice
+```
+
+Checkpoints live at `runs/{rid}/checkpoints/ckpt_best.pt`, repo paths are
+prefixed `runs/`, and `download()` targets `sess.work` not `sess.runs_dir`. So
+the local check looked in the wrong place, **and** the fallback pull that was
+supposed to rescue it used a pattern matching nothing and a destination one
+level off. The notebook would have printed `checkpoint unavailable` for every
+student and produced an empty comparison.
+
+Same family as **D-23**: a path duplicated by hand instead of taken from
+`run_layout`. That is now three defects from the same root cause (D-16, D-23,
+D-25). The rule that follows: **never spell a repo path as a string literal in
+a notebook** — go through `run_layout` or a named accessor, so a wrong path is
+a broken import rather than a silent miss.
+
+Also fixed: `ax.legend()` was called unconditionally, producing a
+`UserWarning: No artists with labels found` whenever the plot was empty, and
+the empty-student case printed nothing explaining itself. NB14 now says exactly
+what is missing and what to run.
+
+### D-24 · `repair_ledger` demoted every completed MSC-KD run
+
+**Severity:** **destroyed valid state on every sync** · **Status:** fixed
+**Found:** 2026-08-04 from NB14 output
+
+```
+[REPAIR] broken stub: p3-resnet8x4-...-s1 marked completed at only 240 epochs
+         -- demoting to paused so it resumes          (x8 runs)
+...
+0 trained students to evaluate
+```
+
+**240 is the full epoch count.** The repair was demoting runs for reaching
+exactly the number they were supposed to reach.
+
+```python
+planned = int(summ.get("num_epochs_planned", 0) or 0)
+done = (summ.get("status") == "completed"
+        and planned > 0 and (last_ep + 1) >= 0.9 * planned)
+```
+
+`train_msc_kd`'s summary does not write `num_epochs_planned` — only
+`train_backbone` does. So `planned = 0`, the `planned > 0` guard failed, `done`
+became False, and a complete run was rewritten as `paused`. On **every** sync.
+
+**Contamination analysis.**
+
+- **No training was lost.** The D-19 fix saved this: `already_finished()` reads
+  `summary.json`, not the ledger, so NB13 would not have retrained them. Had
+  D-19 not shipped two turns earlier, this defect would have silently
+  retrained all nine MSC-KD runs — roughly 30 GPU-hours.
+- **The ledger on HF now carries spurious `paused` events** for the completed
+  runs. Harmless once the repair stops firing, and the next successful sync
+  re-emits `completed` correctly.
+- NB14 saw zero students, which is what surfaced it.
+
+**Two things were wrong, and the second matters more.**
+
+1. The summary contract was incomplete — `num_epochs_planned` is read by
+   `repair_ledger` and one of the two writers omitted it. Now written.
+2. **The repair treated a missing field as proof of failure.** That is the real
+   defect. A function whose job is to fix state must not destroy state on
+   absent evidence. It now falls back to `num_epochs_run`, and if it can
+   establish no epoch target at all it **refuses to demote** and says so.
+
+The stub check is not weakened: a genuine stub's history is short against
+either target, which the self-tests assert directly.
+
+**Guard added:** 6 self-checks over the verdict logic — the exact MSC-KD case
+passes, `num_epochs_planned` is still preferred when present, a 50-of-240 stub
+is still caught by both routes, and a summary with no epoch count at all
+returns "cannot judge". Self-checks 207 → **213**.
 
 ### D-23 · The teacher's exit heads were retrained on every MSC-KD run — D-16 was not cosmetic
 
@@ -1613,6 +1696,8 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | D-25 — **NB14 could never have loaded a student checkpoint**: wrong local path, wrong repo prefix, wrong download destination. Third defect from hand-spelled paths (D-16, D-23, D-25) |
+| 2026-08-04 | **D-24 — `repair_ledger` demoted every completed MSC-KD run**, because `train_msc_kd` omits `num_epochs_planned` and the repair read a missing field as proof of failure. The D-19 fix is the only reason 30 GPU-h of training survived |
 | 2026-08-04 | **NB16: atlas complete — 45/45 trained, 45/45 measured.** `wrn_16_2-s1` trained at 73.64% (+0.38 over reference). D-15 closed |
 | 2026-08-04 | NB10/11/12 re-run with the D-18 fix: **`vgg8` recovered, 14 archs, 91 pairs**, 91/91 shuffled controls pass (max \|z\| 3.30 vs a 5σ threshold). `wrn_16_2` still absent — **NB09 was not re-run**, and `ceilings.json` is the gate |
 | 2026-08-04 | D-23 — **the teacher's exit heads were retrained on every MSC-KD run.** `run_oracle` writes to the run root, `train_msc_kd` read `checkpoints/`. D-16 closed this as "cosmetic — nothing reads the path by convention"; three things did. **O-19 dry run shipped at last** |

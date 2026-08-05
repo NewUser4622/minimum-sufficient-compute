@@ -7046,7 +7046,12 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                "method": cfg["method"], "seed": cfg["seed"],
                "alpha": alpha, "beta": beta, "temperature": temperature,
                "tau": tau, "axis": axis, "shuffled_targets": bool(shuffle_targets),
-               "best_accuracy": float(best), "num_epochs_run": state["epoch"] + 1,
+               "best_accuracy": float(best),
+               # D-24: `num_epochs_planned` is part of the summary contract --
+               # repair_ledger reads it to decide whether a run is a broken
+               # stub. Omitting it here got every completed MSC-KD run demoted.
+               "num_epochs_planned": int(num_epochs),
+               "num_epochs_run": state["epoch"] + 1,
                "total_time_sec": cum_time, "total_energy_j": cum_energy,
                "config_hash": cfg["config_hash"], "sample_order_hash": order_hash,
                "status": "completed", "completed_utc": now_iso()}
@@ -7277,11 +7282,30 @@ class Session:
             except Exception:
                 continue
             summ = read_json(rd / "summary.json", default={}) or {}
+            # D-24: this used to read ONLY `num_epochs_planned`, which
+            # `train_msc_kd` does not write. Missing field -> planned = 0 ->
+            # `planned > 0` false -> `done` false -> a run that finished all
+            # 240 epochs was DEMOTED to `paused` on every sync, and the log
+            # said "marked completed at only 240 epochs", which is the number
+            # it was supposed to reach.
+            #
+            # Absence of a field is not evidence a run is short. Fall back to
+            # what the summary claims it ran; the stub check still works,
+            # because a real stub's history is short against EITHER target.
             planned = int(summ.get("num_epochs_planned", 0) or 0)
-            done = (summ.get("status") == "completed"
-                    and planned > 0 and (last_ep + 1) >= 0.9 * planned)
+            claimed = int(summ.get("num_epochs_run", 0) or 0)
+            target = planned or claimed
+            status_ok = summ.get("status") == "completed"
+            done = status_ok and target > 0 and (last_ep + 1) >= 0.9 * target
             cur = known.get(rd.name, {})
             ident = parse_run_id(rd.name)
+            if (not done) and status_ok and target <= 0:
+                # Neither field usable. Refuse to act: a repair that destroys
+                # good state on missing evidence is worse than no repair.
+                log(f"{rd.name}: summary says completed but carries no epoch "
+                    f"count -- NOT demoting on absent evidence (D-24)",
+                    "REPAIR")
+                continue
             if done and cur.get("state") != "completed":
                 self.registry.append(rd.name, "completed", best_accuracy=best,
                                      num_epochs_run=last_ep + 1, repaired=True,
@@ -8565,6 +8589,35 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-24: repair_ledger must not demote on a MISSING field --------------
+    # train_msc_kd's summary has no `num_epochs_planned`, so `planned` was 0,
+    # `planned > 0` was False, and every COMPLETE MSC-KD run was demoted to
+    # 'paused' on every sync -- logged as "marked completed at only 240
+    # epochs", 240 being exactly the number it was meant to reach.
+    def _verdict(summ, last_ep):
+        planned = int(summ.get("num_epochs_planned", 0) or 0)
+        claimed = int(summ.get("num_epochs_run", 0) or 0)
+        target = planned or claimed
+        ok = summ.get("status") == "completed"
+        return (ok and target > 0 and (last_ep + 1) >= 0.9 * target), target
+
+    _full = {"status": "completed", "num_epochs_run": 240}
+    check("D-24: a complete run with no `num_epochs_planned` is NOT demoted",
+          _verdict(_full, 239)[0], "the exact MSC-KD case")
+    check("D-24: `num_epochs_planned` is still preferred when present",
+          _verdict({**_full, "num_epochs_planned": 240}, 239)[0])
+    check("D-24: a genuine stub is still caught (50 of 240 planned)",
+          not _verdict({"status": "completed", "num_epochs_planned": 240,
+                        "num_epochs_run": 240}, 49)[0],
+          "the stub check must not be weakened by the fix")
+    check("D-24: a stub is caught via the claimed count too",
+          not _verdict({"status": "completed", "num_epochs_run": 240}, 49)[0])
+    check("D-24: no epoch count at all -> refuse to judge, do not demote",
+          _verdict({"status": "completed"}, 239)[1] == 0,
+          "absent evidence is not evidence of a short run")
+    check("D-24: a run whose summary does not say completed is not 'done'",
+          not _verdict({"status": "paused", "num_epochs_run": 120}, 119)[0])
 
     # --- D-23: writer and readers must agree on the exit-heads path ---------
     # run_oracle writes to the run ROOT; train_msc_kd read `checkpoints/`. The
