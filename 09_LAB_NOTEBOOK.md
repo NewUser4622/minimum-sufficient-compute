@@ -20,16 +20,16 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 |---|---|
 | **Phase** | **All five research questions answered.** NB13 (MSC-KD) running |
 | **Verdict** | `FULL-PROGRAM` (2026-08-02) |
-| **Runs trained** | Phase 0 **4/4** · Phase 1 **44/45** — only `p1-wrn_16_2-…-s1` missing |
-| **Runs measured** | Phase 0 **4/4** · Phase 1 **39/45** — see D-15 |
-| **Analysis on the atlas** | Q1 ✅ 14 archs · Q2 ✅ 13 · Q3 ✅ **78 pairs** · Q4 ⚠ 15 biased pairs (D-18) |
+| **Runs trained** | Phase 0 **4/4** · Phase 1 **45/45** ✅ **atlas complete** |
+| **Runs measured** | Phase 0 **4/4** · Phase 1 **45/45** ✅ (NB16 closed D-15) |
+| **Analysis on the atlas** | Q2/Q3/Q4 re-run with the D-18 fix → **14 archs, 91 pairs**. ⚠ **Q1 (NB09) was NOT re-run**, so `ceilings.json` still lacks `wrn_16_2` and it is excluded from everything |
 | **Q3 — the central result** | within-family **0.920** > across-CNN **0.878** > CNN→transformer **0.710**, no overlap |
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
 | **Library version** | `msc_lib` 1.0.0 · **207** offline + **3 torch-gated** self-checks |
-| **Defects found** | 23 · 20 fixed · **3 open** (D-14, D-15, D-18 re-run) · **O-19 dry run now shipped — D-21/D-22/D-23 would all have been caught in <1 s** |
-| **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `9b18d2b`, 2026-08-04T06:1x Z |
+| **Defects found** | 23 · 21 fixed · **2 open** (D-14, D-18 partially — see O-20) · D-15 **closed by NB16** |
+| **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
 > **ΔR² = 0.254** (README, `08_PHASE0_RESULTS.md`) was measured on the wrong
@@ -135,6 +135,25 @@ them — see §1.2.
 All ten share `sample_order_hash = 80031c23…`. `recipe_ok: true` on every CNN.
 
 *source* `runs/p1-{arch}-cifar100-base-s{n}/summary.json`
+
+### 1.1c-bis NB16 closed the atlas — 45/45 trained, 45/45 measured
+
+Run 2026-08-04, ~1.25 h wall-clock (my 3.5 GPU-h estimate was high; measurement
+is much cheaper than training).
+
+| run | what NB16 did | when |
+|---|---|---|
+| `p1-wrn_16_2-…-s1` | **trained** 240/240 → **73.64%** (ref 73.26, **+0.38**) | 17:26:57Z |
+| `p1-wrn_16_2-…-s1` | measured | 17:30:33Z |
+| `p1-wrn_16_2-…-s2` | measured | 17:34:04Z |
+| `p1-wrn_40_1-…-s3` | measured | 17:38:35Z |
+| `p1-vgg8-…-s1` | measured | 17:41:48Z |
+| `p1-mixer_nano-…-s3` | measured | 17:45:23Z |
+
+`wrn_16_2-s1`: 703,284 params, 3,321 s, 0.069 kWh, `recipe_ok: true`,
+`sample_order_hash` matching every other run. **D-15 is closed.**
+
+Every architecture in the zoo now has three trained and three measured seeds.
 
 ### 1.1d Measurement coverage (NB08)
 
@@ -1562,11 +1581,12 @@ Draft, from the record:
 
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
-| ~~O-17~~ | ~~Confirm the nine `p3-*-mscKD*` runs survived~~ — **CLOSED.** All nine are checkpointed on HF and resumable; nothing was lost. The alarm that said otherwise was D-20 | — | — | done |
+| ~~O-17~~ | ~~Confirm the nine `p3-*-mscKD*` runs survived~~ — **CLOSED** (D-20) | — | — | done |
+| **O-20** | **Re-run NB09.** NB10/11/12 were re-run but NB09 was not, so `ceilings.json` still holds 13 architectures and `wrn_16_2` — now fully measured — is excluded from Q1–Q4. NB11 filters on `require=ceilings`, so the ceiling file is the gate. Then re-run NB10 → NB11 → NB12 to go from 91 pairs to **105** | the full 15-arch atlas | **~20 min, CPU** | **highest** |
 | ~~O-19~~ | ~~Dry-run one student batch before the teacher sweep~~ — **DONE.** `msckd_dry_run()` runs the full step on a 2-image batch in <1 s, before any teacher work | — | — | shipped |
 | O-18 | **Add a cross-session resume test.** Five defects have now been about resume (D-05, D-06, D-09, D-12, D-19) and every test we have runs inside one session — which is precisely the case that works. The acceptance test must delete the local run directory to simulate a fresh Kaggle session | the next D-19 | ~1 h | **high** |
 | O-15 | **Re-run NB10 → NB11 → NB12 with the D-18 fix.** Recovers `vgg8`, un-biases Q4, and stratifies the τ check. §1.5's numbers are provisional until this lands | the Q4 headline | **~20 min, CPU** | **highest** |
-| O-12 | **Run `NB16_Fix_Gaps.ipynb`** — trains `wrn_16_2-s1` and measures the 5 outstanding runs. Takes the analysis from **13 architectures to 15**. Also still to do: null the `mobilenetv2` reference (D-14) and add the parameter-count assertion | "15 architectures" being true | **~3.5 GPU-h** | **high** |
+| ~~O-12~~ | ~~Run `NB16_Fix_Gaps.ipynb`~~ — **DONE, atlas complete 45/45.** Still outstanding from D-14: null the `mobilenetv2` reference and add the parameter-count assertion | a false Δ in the table | ~15 min | medium |
 | O-5 | Read SAFE-KD (2602.03043); write the differentiation memo | Related work | ~1 day | **high, not started** |
 | O-9 | **Break the family/accuracy confound in §1.2** — train one non-CNN to CNN-level accuracy, or one CNN down to ~60%, so the low-ceiling finding does not rest on `convnext_femto` alone | the Q1 headline | ~3 GPU-h | **high** |
 | O-14 | **Test the `convnext_femto` explanation (§1.4)** — is low transfer a property of transformer-ised CNNs, or of that one model? One more modern CNN settles it | a quotable sub-finding | ~2 GPU-h | medium |
@@ -1593,6 +1613,8 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-04 | **NB16: atlas complete — 45/45 trained, 45/45 measured.** `wrn_16_2-s1` trained at 73.64% (+0.38 over reference). D-15 closed |
+| 2026-08-04 | NB10/11/12 re-run with the D-18 fix: **`vgg8` recovered, 14 archs, 91 pairs**, 91/91 shuffled controls pass (max \|z\| 3.30 vs a 5σ threshold). `wrn_16_2` still absent — **NB09 was not re-run**, and `ceilings.json` is the gate |
 | 2026-08-04 | D-23 — **the teacher's exit heads were retrained on every MSC-KD run.** `run_oracle` writes to the run root, `train_msc_kd` read `checkpoints/`. D-16 closed this as "cosmetic — nothing reads the path by convention"; three things did. **O-19 dry run shipped at last** |
 | 2026-08-04 | D-22 — **five wrong column names killed every MSC-KD run at the end of epoch 0.** The two training paths disagreed about unknown columns: one raised, one silently dropped. Also recovered the three-term loss decomposition, which was being computed and thrown away |
 | 2026-08-04 | **D-21 — the MSC-KD loss cannot run under AMP.** `F.binary_cross_entropy` is banned under autocast, so the method's training step could never execute. The NB00 preflight covers all 15 backbones and neither `MSCStudent` nor `MSCLoss` |

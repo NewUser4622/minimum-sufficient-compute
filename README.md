@@ -39,11 +39,11 @@ and resolution correlate at 0.38, precision is nearly independent at ~0.23. That
 is a result in its own right, and it says results on depth-based early exit do
 not license claims about the other axes.
 
-## Phase 1 atlas — trained 44/45, measured 40/45
+## ✅ Phase 1 atlas — complete: 45/45 trained, 45/45 measured
 
-Audited against HuggingFace, 2026-08-04. **`NB16_Fix_Gaps.ipynb` closes the
-remaining gap** — 1 training run + 5 measurements, ~3.5 GPU-h, taking the
-analysis from 13 architectures to 15.
+Audited against HuggingFace, 2026-08-04. `NB16_Fix_Gaps.ipynb` closed the last
+gap in ~1.25 h — every architecture now has three trained and three measured
+seeds.
 
 | arch | family | top-1 | published | Δ | ρ_seed @τ=0.1 |
 |---|---|---|---|---|---|
@@ -51,7 +51,7 @@ analysis from 13 architectures to 15.
 | `wrn_40_2` | wrn | 76.06 | 75.61 | +0.45 | 0.7089 |
 | `vgg13` | vgg | 75.70 | 74.64 | +1.06 | 0.6689 |
 | `resnet110` | resnet | 74.38 | 74.31 | +0.07 | 0.6339 |
-| `wrn_16_2` | wrn | 73.79 | 73.26 | +0.53 | *1 seed — needs 2 (NB16)* |
+| `wrn_16_2` | wrn | 73.79 | 73.26 | +0.53 | *measured — pending NB09 re-run* |
 | `resnet56` | resnet | 73.69 | 72.34 | +1.35 | 0.6217 |
 | `resnet8x4` | resnet | 73.26 | 72.50 | +0.76 | 0.6671 |
 | `wrn_40_1` | wrn | 72.41 | 71.98 | +0.43 | 0.6559 |
@@ -87,8 +87,8 @@ Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LA
 
 ## ✅ The central result — compute-need transfers across architectures
 
-**78 architecture pairs, 13 architectures, disattenuated by per-architecture
-noise ceilings.** τ = 0.1, depth axis, 1000 bootstrap resamples.
+**91 architecture pairs, 14 architectures, disattenuated by per-architecture
+noise ceilings.** (`wrn_16_2` joins once NB09 is re-run — see below.) τ = 0.1, depth axis, 1000 bootstrap resamples.
 
 | pair type | n | **mean T** | range |
 |---|---|---|---|
@@ -129,7 +129,7 @@ in any architecture we tried.
 | | |
 |---|---|
 | **Q4 re-run** | Q4's 15 pairs were selected alphabetically and are dominated by the two most atypical architectures (D-18). The fix is committed; the numbers are provisional until NB10→NB11→NB12 re-run (~20 min, CPU) |
-| `wrn_16_2`, `vgg8` | not in the analysis — `wrn_16_2` has 1 measured seed and needs 2 (D-15); `vgg8` was dropped by the seed-1 selector (D-18, fixed). **Run `NB16_Fix_Gaps.ipynb`** to close both |
+| **NB09 re-run** | NB10/11/12 were re-run but **NB09 was not**, so `ceilings.json` still holds 13 architectures and `wrn_16_2` — fully measured — is excluded. NB11 gates on that file. Re-run NB09 → NB10 → NB11 → NB12 (~20 min, CPU) for the full 15-architecture, 105-pair matrix |
 | `mobilenetv2` Δ | compared against a half-width baseline (D-14); reference to be nulled |
 | NB13–NB15 | MSC-KD training, method comparison, paper outputs |
 
