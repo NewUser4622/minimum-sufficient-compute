@@ -22,13 +22,13 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Verdict** | `FULL-PROGRAM` (2026-08-02) |
 | **Runs trained** | Phase 0 **4/4** · Phase 1 **45/45** ✅ **atlas complete** |
 | **Runs measured** | Phase 0 **4/4** · Phase 1 **45/45** ✅ (NB16 closed D-15) |
-| **Analysis on the atlas** | Q2/Q3/Q4 re-run with the D-18 fix → **14 archs, 91 pairs**. ⚠ **Q1 (NB09) was NOT re-run**, so `ceilings.json` still lacks `wrn_16_2` and it is excluded from everything |
+| **Analysis on the atlas** | ✅ **all 15 architectures** — NB09 re-run, `ceilings.json` now carries `wrn_16_2` (0.6328) and a 3-seed `vgg8` (0.7216). Q1–Q4 complete on the full atlas |
 | **Q3 — the central result** | within-family **0.920** > across-CNN **0.878** > CNN→transformer **0.710**, no overlap |
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **217** offline + **3 torch-gated** self-checks |
-| **Defects found** | 27 · 25 fixed · **2 open** (D-14, O-20) · **run the REBUILT notebooks — stale copies on Kaggle re-ran D-21/D-23** |
+| **Library version** | `msc_lib` 1.0.0 · **223** offline + **3 torch-gated** self-checks |
+| **Defects found** | 28 · 26 fixed · **2 open** (D-14, O-21 B11) · **D-28 invalidates the 9 MSC-KD students — retrain** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,66 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-28 · The router was sized from the teacher's budget grid, not the student's
+
+**Severity:** crashed NB14 on every adaptive-K student · **Status:** **fixed**
+**Found:** 2026-08-05 · **This one is a modelling error, not a typo**
+
+```
+IndexError: index 3 is out of bounds for axis 1 with size 3
+  sweep_operating_points -> correct_at[np.arange(n), route]
+```
+
+`train_msc_kd` sized the student's sufficiency head from the **teacher's**
+budget table:
+
+```python
+rho_list = t_budgets["axes"]["depth"]["rho"]          # teacher: 5 budgets
+student  = MSCStudent(..., len(rho_list))             # 5-column router
+```
+
+But a student's exits are **adaptive** (D-01b): `resnet8x4` has only 3 usable
+depth exits where the `resnet32x4` teacher has 5. So the model carried a
+5-column router bolted onto a 3-exit backbone. Training ran fine — the loss
+only ever compares the head against targets, both on the teacher's grid. It
+broke at *evaluation*, where `correct_at` (3 columns, from the student's actual
+exits) met a route index of 3.
+
+**Why this is a modelling error and not a shape bug.** The sufficiency head
+predicts *how much compute this input needs*, and the routing decision spends
+**the student's** compute. Expressing that on the teacher's grid is meaningless:
+budget index 4 of `resnet32x4` does not correspond to anything `resnet8x4` can
+do. The teacher's MSC is a scalar fraction in [0, 1] and
+`sufficiency_targets` projects it onto whichever grid it is handed — so the
+right grid was always the student's, and using the teacher's was wrong even
+where the two happened to have equal length.
+
+**Contamination analysis.**
+
+- **The nine real-arm students trained before this fix carry a
+  teacher-shaped router.** Their weights are not reusable and they must be
+  retrained. `resnet20` and `vgg8` happen to have 5 exits, so only the three
+  `resnet8x4` seeds actually crash — but all nine were trained against targets
+  on the wrong grid, so all nine are suspect and should be redone together.
+- No Q1–Q4 number is affected; none of them touch `MSCStudent`.
+- The scrambled control arm has the same defect, and is equally invalid.
+
+**Fix.** `train_msc_kd` now loads the **student's** budgets, sizes the head from
+them, builds targets on them, and stores them as `rho` in the checkpoint (the
+teacher's grid is kept alongside as `teacher_rho` for provenance). An assertion
+right after construction requires `len(student.heads) == len(rho_student)`, and
+`evaluate_routing_methods` raises a message naming all three widths instead of
+letting an `IndexError` surface eight frames down.
+
+**Guard added:** 6 self-checks — matched shapes accepted, the exact
+teacher-sized case rejected, and `sufficiency_targets` shown to follow whichever
+grid it is given while staying monotone on both. Self-checks 217 → **223**.
+
+**Open, related:** B11 — the oracle ceiling — needs each *student's* own
+per-sample MSC table, and NB08 measures only `p1` runs. NB14 reports
+`no per-image table for this student` and drops B11, which means the headline
+"fraction of the B2→B11 gap closed" cannot yet be computed. Logged as **O-21**.
 
 ### D-27 · NB13 required a manual flag flip, so the real arm kept not existing
 
@@ -1769,6 +1829,9 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-05 | **D-28 — the router was sized from the TEACHER's budget grid.** A 5-column router on a 3-exit `resnet8x4`. A modelling error, not a shape bug: routing spends the *student's* compute. **All 9 MSC-KD students must be retrained** |
+| 2026-08-05 | **NB09 re-run: `ceilings.json` now has all 15 architectures.** `wrn_16_2` = 0.6328 sits inside the CNN band, so the §1.2 CNN/non-CNN separation survives the full atlas |
+| 2026-08-05 | **Real MSC-KD arm training** — `p3-resnet20-…-s1` completed 240/240 at 71.04%, and its summary carries `num_epochs_planned`, confirming the D-24 fix is live |
 | 2026-08-04 | D-27 — **NB13 needed a manual flag flip**, so four runs all trained the control and the real arm never existed. Both arms now run in one pass. An invariant in a comment is not a mechanism |
 | 2026-08-04 | **D-26 — `epochs.csv` outranked `summary.json`**, demoting five completed atlas runs. History is telemetry on a 30-min timer; the summary is the completion record |
 | 2026-08-04 | D-25 — **NB14 could never have loaded a student checkpoint**: wrong local path, wrong repo prefix, wrong download destination. Third defect from hand-spelled paths (D-16, D-23, D-25) |

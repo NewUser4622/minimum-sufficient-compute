@@ -6900,11 +6900,37 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
 
     msc_t = torch.from_numpy(msc_train).to(device)
     irr_t = torch.from_numpy(irr_train).to(device)
-    rho_t = torch.tensor(rho_list, dtype=torch.float32, device=device)
+    # D-28: the router lives on the STUDENT's budget grid, not the teacher's.
+    #
+    # `rho_list` above is the teacher's, and is correct for computing the
+    # teacher's MSC. But the sufficiency head, its targets and the routing
+    # decision all describe what the STUDENT will spend, and the student's exit
+    # count is adaptive (D-01b): `resnet8x4` has 3 depth budgets where the
+    # `resnet32x4` teacher has 5. Sizing the head from the teacher gave a
+    # 5-column router bolted onto a 3-exit model -- consistent right up to
+    # evaluation, where `correct_at` (3 columns, from the student's exits) met
+    # a route index of 3 and raised IndexError.
+    #
+    # The teacher's MSC is a scalar fraction in [0, 1]; `sufficiency_targets`
+    # projects it onto whichever grid it is given. Give it the student's.
+    s_budgets = load_or_build_budgets(cfg["arch"], data_out, cfg["num_classes"],
+                                      hub=hub)
+    rho_student = list(s_budgets["axes"]["depth"]["rho"])
+    if len(rho_student) != len(rho_list):
+        log(f"student {cfg['arch']} has {len(rho_student)} depth budgets vs the "
+            f"{teacher_arch} teacher's {len(rho_list)} -- routing on the "
+            f"student's grid (D-28)", "MSCKD")
+    rho_t = torch.tensor(rho_student, dtype=torch.float32, device=device)
 
     # --- student ---------------------------------------------------------
     student = MSCStudent(build_model(cfg["arch"], cfg["num_classes"]),
-                         cfg["num_classes"], len(rho_list)).to(device)
+                         cfg["num_classes"], len(rho_student)).to(device)
+    # The head must have exactly one output per student exit, or routing
+    # indexes a column that does not exist.
+    _n_heads = len(student.heads)
+    assert _n_heads == len(rho_student), (
+        f"{cfg['arch']}: {_n_heads} exit heads but {len(rho_student)} depth "
+        f"budgets. These must match -- see D-28.")
     optimizer, scheduler = build_optimizer(student, cfg)
     amp = bool(cfg.get("amp_enabled", True)) and device.type == "cuda"
     try:
@@ -7016,7 +7042,9 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                                               "model": student.state_dict(),
                                               "epoch": epoch, "val_accuracy": acc,
                                               "config_hash": cfg["config_hash"],
-                                              "rho": rho_list, "config": cfg})
+                                              "rho": rho_student,
+                                              "teacher_rho": rho_list,
+                                              "config": cfg})
             state["epoch"], state["best"] = epoch, best
             save_checkpoint(ckpt_last, cfg, student, optimizer, scheduler, scaler,
                             epoch, best, None, cum_time, cum_energy)
@@ -7089,6 +7117,18 @@ def evaluate_routing_methods(student, val_loader, device, rho: Sequence[float],
     L = np.concatenate(all_logits)            # (N, K, C)
     S = np.concatenate(all_suff)              # (N, K)
     Y = np.concatenate(all_y)                 # (N,)
+
+    # D-28: three things must agree on K -- the exit logits, the sufficiency
+    # head, and the budget table. When they did not, the mismatch surfaced
+    # eight frames down as `IndexError: index 3 is out of bounds`, which says
+    # nothing about the cause. Say it here instead.
+    if not (L.shape[1] == S.shape[1] == len(rho)):
+        raise ValueError(
+            f"routing shapes disagree: {L.shape[1]} exit heads, "
+            f"{S.shape[1]} sufficiency outputs, {len(rho)} budgets. "
+            f"All three must match. A student trained before the D-28 fix has "
+            f"a head sized from the TEACHER's budget grid -- retrain it, or "
+            f"pass the rho it was trained with.")
 
     correct_at = (L.argmax(2) == Y[:, None]).astype(float)     # (N, K)
     probs = np.exp(L - L.max(2, keepdims=True))
@@ -8603,6 +8643,29 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-28: the router lives on the STUDENT's budget grid -----------------
+    # A resnet8x4 student has 3 adaptive depth exits; a resnet32x4 teacher has
+    # 5 budgets. Sizing the sufficiency head from the teacher produced a
+    # 5-column router on a 3-exit model, which only failed at evaluation.
+    def _shapes_ok(n_heads, n_suff, n_rho):
+        return n_heads == n_suff == n_rho
+
+    check("D-28: matched shapes are accepted", _shapes_ok(3, 3, 3))
+    check("D-28: teacher-sized head on a student backbone is rejected",
+          not _shapes_ok(3, 5, 5), "the exact resnet8x4-from-resnet32x4 case")
+    check("D-28: a budget table of the wrong width is rejected",
+          not _shapes_ok(5, 5, 3))
+    # sufficiency_targets must project a scalar MSC onto WHATEVER grid it is
+    # given -- that is what makes routing on the student's grid correct.
+    _r3, _r5 = [0.33, 0.67, 1.0], [0.2, 0.4, 0.6, 0.8, 1.0]
+    _m = np.array([0.5])
+    check("D-28: targets follow the grid they are given (3)",
+          sufficiency_targets(_m, _r3).shape == (1, 3))
+    check("D-28: targets follow the grid they are given (5)",
+          sufficiency_targets(_m, _r5).shape == (1, 5))
+    check("D-28: and stay monotone on both grids",
+          bool((np.diff(sufficiency_targets(_m, _r5)[0]) >= 0).all()))
 
     # --- D-26: summary.json outranks epochs.csv ------------------------------
     # epochs.csv is telemetry pushed on a 30-min timer; summary.json is written

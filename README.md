@@ -51,12 +51,12 @@ seeds.
 | `wrn_40_2` | wrn | 76.06 | 75.61 | +0.45 | 0.7089 |
 | `vgg13` | vgg | 75.70 | 74.64 | +1.06 | 0.6689 |
 | `resnet110` | resnet | 74.38 | 74.31 | +0.07 | 0.6339 |
-| `wrn_16_2` | wrn | 73.79 | 73.26 | +0.53 | *measured — pending NB09 re-run* |
+| `wrn_16_2` | wrn | 73.79 | 73.26 | +0.53 | 0.6328 |
 | `resnet56` | resnet | 73.69 | 72.34 | +1.35 | 0.6217 |
 | `resnet8x4` | resnet | 73.26 | 72.50 | +0.76 | 0.6671 |
 | `wrn_40_1` | wrn | 72.41 | 71.98 | +0.43 | 0.6559 |
 | `shufflenetv2` | mobile | 71.93 | 70.50 | +1.43 | 0.6698 |
-| `vgg8` | vgg | 71.73 | 70.36 | +1.37 | **0.7248** |
+| `vgg8` | vgg | 71.73 | 70.36 | +1.37 | **0.7216** |
 | `resnet20` | resnet | 70.13 | 69.06 | +1.07 | 0.6425 |
 | `mobilenetv2` | mobile | 70.10 | — ⚠ | — | 0.6880 |
 | `convnext_femto` | convnext | 62.67 | — | — | 0.7084 |
@@ -129,7 +129,8 @@ in any architecture we tried.
 | | |
 |---|---|
 | **Q4 re-run** | Q4's 15 pairs were selected alphabetically and are dominated by the two most atypical architectures (D-18). The fix is committed; the numbers are provisional until NB10→NB11→NB12 re-run (~20 min, CPU) |
-| **NB09 re-run** | NB10/11/12 were re-run but **NB09 was not**, so `ceilings.json` still holds 13 architectures and `wrn_16_2` — fully measured — is excluded. NB11 gates on that file. Re-run NB09 → NB10 → NB11 → NB12 (~20 min, CPU) for the full 15-architecture, 105-pair matrix |
+| **MSC-KD retrain** | D-28: the nine students were trained with a router sized from the *teacher's* budget grid. Fixed, but the existing checkpoints are invalid and NB13 must be re-run |
+| **B11 ceiling** | needs each student's own per-sample table; NB08 measures only `p1` runs (O-21) |
 | `mobilenetv2` Δ | compared against a half-width baseline (D-14); reference to be nulled |
 | NB13–NB15 | MSC-KD training, method comparison, paper outputs |
 
