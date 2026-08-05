@@ -6843,6 +6843,30 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     sync = RunSync(hub, run_id, run_dir, data_out)
 
     registry.pull()
+
+    # D-32: validity BEFORE the claim.
+    #
+    # There are three gates between "this run exists" and "train it", and each
+    # one has to know about invalidation independently:
+    #   1. plan_work's done_fn  -- fixed by D-31
+    #   2. registry.can_claim   -- THIS ONE; it reads the ledger, sees
+    #                              'completed', and refuses
+    #   3. already_finished     -- fixed by D-29
+    # Fixing them one at a time simply moved the stop to the next gate down,
+    # which is what the user saw twice. Setting `force_rerun` here clears all
+    # three at once, because every gate already honours that flag.
+    if not cfg.get("force_rerun"):
+        _ok, _why = msckd_router_ok(work, run_id, cfg, data_out, hub)
+        if not _ok:
+            log(f"{run_id}: {_why} -- discarding the stale checkpoint and "
+                f"retraining from scratch", "MSCKD")
+            cfg = {**cfg, "force_rerun": True}
+            for _p in (ckpt_last, ckpt_best, history_path):
+                try:
+                    _p.unlink(missing_ok=True)
+                except Exception:                            # noqa: BLE001
+                    pass
+
     ok, why = registry.can_claim(run_id, force=bool(cfg.get("force_rerun")))
     if not ok:
         log(f"SKIP {run_id}: {why}", "CLAIM")
@@ -6851,22 +6875,12 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     # D-19: check the artifact BEFORE the teacher sweep, which is the expensive
     # part of this function -- a full multi-exit pass over 50,000 training
     # images. Discovering "already done" after paying for that is no use.
+    # D-29/D-32: `force_rerun` is already set above when the router is stale,
+    # and `already_finished` honours it, so this returns None for exactly the
+    # runs that need redoing.
     _cached = already_finished(hub, work, run_id, cfg, registry)
     if _cached is not None:
-        # D-29: "finished" is not "valid". Check the router width before
-        # accepting the cache, or a checkpoint invalidated by D-28 is skipped
-        # forever and keeps flowing downstream into NB14.
-        _ok, _why = msckd_router_ok(work, run_id, cfg, data_out, hub)
-        if _ok:
-            return _cached
-        log(f"{run_id} is complete but INVALID: {_why}. Retraining from "
-            f"scratch -- the stored weights cannot be reused.", "MSCKD")
-        cfg = {**cfg, "force_rerun": True}
-        for _p in (ckpt_last, ckpt_best, history_path):
-            try:
-                _p.unlink(missing_ok=True)
-            except Exception:                                # noqa: BLE001
-                pass
+        return _cached
 
     atomic_write_yaml(run_dir / "config.yaml", cfg)
     atomic_write_json(L["env"] / "environment.json", environment_report())
@@ -8746,6 +8760,25 @@ def _selftest() -> bool:
     sh = shuffle_msc_targets(m, seed=0)
     check("shuffle preserves the multiset", np.allclose(np.sort(sh), np.sort(m)))
     check("shuffle actually permutes", not np.allclose(sh, m))
+
+    # --- D-32: EVERY gate must honour invalidation, not just one -------------
+    # Three independent gates stand between "run exists" and "train it":
+    # plan_work's done_fn, registry.can_claim, and already_finished. Each was
+    # fixed in turn, and each time the stop simply moved to the next gate down.
+    # `force_rerun` is the one flag they all already honour.
+    def _passes_all(force, ledger_completed, summary_exists):
+        gate_plan = not ledger_completed or force
+        gate_claim = (not ledger_completed) or force
+        gate_cached = (not summary_exists) or force
+        return gate_plan and gate_claim and gate_cached
+
+    check("D-32: without force, a completed run is stopped",
+          not _passes_all(False, True, True))
+    check("D-32: force clears all three gates at once",
+          _passes_all(True, True, True),
+          "fixing them one at a time just moved the stop")
+    check("D-32: a fresh run needs no force",
+          _passes_all(False, False, False))
 
     # --- D-31: the compatibility check must sit in the PREDICATE -------------
     # D-29 put the router check inside train_msc_kd. plan_work filters "done"
