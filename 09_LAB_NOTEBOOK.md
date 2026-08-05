@@ -28,7 +28,7 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
 | **Library version** | `msc_lib` 1.0.0 · **232** offline + **3 torch-gated** self-checks |
-| **Defects found** | 32 · 30 fixed · **2 open** (D-14, O-21 B11) · **D-19/26/29/31/32 are one family: presence vs validity** |
+| **Defects found** | 33 · 31 fixed · **2 open** (D-14, O-21 B11) · D-28/D-33: never hardcode a budget count — ask the backbone |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,43 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-33 · The dry run recreated D-28 inside itself
+
+**Severity:** blocked every retrain · **Status:** **fixed** · **Found:** 2026-08-05
+
+The gates finally opened, the retrain started, and then:
+
+```
+[ERROR] ... MSC-KD dry run failed BEFORE any expensive work:
+        routing shapes disagree: 3 exit heads, 5 sufficiency outputs, 3 budgets
+```
+
+**The failure was in my dry run, not in the student.** I wrote:
+
+```python
+student = MSCStudent(build_model(cfg["arch"], n_cls), n_cls, 5)   # <-- literal
+tgt     = torch.zeros(2, 5)                                       # <-- literal
+```
+
+Two hardcoded `5`s. On a 3-exit `resnet8x4` that builds a 5-output router on a
+3-head backbone — **exactly the defect D-28 was about, committed inside the
+check written to catch it.** So every healthy retrain was rejected by its own
+smoke test.
+
+Worse, the torch-gated self-test had the same shape (`resnet20`, `n_budgets=5`)
+— and `resnet20` genuinely has 5 exits, so the test **agreed with itself by
+accident** and could never have caught this. A test that hardcodes the same
+assumption as the code under test verifies nothing.
+
+**Fix.** Both derive from the backbone: `n_heads = len(bb.feature_dims)`, and
+the target tensor is sized from that. The self-test now uses **`resnet8x4`**,
+the 3-exit case, and asserts `len(heads) == n_budgets == suff.n_budgets`.
+
+**The lesson, and it is the same one as D-28.** Every place that needs a budget
+count must *ask the backbone*. Three separate sites had guessed it: the trainer
+(D-28), the dry run and the self-test (both D-33). A literal `5` was correct for
+most of the zoo, which is precisely why it survived.
 
 ### D-32 · Three gates, and I fixed them one at a time
 
@@ -1951,6 +1988,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-05 | **D-33 — the dry run recreated D-28 inside itself.** Two hardcoded `5`s built a 5-output router on a 3-exit `resnet8x4`, so every healthy retrain was rejected by its own smoke test. The self-test used `resnet20` (5 exits) and agreed with itself by accident |
 | 2026-08-05 | **D-32 — three gates skip work and I fixed them one at a time**, so the stop moved from `plan_work` to `can_claim`. `force_rerun` set before the claim clears all three |
 | 2026-08-05 | **D-31 — the D-29 check was unreachable.** `plan_work` skips "done" runs before `train_msc_kd` runs, so NB13 planned zero work and declared success. Fourth defect in the "do I have it?" vs "is it still correct?" family |
 | 2026-08-05 | **D-29 — the completion cache had no compatibility check.** My D-28 remedy ("re-run NB13") was impossible: `already_finished` would have skipped all nine. Third time a fix has been blocked by a cache that only knew presence (D-19, D-26, D-29) |

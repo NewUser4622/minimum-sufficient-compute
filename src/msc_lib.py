@@ -4393,12 +4393,18 @@ def msckd_dry_run(cfg: Dict[str, Any], teacher, device, amp: bool,
     import tempfile as _tf
     try:
         n_cls = int(cfg["num_classes"])
-        student = MSCStudent(build_model(cfg["arch"], n_cls), n_cls, 5).to(device)
+        # D-33: n_budgets MUST come from the backbone, never a literal. A
+        # hardcoded 5 here recreated D-28 inside the very check written to
+        # catch it: a 3-exit resnet8x4 got a 5-output router and the dry run
+        # failed every healthy run.
+        _bb = build_model(cfg["arch"], n_cls)
+        n_heads = len(_bb.feature_dims)
+        student = MSCStudent(_bb, n_cls, n_heads).to(device)
         x = torch.randn(2, 3, int(cfg.get("image_size", 32)),
                         int(cfg.get("image_size", 32)), device=device)
         y = torch.zeros(2, dtype=torch.long, device=device)
-        tgt = torch.zeros(2, 5, device=device)
-        tgt[:, 3:] = 1.0
+        tgt = torch.zeros(2, n_heads, device=device)   # D-33: not a literal
+        tgt[:, max(0, n_heads - 2):] = 1.0
         opt = torch.optim.SGD(student.parameters(), lr=1e-4)
         lossfn = MSCLoss(alpha=alpha, beta=beta, temperature=temperature)
         with torch.amp.autocast(device_type=device.type, enabled=amp):
@@ -9166,11 +9172,20 @@ def _selftest() -> bool:
         # CPU autocast enforces the same ban as CUDA, so this catches it with
         # no GPU.
         try:
-            _st = MSCStudent(build_model("resnet20", 10), 10, n_budgets=5)
+            # D-33: use resnet8x4, which has only 3 adaptive exits. The old
+            # test used resnet20 (5 exits) with a hardcoded n_budgets=5, so it
+            # agreed with itself by accident and could never catch a
+            # head/budget mismatch. Derive the count from the backbone.
+            _bb0 = build_model("resnet8x4", 10)
+            _nb0 = len(_bb0.feature_dims)
+            _st = MSCStudent(_bb0, 10, n_budgets=_nb0)
+            check("D-33: student head count is derived, not assumed",
+                  len(_st.heads) == _nb0 == _st.suff.n_budgets,
+                  f"resnet8x4 -> {_nb0} exits")
             _x = torch.randn(4, 3, 32, 32)
             _tl, _y = torch.randn(4, 10), torch.tensor([0, 1, 2, 3])
-            _tg = torch.zeros(4, 5)
-            _tg[:, 3:] = 1.0
+            _tg = torch.zeros(4, _nb0)          # D-33: derived, not a literal
+            _tg[:, max(0, _nb0 - 2):] = 1.0
             with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
                 _sl, _suff, _ = _st(_x, suff_logits=True)
                 _loss, _ = MSCLoss()(_sl[-1], _tl, _y, _suff, _tg)
