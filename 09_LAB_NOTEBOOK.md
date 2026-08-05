@@ -27,8 +27,8 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
-| **Library version** | `msc_lib` 1.0.0 · **229** offline + **3 torch-gated** self-checks |
-| **Defects found** | 31 · 29 fixed · **2 open** (D-14, O-21 B11) · NB13 now re-plans the D-28 students (D-31) |
+| **Library version** | `msc_lib` 1.0.0 · **232** offline + **3 torch-gated** self-checks |
+| **Defects found** | 32 · 30 fixed · **2 open** (D-14, O-21 B11) · **D-19/26/29/31/32 are one family: presence vs validity** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,42 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-32 · Three gates, and I fixed them one at a time
+
+**Severity:** the stop just moved · **Status:** **fixed** · **Found:** 2026-08-05
+
+D-31 worked — NB13 planned the three invalid runs. Then:
+
+```
+>>> [1/3] p3-resnet8x4-cifar100-mscKDshuffromresnet32x4-s1
+[CLAIM] SKIP p3-resnet8x4-...-s1: already completed        (x3, both arms)
+```
+
+**Three independent gates** stand between *"this run exists"* and *"train it"*:
+
+| # | gate | asks | fixed by |
+|---|---|---|---|
+| 1 | `plan_work`'s `done_fn` | is it done? | D-31 |
+| 2 | `registry.can_claim` | does the ledger say completed? | **this defect** |
+| 3 | `already_finished` | is there a summary? | D-29 |
+
+I fixed them **one at a time**, and each fix moved the stop to the next gate
+down. The user watched that happen twice in consecutive sessions.
+
+**Fix.** Run the validity check *before* the claim and set `force_rerun` there.
+Every gate already honours that flag, so one assignment clears all three at
+once — and the stale checkpoint and history are deleted at the same point, so
+the retrain genuinely starts from zero.
+
+**Guard added:** 3 self-checks asserting `force` clears all three gates
+together, and that a fresh run needs no force. Self-checks 229 → **232**.
+
+**Fifth in the family** (D-19, D-26, D-29, D-31, D-32). The earlier four were
+about asking the right question. This one is about asking it **everywhere that
+can say no**: when work can be skipped at N points, an invalidation has to be
+understood at all N. Fixing the first one relocates the symptom and looks like
+progress.
 
 ### D-31 · The D-29 validity check was unreachable — wrong layer
 
@@ -1915,6 +1951,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-05 | **D-32 — three gates skip work and I fixed them one at a time**, so the stop moved from `plan_work` to `can_claim`. `force_rerun` set before the claim clears all three |
 | 2026-08-05 | **D-31 — the D-29 check was unreachable.** `plan_work` skips "done" runs before `train_msc_kd` runs, so NB13 planned zero work and declared success. Fourth defect in the "do I have it?" vs "is it still correct?" family |
 | 2026-08-05 | **D-29 — the completion cache had no compatibility check.** My D-28 remedy ("re-run NB13") was impossible: `already_finished` would have skipped all nine. Third time a fix has been blocked by a cache that only knew presence (D-19, D-26, D-29) |
 | 2026-08-05 | **D-28 — the router was sized from the TEACHER's budget grid.** A 5-column router on a 3-exit `resnet8x4`. A modelling error, not a shape bug: routing spends the *student's* compute. **All 9 MSC-KD students must be retrained** |
