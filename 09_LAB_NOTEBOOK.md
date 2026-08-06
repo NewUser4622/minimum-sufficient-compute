@@ -28,7 +28,7 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
 | **Library version** | `msc_lib` 1.0.0 · **232** offline + **3 torch-gated** self-checks |
-| **Defects found** | 33 · 31 fixed · **2 open** (D-14, O-21 B11) · D-28/D-33: never hardcode a budget count — ask the backbone |
+| **Defects found** | 34 · 32 fixed · **2 open** (D-14, O-21 B11) · **six sites had to learn about K** (D-28/33/34) |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,36 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-34 · Step 7 had no router guard, and LTT indexed the wrong array
+
+**Severity:** crashed NB14 Step 7 · **Status:** **fixed** · **Found:** 2026-08-05
+
+```
+IndexError: index 4 is out of bounds for axis 1 with size 3
+  learn_then_test_threshold -> correct_at[np.arange(n), route]
+```
+
+Two faults, both mine:
+
+1. **Step 5 skips stale students (D-29); Step 7 did not.** I added the guard to
+   one loop in NB14 and not the other, so a pre-D-28 checkpoint sailed past
+   into the Learn-then-Test calibration.
+2. **`learn_then_test_threshold` took `k_max` from `suff_pred` but indexed
+   `correct_at` with it.** When the router is wider than the backbone's exit
+   count, that is an out-of-range column — the same two-arrays-must-agree-on-K
+   root as D-28, in a third function.
+
+**Fix.** Step 7 now carries the same `msckd_router_ok` guard as Step 5, and
+`learn_then_test_threshold` validates the two widths up front (raising a message
+that names both and says to re-run NB13) and derives `k_max` from `correct_at`,
+the array it actually indexes.
+
+**Count of sites that had to learn about K:** `train_msc_kd` (D-28),
+`msckd_dry_run` and the self-test (D-33), `evaluate_routing_methods` (D-28
+guard), `learn_then_test_threshold` and NB14 Step 7 (D-34). Six. The budget
+count is a cross-cutting invariant and I patched it one call site at a time,
+which is why this took six rounds instead of one.
 
 ### D-33 · The dry run recreated D-28 inside itself
 
@@ -1988,6 +2018,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-05 | **D-34 — NB14 Step 7 had no router guard** (Step 5 did), and `learn_then_test_threshold` took `k_max` from `suff_pred` while indexing `correct_at`. Sixth site to learn about K |
 | 2026-08-05 | **D-33 — the dry run recreated D-28 inside itself.** Two hardcoded `5`s built a 5-output router on a 3-exit `resnet8x4`, so every healthy retrain was rejected by its own smoke test. The self-test used `resnet20` (5 exits) and agreed with itself by accident |
 | 2026-08-05 | **D-32 — three gates skip work and I fixed them one at a time**, so the stop moved from `plan_work` to `can_claim`. `force_rerun` set before the claim clears all three |
 | 2026-08-05 | **D-31 — the D-29 check was unreachable.** `plan_work` skips "done" runs before `train_msc_kd` runs, so NB13 planned zero work and declared success. Fourth defect in the "do I have it?" vs "is it still correct?" family |

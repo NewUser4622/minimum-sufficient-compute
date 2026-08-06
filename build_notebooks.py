@@ -2622,11 +2622,18 @@ for rid, arch, seed in students:
     ck = msc.run_layout(sess.work, rid)['checkpoints'] / 'ckpt_best.pt'
     if not ck.exists():
         continue
+    cfg = sess.config(arch, seed=seed)
+    # D-34: Step 5 skips students whose router predates D-28; Step 7 did not,
+    # so a stale checkpoint reached learn_then_test_threshold and died there
+    # with a bare IndexError. Same guard, same place in the loop.
+    ok, why = msc.msckd_router_ok(sess.work, rid, cfg, sess.data_dir, sess.hub)
+    if not ok:
+        print(f'  {rid}: SKIPPED -- {why}')
+        continue
     blob = torch.load(ck, map_location=device, weights_only=False)
     rho = blob['rho']
     student = msc.MSCStudent(msc.build_model(arch, 100), 100, len(rho)).to(device)
     student.load_state_dict(blob['model'])
-    cfg = sess.config(arch, seed=seed)
     _, _, hold_loader, _, _ = msc.build_loaders(cfg)
 
     S, C = [], []

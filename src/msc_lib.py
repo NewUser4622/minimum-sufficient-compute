@@ -6054,7 +6054,18 @@ def learn_then_test_threshold(suff_pred: np.ndarray, correct_at: np.ndarray,
     """
     if grid is None:
         grid = np.linspace(0.99, 0.05, 60)
-    n, k_max = suff_pred.shape[0], suff_pred.shape[1] - 1
+    # D-34: `k_max` indexes `correct_at`, so it must come from `correct_at`.
+    # Taking it from `suff_pred` meant a router wider than the backbone's exit
+    # count produced an out-of-range column index and a bare IndexError eight
+    # frames from the cause. Same root as D-28: two arrays that must agree on K.
+    if suff_pred.shape[1] != correct_at.shape[1]:
+        raise ValueError(
+            f"learn_then_test_threshold: {suff_pred.shape[1]} sufficiency "
+            f"outputs but {correct_at.shape[1]} exit columns. These must "
+            f"match. A student trained before the D-28 fix has a router sized "
+            f"from the TEACHER's grid -- re-run NB13, which detects and "
+            f"retrains those automatically.")
+    n, k_max = suff_pred.shape[0], correct_at.shape[1] - 1
     chosen = float(grid[0])
     slack = float(np.sqrt(np.log(1.0 / delta) / (2.0 * n)))
     if warn_underpowered and slack > epsilon:
