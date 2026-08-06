@@ -28,7 +28,7 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
 | **Library version** | `msc_lib` 1.0.0 · **232** offline + **3 torch-gated** self-checks |
-| **Defects found** | 34 · 32 fixed · **2 open** (D-14, O-21 B11) · **six sites had to learn about K** (D-28/33/34) |
+| **Defects found** | 35 · 33 fixed · **2 open** (D-14, O-21 B11) · **all 17 notebooks swept against the 5 recurring classes — clean** |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,51 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-35 · NB15 tabulated MSC-KD runs as if they were backbones
+
+**Severity:** crashed NB15 Table 1 · **Status:** **fixed** · **Found:** 2026-08-06
+
+Table 1 built itself from *every* directory under `runs/`:
+
+```python
+for d in sorted(sess.runs_dir.iterdir()):
+    s = read_json(d / 'summary.json')
+    rows.append({k: s.get(k) for k in (... 'num_parameters', 'full_flops' ...)})
+t1['params_M'] = (t1.num_parameters / 1e6)      # <-- None / 1e6
+```
+
+That sweeps in the 18 `p3-*` MSC-KD runs, whose summaries carry a **different
+schema** — no `num_parameters`, `full_flops`, `reference_accuracy` or `family`.
+Those columns arrive as `None` and the arithmetic fails.
+
+**Two run types share one directory tree, and the reader has to say which it
+wants.** `runs/` holds backbones (`p0`/`p1`) and distilled students (`p3`);
+"iterate everything and hope the keys are there" was only ever going to work
+while `p3` was empty.
+
+**Fix.** Split on phase: backbones go to Table 1, MSC-KD runs to a new
+`table_msckd_runs` with the fields they actually have. Numeric columns go
+through `pd.to_numeric(errors='coerce')`, so one malformed summary degrades a
+cell rather than the table.
+
+### Sweep — all 17 notebooks, all known bug classes
+
+Prompted by the user, correctly: I had been fixing these one notebook at a time
+as they surfaced. Every notebook was checked against the five recurring classes:
+
+| class | defects | result |
+|---|---|---|
+| hand-spelled repo/checkpoint paths | D-16, D-23, D-25 | **clean** — all via `run_layout` |
+| hardcoded budget/exit counts | D-28, D-33, D-34 | **clean** — all derived from the backbone |
+| presence-only completion predicates | D-19, D-29, D-31, D-32 | **clean** — `msckd_valid` / `measured` |
+| loops over students without a router guard | D-34 | **clean** — Steps 5 and 7 both guarded |
+| `runs_dir.iterdir()` without a phase or existence guard | D-35 | **clean** after this fix |
+
+Two first-pass flags (NB02, NB14) were **my own regex being wrong**, not real
+defects — NB02 guards with `is_dir()` two lines below the loop, and NB14's
+paths already go through `run_layout`. Recorded because a sweep that reports
+false positives is worth as little as one that misses true ones.
 
 ### D-34 · Step 7 had no router guard, and LTT indexed the wrong array
 
@@ -2018,6 +2063,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-06 | **D-35 — NB15 tabulated `p3` MSC-KD runs as backbones**; their summaries have a different schema. Split by phase. **Followed by a sweep of all 17 notebooks against the five recurring classes — clean** |
 | 2026-08-05 | **D-34 — NB14 Step 7 had no router guard** (Step 5 did), and `learn_then_test_threshold` took `k_max` from `suff_pred` while indexing `correct_at`. Sixth site to learn about K |
 | 2026-08-05 | **D-33 — the dry run recreated D-28 inside itself.** Two hardcoded `5`s built a 5-output router on a 3-exit `resnet8x4`, so every healthy retrain was rejected by its own smoke test. The self-test used `resnet20` (5 exits) and agreed with itself by accident |
 | 2026-08-05 | **D-32 — three gates skip work and I fixed them one at a time**, so the stop moved from `plan_work` to `can_claim`. `force_rerun` set before the claim clears all three |

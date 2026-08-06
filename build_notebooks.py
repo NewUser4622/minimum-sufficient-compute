@@ -2709,10 +2709,22 @@ if len(ledger):
         measurement from it is suspect.
         """),
         code("""\
-rows = []
+# D-35: Table 1 is the ATLAS table -- backbone runs only. Iterating every run
+# directory also swept in the 18 p3 MSC-KD runs, whose summaries have a
+# different schema (no num_parameters, full_flops, reference_accuracy or
+# family), so those columns arrived as None and `num_parameters / 1e6` failed.
+# Two run types share one directory tree; the reader has to say which it wants.
+rows, msckd_rows = [], []
 for d in sorted(sess.runs_dir.iterdir()) if sess.runs_dir.exists() else []:
     s = msc.read_json(d / 'summary.json', default=None)
     if not s or s.get('status') != 'completed':
+        continue
+    if str(s.get('phase') or msc.parse_run_id(d.name).get('phase')) == 'p3':
+        msckd_rows.append({k: s.get(k) for k in
+                           ('run_id', 'arch', 'teacher', 'method', 'seed',
+                            'best_accuracy', 'shuffled_targets', 'alpha',
+                            'beta', 'temperature', 'tau', 'num_epochs_run',
+                            'total_time_sec', 'config_hash')})
         continue
     rows.append({k: s.get(k) for k in
                  ('run_id', 'arch', 'family', 'seed', 'best_accuracy',
@@ -2721,12 +2733,21 @@ for d in sorted(sess.runs_dir.iterdir()) if sess.runs_dir.exists() else []:
                   'total_time_sec', 'total_energy_kwh', 'total_co2_kg',
                   'num_epochs_run', 'config_hash')})
 t1 = pd.DataFrame(rows)
+t_msckd = pd.DataFrame(msckd_rows)
+print(f'{len(t1)} backbone runs, {len(t_msckd)} MSC-KD runs')
 if not len(t1):
-    print('No completed runs found. Nothing to tabulate yet.')
+    print('No completed backbone runs found. Nothing to tabulate yet.')
 if len(t1):
+    # Coerce rather than assume: one malformed summary should not take the
+    # whole table down.
+    for _c in ('num_parameters', 'full_flops', 'best_accuracy'):
+        t1[_c] = pd.to_numeric(t1[_c], errors='coerce')
     t1['params_M'] = (t1.num_parameters / 1e6).round(2)
     t1['GFLOPs'] = (t1.full_flops / 1e9).round(3)
     t1['acc_pct'] = (t1.best_accuracy * 100).round(2)
+if len(t_msckd):
+    msc.save_analysis(sess.data_dir, 'table_msckd_runs', t_msckd, sess.hub)
+    display(t_msckd)
     t1 = t1.sort_values(['family', 'arch', 'seed'])
     display(t1[['run_id', 'arch', 'seed', 'acc_pct', 'reference_accuracy',
                 'accuracy_gap_vs_reference', 'params_M', 'GFLOPs',
