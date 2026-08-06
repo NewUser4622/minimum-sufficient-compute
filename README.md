@@ -4,6 +4,12 @@ Research package for: *Is Compute Difficulty Architecture-Agnostic? Measuring an
 
 **Artifacts:** [`huggingface.co/datasets/Shanmuk4622/msc-cifar100`](https://huggingface.co/datasets/Shanmuk4622/msc-cifar100)
 
+> ## ✅ The measurement programme is complete
+> **49 models trained, 49 measured, all five research questions answered on the
+> full 15-architecture atlas.** Read
+> **[`10_FINAL_RESULTS.md`](10_FINAL_RESULTS.md)** — every table, every number,
+> every limitation, in one place.
+
 ## The question
 
 Adaptive-inference networks decide at runtime how much computation to spend per input. That decision is almost always gated on the deployed model's own confidence — which is exactly the signal a small, poorly-calibrated model is worst at producing. Before building a better gate, this project asks the prior question the field has assumed rather than measured:
@@ -87,8 +93,8 @@ Running record of results, defects and decisions: **[`09_LAB_NOTEBOOK.md`](09_LA
 
 ## ✅ The central result — compute-need transfers across architectures
 
-**91 architecture pairs, 14 architectures, disattenuated by per-architecture
-noise ceilings.** (`wrn_16_2` joins once NB09 is re-run — see below.) τ = 0.1, depth axis, 1000 bootstrap resamples.
+**105 architecture pairs, all 15 architectures**, disattenuated by
+per-architecture noise ceilings. τ = 0.1, depth axis, 1000 bootstrap resamples.
 
 | pair type | n | **mean T** | range |
 |---|---|---|---|
@@ -117,22 +123,32 @@ different-seed agreement.
 ### H2 refuted across the whole atlas
 
 **0 of 15 runs** reach the pre-registered PC1 ≥ 0.60; the highest anywhere is
-**0.532** and the spread across 13 architectures is only 0.09 wide. Compute-need
+**0.532** and the spread across 15 architectures is only 0.09 wide. Compute-need
 is *reliably* three-dimensional. The axes decouple further in the
 non-convolutional models — for `mixer_nano`, depth↔precision is **0.096**.
 
 Results on depth-based early exit do not license claims about the other axes,
 in any architecture we tried.
 
-### What is not done yet
+### Q4 — MSC is irreducible for CNNs, not reliably so for transformers
+
+105 pairs, `train_holdout`, full 7-score battery:
+
+| | median ΔR² | clearing the 0.05 gate |
+|---|---|---|
+| CNN-only (78 pairs) | **0.1552** | **78/78 = 100%** |
+| transformer-involving (27) | **0.0425** | 11/27 = 41% |
+
+⚠ The Phase 0 figure of 0.254 is **withdrawn** — it ran on the wrong split with
+5 of 7 scores (D-11).
+
+### What remains
 
 | | |
 |---|---|
-| **Q4 re-run** | Q4's 15 pairs were selected alphabetically and are dominated by the two most atypical architectures (D-18). The fix is committed; the numbers are provisional until NB10→NB11→NB12 re-run (~20 min, CPU) |
-| **MSC-KD retrain** | D-28: the nine students were trained with a router sized from the *teacher's* budget grid. Fixed, but the existing checkpoints are invalid and NB13 must be re-run |
-| **B11 ceiling** | needs each student's own per-sample table; NB08 measures only `p1` runs (O-21) |
+| **B11 ceiling** (O-21) | needs each student's own per-sample table; NB08 measures only `p1` runs. Blocks the Q5 headline only — Q1–Q4 are complete |
 | `mobilenetv2` Δ | compared against a half-width baseline (D-14); reference to be nulled |
-| NB13–NB15 | MSC-KD training, method comparison, paper outputs |
+| O-14 / O-9 | two ~2 GPU-h follow-ups that strengthen sub-findings |
 
 ---
 

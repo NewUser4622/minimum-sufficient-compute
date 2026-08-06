@@ -18,11 +18,11 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 
 | | |
 |---|---|
-| **Phase** | **All five research questions answered.** NB13 (MSC-KD) running |
+| **Phase** | ✅ **COMPLETE.** 49 trained, 49 measured, Q1–Q4 on all 15 architectures. Capstone: [`10_FINAL_RESULTS.md`](10_FINAL_RESULTS.md) |
 | **Verdict** | `FULL-PROGRAM` (2026-08-02) |
 | **Runs trained** | Phase 0 **4/4** · Phase 1 **45/45** ✅ **atlas complete** |
 | **Runs measured** | Phase 0 **4/4** · Phase 1 **45/45** ✅ (NB16 closed D-15) |
-| **Analysis on the atlas** | ✅ **all 15 architectures** — NB09 re-run, `ceilings.json` now carries `wrn_16_2` (0.6328) and a 3-seed `vgg8` (0.7216). Q1–Q4 complete on the full atlas |
+| **Analysis on the atlas** | ✅ **all 15** — Q3 at **105 pairs**, Q4 at **105 pairs** with the full 7-score battery on `train_holdout`. NB15 tables and figures produced |
 | **Q3 — the central result** | within-family **0.920** > across-CNN **0.878** > CNN→transformer **0.710**, no overlap |
 | **Hypotheses** | H2 **refuted** 15/15 · H3 ordering ✅ but magnitude **refuted favourably** · H4 ΔR² ✅, partial ρ marginal |
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
