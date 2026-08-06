@@ -2771,6 +2771,7 @@ if len(t_msckd):
         answer "why was that architecture slow?" months later.
         """),
         code("""\
+import re
 rows = []
 for d in sorted(sess.runs_dir.iterdir()) if sess.runs_dir.exists() else []:
     h = d / 'metrics' / 'epochs.csv'
@@ -2783,14 +2784,31 @@ for d in sorted(sess.runs_dir.iterdir()) if sess.runs_dir.exists() else []:
     if df.empty:
         continue
     rec = {'run_id': d.name, 'epochs': len(df)}
-    for c, agg in (('epoch_time_sec', 'median'), ('throughput_img_s', 'median'),
-                   ('dataload_frac', 'median'), ('gpu_util_mean_pct', 'mean'),
-                   ('gpu_temp_max_c', 'max'), ('peak_vram_mb', 'max'),
-                   ('grad_norm_mean', 'median'), ('update_to_weight_ratio', 'median'),
-                   ('step_time_p99_ms', 'median'), ('nan_or_inf_batches', 'sum'),
+    # D-36: these must be REAL HISTORY_FIELDS names. Three were invented --
+    # `throughput_img_s`, `gpu_util_mean_pct`, `gpu_temp_max_c`. The schema has
+    # `throughput_train_img_s`, and GPU columns are PER DEVICE (`gpu0_*`,
+    # `gpu1_*`) because a dual-T4 session has two. The build loop silently
+    # skipped them (`if c in df.columns`) and the display below then asked for
+    # one by name and raised KeyError.
+    for c, agg in (('epoch_time_sec', 'median'),
+                   ('throughput_train_img_s', 'median'),
+                   ('dataload_frac', 'median'),
+                   ('peak_vram_mb', 'max'),
+                   ('grad_norm_mean', 'median'),
+                   ('update_to_weight_ratio', 'median'),
+                   ('step_time_p99_ms', 'median'),
+                   ('nan_or_inf_batches', 'sum'),
                    ('cumulative_energy_kwh', 'max')):
         if c in df.columns:
             rec[c] = float(getattr(df[c], agg)())
+    # Average utilisation and peak temperature across whatever devices this
+    # session actually had, rather than assuming a single GPU.
+    for stem, agg, out in (('util_mean_pct', 'mean', 'gpu_util_mean_pct'),
+                           ('temp_max_c', 'max', 'gpu_temp_max_c')):
+        cols = [c for c in df.columns
+                if re.fullmatch(rf'gpu\\d+_{stem}', c) and df[c].notna().any()]
+        if cols:
+            rec[out] = float(getattr(df[cols].mean(axis=1), agg)())
     rows.append(rec)
 tel = pd.DataFrame(rows)
 if len(tel):
@@ -2801,7 +2819,10 @@ if len(tel):
         if len(starved):
             print('\\nThese runs spent >30% of their time waiting for data --')
             print('the GPU was idle. Worth knowing before scaling up:')
-            display(starved[['run_id', 'dataload_frac', 'gpu_util_mean_pct']])
+            # Ask only for columns that are actually present.
+            cols = [c for c in ('run_id', 'dataload_frac', 'gpu_util_mean_pct')
+                    if c in starved.columns]
+            display(starved[cols])
     if 'nan_or_inf_batches' in tel:
         bad = tel[tel.nan_or_inf_batches > 0]
         if len(bad):

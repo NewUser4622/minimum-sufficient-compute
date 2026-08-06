@@ -28,7 +28,7 @@ each. §3 is decisions changed. §4 maps all of it onto paper sections.
 | **GPU-hours spent** | ~115 (9.5 Phase 0 + ~82 atlas + ~20 measurement + 2.9 wasted to D-12) |
 | **GPU-hours remaining** | ~45 (gap-fill ~8 · NB13 MSC-KD ~30 · NB14 ~5) — analysis re-runs are CPU-only |
 | **Library version** | `msc_lib` 1.0.0 · **232** offline + **3 torch-gated** self-checks |
-| **Defects found** | 35 · 33 fixed · **2 open** (D-14, O-21 B11) · **all 17 notebooks swept against the 5 recurring classes — clean** |
+| **Defects found** | 36 · 34 fixed · **2 open** (D-14, O-21 B11) · NB15 column literals now validated against the schema |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-cifar100` @ `4ce2703` |
 
 > **⚠ Two numbers in older documents are now known to be wrong.**
@@ -589,6 +589,48 @@ measurement to write it rather than hedge it.
 
 Every bug found, with a **contamination analysis** — the question a reviewer
 would ask, and the one we need to have answered before writing.
+
+### D-36 · NB15 asked for three column names that do not exist
+
+**Severity:** crashed NB15 Step 4 · **Status:** **fixed** · **Found:** 2026-08-06
+
+```
+KeyError: "['gpu_util_mean_pct'] not in index"
+```
+
+Three of the telemetry column names were invented:
+
+| NB15 asked for | the schema actually has |
+|---|---|
+| `throughput_img_s` | `throughput_train_img_s` |
+| `gpu_util_mean_pct` | `gpu0_util_mean_pct`, `gpu1_util_mean_pct`, … |
+| `gpu_temp_max_c` | `gpu0_temp_max_c`, `gpu1_temp_max_c`, … |
+
+**GPU columns are per device**, because a Kaggle dual-T4 session has two of
+them and `_gpu_fields()` emits one set each. There is no un-suffixed name.
+
+**Why it surfaced as a `KeyError` rather than a missing column.** The build loop
+guards every access (`if c in df.columns`), so the three names were silently
+skipped and `tel` came out without them — the loop did the right thing quietly.
+The *display* two lines later then asked for one by name. **A guarded write
+followed by an unguarded read**: the guard made the mistake invisible right up
+to the point where it was fatal.
+
+**Fix.** Correct names, and GPU utilisation/temperature are now averaged across
+however many devices the session had, matched by `gpu\d+_` rather than assumed
+to be one. The display filters to columns that are present.
+
+**Then I checked all of them.** Rather than fix the one name in the traceback, I
+validated **every** column literal in NB15 against `HISTORY_FIELDS` and
+`FINAL_FIELDS`: 12 telemetry references, 3 invented, now 0. The three that
+remain outside `HISTORY_FIELDS` (`acc_pct`, `total_energy_kwh`, `total_co2_kg`)
+are correct — they come from `summary.json` and from Table 1's own computed
+columns, and were confirmed present in a real summary on HF.
+
+**This is the same shape as D-22** (five wrong column names in the MSC-KD
+history row). Both were literals that no test compared against the schema. The
+schema is data; the names referencing it should be checked against it
+mechanically, not by eye.
 
 ### D-35 · NB15 tabulated MSC-KD runs as if they were backbones
 
@@ -2063,6 +2105,7 @@ O-12 and O-14 is now writing or minutes of CPU.
 
 | Date | Event |
 |---|---|
+| 2026-08-06 | **D-36 — NB15 asked for three column names that do not exist.** GPU fields are per-device (`gpu0_*`); a guarded write followed by an unguarded read hid it until the display. All 12 telemetry literals now validated against the schema |
 | 2026-08-06 | **D-35 — NB15 tabulated `p3` MSC-KD runs as backbones**; their summaries have a different schema. Split by phase. **Followed by a sweep of all 17 notebooks against the five recurring classes — clean** |
 | 2026-08-05 | **D-34 — NB14 Step 7 had no router guard** (Step 5 did), and `learn_then_test_threshold` took `k_max` from `suff_pred` while indexing `correct_at`. Sixth site to learn about K |
 | 2026-08-05 | **D-33 — the dry run recreated D-28 inside itself.** Two hardcoded `5`s built a 5-output router on a 3-exit `resnet8x4`, so every healthy retrain was rejected by its own smoke test. The self-test used `resnet20` (5 exits) and agreed with itself by accident |
