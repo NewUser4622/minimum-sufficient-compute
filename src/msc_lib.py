@@ -1788,6 +1788,71 @@ CIFAR100_MEAN = (0.5071, 0.4865, 0.4409)
 CIFAR100_STD = (0.2673, 0.2564, 0.2762)
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD = (0.2470, 0.2435, 0.2616)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+# =============================================================================
+# 6a. dataset registry -- the answer to "how big is an image here?"
+# =============================================================================
+# Every literal `32` and every literal `100` in this library used to be correct
+# because there was one dataset. Rule 2: a literal that is right for 13 of 15
+# cases is the worst kind, and a literal that is right for 1 of 2 datasets is
+# the same defect with a smaller denominator.
+#
+# So: nothing downstream may spell an input resolution or a class count. It asks
+# here. The three accessors below are the only sanctioned way to obtain them,
+# which means a missing dataset is a KeyError at the top of a notebook rather
+# than a shape error eight frames into a sweep.
+#
+# `resolutions` is the resolution axis grid. For CIFAR it is the frozen
+# (16,20,24,28,32). For ImageNet-100 every value must be divisible by 32,
+# because a ViT-S/16 has to patchify it into a square grid AND a Swin-T reduces
+# by 4 (patch) x 2 x 2 x 2 (three merges) = 32. 224 x the CIFAR fractions gives
+# 112/140/168/196/224, and 140 and 196 satisfy neither. This is exactly the
+# constraint that produced D-01a and D-02 on CIFAR, resolved at design time
+# instead of at preflight time.
+DATASETS: Dict[str, Dict[str, Any]] = {
+    "cifar100": dict(
+        num_classes=100, native_res=32, resolutions=(16, 20, 24, 28, 32),
+        mean=CIFAR100_MEAN, std=CIFAR100_STD, backend="cifar",
+        zoo="cifar", train_n=50_000, eval_n=10_000),
+    "cifar10": dict(
+        num_classes=10, native_res=32, resolutions=(16, 20, 24, 28, 32),
+        mean=CIFAR10_MEAN, std=CIFAR10_STD, backend="cifar",
+        zoo="cifar", train_n=50_000, eval_n=10_000),
+    "imagenet100": dict(
+        num_classes=100, native_res=224, resolutions=(96, 128, 160, 192, 224),
+        mean=IMAGENET_MEAN, std=IMAGENET_STD, backend="packed",
+        zoo="imagenet", train_n=119_395, eval_n=10_000),
+}
+
+
+def dataset_spec(dataset: str) -> Dict[str, Any]:
+    d = str(dataset).lower()
+    if d not in DATASETS:
+        raise KeyError(f"unknown dataset '{dataset}'. Known: {sorted(DATASETS)}")
+    return DATASETS[d]
+
+
+def native_res(dataset: str) -> int:
+    """The resolution the network is trained and evaluated at."""
+    return int(dataset_spec(dataset)["native_res"])
+
+
+def resolutions_for(dataset: str) -> Tuple[int, ...]:
+    return tuple(dataset_spec(dataset)["resolutions"])
+
+
+def num_classes_for(dataset: str) -> int:
+    return int(dataset_spec(dataset)["num_classes"])
+
+
+def input_shape(dataset: str, res: Optional[int] = None,
+                batch: int = 1) -> Tuple[int, int, int, int]:
+    """The profiler input shape. Never write `(1, 3, 32, 32)` anywhere again."""
+    r = int(res if res is not None else native_res(dataset))
+    return (int(batch), 3, r, r)
 
 
 def _has_cifar100(root: Path) -> bool:
@@ -1965,6 +2030,301 @@ class CIFARTensor(Dataset):
         return x, int(self.labels[idx]), int(idx)
 
 
+# =============================================================================
+# 6c. data -- ImageNet-100 from the packed uint8 memmap
+# =============================================================================
+# Built by tools/pack_imagenet100.py. See 25_IN100_DATA_CARD.md for the subset
+# identity, the split policy and the fingerprint.
+#
+# The design decision that matters here: augmentation runs on the GPU, and it
+# runs INSIDE THE LOADER rather than in the training loop.
+#
+# The obvious implementation puts a `x = augment(x)` line after every
+# `.to(device)`. There are eleven such sites -- train_backbone, evaluate,
+# run_oracle's three sweeps, difficulty_battery, prediction_depth,
+# train_exit_heads, train_msc_kd, the dry runs -- and rule 6 is exactly about
+# this shape: when a step can be skipped at N points, forgetting it at one is a
+# silent wrong answer, not an error. A model trained on augmented data and
+# measured on un-normalised data produces a per-sample MSC table that is
+# well-formed and meaningless.
+#
+# So the loader yields what every existing consumer already expects: a float,
+# normalised, correctly-sized tensor already on the device. Nothing downstream
+# changed, and nothing downstream CAN forget.
+IN100_PACK_FILES = ("images_256.u8", "labels.npy", "manifest.json", "splits.json")
+
+
+def _has_imagenet100(root: Path) -> bool:
+    r = Path(root)
+    return all((r / f).exists() for f in IN100_PACK_FILES)
+
+
+def locate_imagenet100(prefer_scratch: bool = True, verbose: bool = True) -> Path:
+    """Find the packed dataset. Never downloads -- packing is a deliberate,
+    verified, 20-minute step with its own tool, not something to trigger by
+    accident from inside a training run."""
+    def _say(m):
+        if verbose:
+            log(m, "DATA")
+
+    cands: List[Path] = []
+    env = os.environ.get("MSC_IN100_DIR")
+    if env:
+        cands.append(Path(env))
+    inp = Path("/kaggle/input")
+    if inp.exists():
+        cands += [p for p in inp.iterdir() if p.is_dir()]
+        cands += [q for p in inp.iterdir() if p.is_dir()
+                  for q in p.iterdir() if q.is_dir()]
+    for base in (SCRATCH_ROOT, WORK_ROOT):
+        cands += [base / "data" / "in100", base / "in100"]
+
+    for c in cands:
+        try:
+            if _has_imagenet100(c):
+                _say(f"found packed ImageNet-100 at {c}")
+                return Path(c)
+        except Exception:
+            continue
+    raise RuntimeError(
+        "packed ImageNet-100 not found. Build it once with:\n"
+        "    python tools/pack_imagenet100.py --src <folder with train/> "
+        "--out <dest>\n"
+        "then either set MSC_IN100_DIR=<dest>, place it at "
+        f"{SCRATCH_ROOT / 'data' / 'in100'}, or attach it as a Kaggle Dataset.\n"
+        f"Looked in: {[str(c) for c in cands[:8]]}")
+
+
+def data_present(dataset: str, root) -> Tuple[bool, str]:
+    """Uniform 'is the data where it should be' check, for the preflight."""
+    backend = dataset_spec(dataset)["backend"]
+    if backend == "cifar":
+        return _has_cifar100(Path(root)), str(root)
+    ok = _has_imagenet100(Path(root))
+    if not ok:
+        return False, f"{root} is missing {IN100_PACK_FILES}"
+    man = read_json(Path(root) / "manifest.json", {}) or {}
+    return True, (f"{root}  n={man.get('count')}  "
+                  f"classes={man.get('n_classes')}  "
+                  f"fingerprint={str(man.get('fingerprint',''))[:12]}")
+
+
+class PackedImageDataset(Dataset):
+    """A split of the packed memmap. Returns RAW uint8 HWC plus the GLOBAL index.
+
+    Three properties that are load-bearing:
+
+    * **`sample_idx` is the global pack index, not the position in this split.**
+      The val table's indices are the val indices. That makes every per-sample
+      table self-describing, lets val and train_holdout tables coexist without
+      ambiguity, and means an accidental split mismatch shows up as
+      non-overlapping indices rather than as a plausible correlation.
+
+    * **The memmap is opened lazily, per worker.** On Windows the DataLoader
+      spawns rather than forks, so a handle opened in the parent is not
+      inherited. Opening eagerly would either crash the workers or -- much worse
+      -- serve zeros silently.
+
+    * **No shuffling, ever, on an eval split.** Same contract as CIFARTensor:
+      `sample_idx` alignment is what every correlation in the project rests on.
+    """
+
+    def __init__(self, root, split: str = "val"):
+        root = Path(root)
+        self.root = root
+        self.split = split
+        man = read_json(root / "manifest.json")
+        if not man:
+            raise RuntimeError(f"no manifest.json under {root}")
+        self.manifest = man
+        self.stored_res = int(man["stored_res"])
+        self.count = int(man["count"])
+        self.classes = list(man["classes"])
+        self.class_names = [man.get("class_names", {}).get(c, c) for c in self.classes]
+        self.fingerprint = str(man["fingerprint"])
+
+        splits = read_json(root / "splits.json")
+        if split not in ("val", "train", "holdout"):
+            raise KeyError(f"unknown split {split!r}")
+        self.indices = np.asarray(splits[split], dtype=np.int64)
+        self.labels_all = np.load(root / "labels.npy")
+        self.labels = self.labels_all[self.indices].astype(np.int64)
+        self._mm = None
+        # Same role as CIFARTensor.order_hash: fingerprints the label order of
+        # THIS split so the analysis refuses to correlate misaligned tables.
+        self.order_hash = sha256_of_array(self.labels)
+
+    def _mmap(self):
+        if self._mm is None:
+            self._mm = np.memmap(self.root / "images_256.u8", dtype=np.uint8,
+                                 mode="r",
+                                 shape=(self.count, self.stored_res,
+                                        self.stored_res, 3))
+        return self._mm
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def __getitem__(self, i: int):
+        g = int(self.indices[i])
+        img = np.asarray(self._mmap()[g])            # (S, S, 3) uint8
+        return torch.from_numpy(img), int(self.labels[i]), g
+
+
+if _TORCH_OK:
+
+    class GPUBatchLoader:
+        """Wraps a DataLoader of raw uint8 batches and yields exactly what every
+        consumer in this library already expects: `(x_float_normalised, y, idx)`
+        on the device.
+
+        Crop and resize are done with a single batched `grid_sample`, which
+        expresses RandomResizedCrop as an affine transform -- one kernel for the
+        whole batch instead of a per-image Python loop, and the same code path
+        for train (random) and eval (fixed centre crop).
+
+        Delegates `.dataset` and `__len__`, because callers legitimately ask for
+        `len(loader.dataset)` and would otherwise get an AttributeError at the
+        first log line of the sweep.
+        """
+
+        def __init__(self, loader, device, out_res: int, stored_res: int,
+                     mean: Sequence[float], std: Sequence[float],
+                     train: bool = False, scale=(0.35, 1.0),
+                     ratio=(3.0 / 4.0, 4.0 / 3.0), hflip: bool = True,
+                     seed: int = 0):
+            self.loader = loader
+            self.device = device
+            self.out_res = int(out_res)
+            self.stored_res = int(stored_res)
+            self.train = bool(train)
+            self.scale, self.ratio, self.hflip = tuple(scale), tuple(ratio), bool(hflip)
+            self._mean = torch.tensor(mean, device=device).view(1, 3, 1, 1)
+            self._std = torch.tensor(std, device=device).view(1, 3, 1, 1)
+            # Its own generator, on the device, seeded from the run seed. Crop
+            # sampling must be part of the reproducible RNG story or a resumed
+            # run sees a different augmentation stream than an uninterrupted one
+            # -- the exact failure the checkpoint contract's `rng` field exists
+            # to prevent (playbook 8).
+            self._g = torch.Generator(device="cpu")
+            self._g.manual_seed(int(seed))
+
+        # -- delegation ------------------------------------------------------
+        def __len__(self):
+            return len(self.loader)
+
+        @property
+        def dataset(self):
+            return self.loader.dataset
+
+        @property
+        def batch_size(self):
+            return getattr(self.loader, "batch_size", None)
+
+        # -- the transform ---------------------------------------------------
+        def _theta(self, n: int):
+            """Per-sample affine for crop+resize (+flip), in normalised coords."""
+            S = float(self.stored_res)
+            if not self.train:
+                f = self.out_res / S                       # centred, no flip
+                th = torch.zeros(n, 2, 3)
+                th[:, 0, 0] = f
+                th[:, 1, 1] = f
+                return th
+
+            area = S * S
+            lo, hi = self.scale
+            logr = torch.empty(n).uniform_(math.log(self.ratio[0]),
+                                           math.log(self.ratio[1]),
+                                           generator=self._g)
+            ar = torch.exp(logr)
+            tgt = torch.empty(n).uniform_(lo, hi, generator=self._g) * area
+            w = torch.sqrt(tgt * ar).clamp(8.0, S)
+            h = torch.sqrt(tgt / ar).clamp(8.0, S)
+            # Uniform top-left within the legal range, expressed as a centre
+            # offset in normalised [-1, 1] coordinates.
+            maxdx = (S - w) / S
+            maxdy = (S - h) / S
+            dx = (torch.rand(n, generator=self._g) * 2 - 1) * maxdx
+            dy = (torch.rand(n, generator=self._g) * 2 - 1) * maxdy
+            sw, sh = w / S, h / S
+            if self.hflip:
+                flip = (torch.rand(n, generator=self._g) < 0.5)
+                sw = torch.where(flip, -sw, sw)
+            th = torch.zeros(n, 2, 3)
+            th[:, 0, 0] = sw
+            th[:, 0, 2] = dx
+            th[:, 1, 1] = sh
+            th[:, 1, 2] = dy
+            return th
+
+        def __iter__(self):
+            for batch in self.loader:
+                xb, y, idx = batch[0], batch[1], batch[2]
+                x = xb.to(self.device, non_blocking=True)
+                if x.dim() == 4 and x.shape[-1] == 3:       # NHWC uint8 -> NCHW
+                    x = x.permute(0, 3, 1, 2)
+                x = x.float().div_(255.0)
+                n = x.shape[0]
+                th = self._theta(n).to(self.device, dtype=x.dtype)
+                grid = F.affine_grid(th, (n, 3, self.out_res, self.out_res),
+                                     align_corners=False)
+                x = F.grid_sample(x, grid, mode="bilinear",
+                                  padding_mode="reflection", align_corners=False)
+                x = (x - self._mean) / self._std
+                yield (x.contiguous(memory_format=torch.channels_last),
+                       y.to(self.device, non_blocking=True), idx)
+
+
+def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
+    """train / val / train-holdout for the packed ImageNet-100.
+
+    `train_holdout` is a slice OF train evaluated with augmentation OFF. It is
+    not withheld from training: EL2N and forgetting events are training-set
+    quantities and are undefined anywhere else, which is what D-11 was about.
+    """
+    spec = dataset_spec("imagenet100")
+    root = Path(cfg["data_root"])
+    dev = torch.device(cfg.get("device")
+                       or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    bs = int(cfg.get("batch_size", 128))
+    eval_bs = int(cfg.get("eval_batch_size", 256))
+    res = int(cfg.get("input_res", spec["native_res"]))
+    seed = int(cfg.get("seed", 1))
+
+    tr = PackedImageDataset(root, "train")
+    va = PackedImageDataset(root, "val")
+    ho = PackedImageDataset(root, "holdout")
+
+    got = tr.fingerprint
+    want = cfg.get("data_fingerprint")
+    if want and str(want) != got:
+        raise RuntimeError(
+            f"data fingerprint mismatch.\n  config: {want}\n  on disk: {got}\n"
+            f"This run was configured against a different pack or a different "
+            f"split. Correlating per-sample tables across the two would align "
+            f"them by index and compare different images. Repack, or use the "
+            f"matching pack.")
+
+    nw = int(cfg.get("num_workers", min(8, max(0, (os.cpu_count() or 2) - 2))))
+    common = dict(num_workers=nw, pin_memory=(dev.type == "cuda"),
+                  persistent_workers=bool(nw), prefetch_factor=(4 if nw else None))
+    g = torch.Generator(); g.manual_seed(seed)
+
+    raw_tr = DataLoader(tr, batch_size=bs, shuffle=True, drop_last=False,
+                        generator=g, **common)
+    # Never shuffle eval loaders. sample_idx alignment depends on it.
+    raw_va = DataLoader(va, batch_size=eval_bs, shuffle=False, **common)
+    raw_ho = DataLoader(ho, batch_size=eval_bs, shuffle=False, **common)
+
+    mk = lambda raw, train, sd: GPUBatchLoader(
+        raw, dev, res, tr.stored_res, spec["mean"], spec["std"],
+        train=train, scale=tuple(cfg.get("rrc_scale", (0.35, 1.0))), seed=sd)
+
+    return (mk(raw_tr, True, seed), mk(raw_va, False, 0), mk(raw_ho, False, 0),
+            tr.class_names, va.order_hash)
+
+
 def build_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
     """train / val(test) / train-holdout loaders.
 
@@ -1973,8 +2333,11 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
     answers a free question: does MSC structure look different on data the
     model has already seen?
     """
-    data_root = cfg["data_root"]
     ds = str(cfg.get("dataset_name", "cifar100"))
+    if dataset_spec(ds)["backend"] == "packed":
+        return _in100_loaders(cfg)
+
+    data_root = cfg["data_root"]
     bs = int(cfg.get("batch_size", 64))
     eval_bs = int(cfg.get("eval_batch_size", 512))
 
@@ -2577,13 +2940,219 @@ if _TORCH_OK:
         return MixerBackbone(stem, blocks, nn.Linear(dim, num_classes),
                              lambda i: dim, final_norm=nn.LayerNorm(dim))
 
+    # =====================================================================
+    # ImageNet-100 zoo -- eight architectures at 224 px
+    # =====================================================================
+    # These are adapters, not reimplementations. The convolutional backbones
+    # come from torchvision, which is guaranteed present alongside torch and
+    # whose ImageNet definitions are the standard ones; re-typing them would
+    # risk a silent deviation from the architecture everyone else means by
+    # "ResNet-50". What is OURS -- and therefore what needs testing (rule 8) --
+    # is the decomposition into (stem, ordered blocks, classifier), because
+    # that is what makes `forward_prefix(x, k)` genuinely stop at stage k
+    # rather than run the whole network and read a mid-layer activation. An
+    # early exit that costs full compute would make every FLOPs saving in the
+    # project fictional.
+    #
+    # ONE HEAD SHAPE FOR ALL EIGHT: global average pool -> Linear. Stock VGG-16
+    # has a 25088->4096->4096 fully-connected head worth ~124 M parameters. If
+    # the final exit carried that head while exits 1..K-1 carried a GAP+Linear
+    # ExitHead, the depth-axis rho would be measuring the head rather than the
+    # backbone, and `rho` is the quantity the whole project normalises by. So
+    # every architecture terminates the same way the exit heads do. This makes
+    # `vgg16` here "VGG-16(BN) with a global-average-pool head" and not stock
+    # VGG-16 -- recorded, and harmless because no published reference is
+    # claimed for anything in this zoo (25_IN100_DATA_CARD.md 1).
+
+    def _tv():
+        try:
+            import torchvision.models as tvm
+            return tvm
+        except Exception as e:                                  # noqa: BLE001
+            raise RuntimeError(
+                f"torchvision is required for the ImageNet zoo ({e}). "
+                f"pip install torchvision") from e
+
+    def build_resnet_imagenet(depth: int, num_classes: int = 100) -> StagedBackbone:
+        """torchvision ResNet-18/50, decomposed by residual block.
+
+        8 blocks for R18, 16 for R50 -- comfortably more than the 5 depth
+        fractions want, so K is the full 5 and the adaptive-K path (D-01b) is
+        not exercised here. It is still derived from the model, never assumed.
+        """
+        tvm = _tv()
+        net = {18: tvm.resnet18, 50: tvm.resnet50}[depth](weights=None)
+        stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
+        blocks, dims = [], []
+        for layer in (net.layer1, net.layer2, net.layer3, net.layer4):
+            for b in layer:
+                blocks.append(b)
+                dims.append(b.conv3.out_channels if hasattr(b, "conv3")
+                            else b.conv2.out_channels)
+        return StagedBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
+                              lambda i: dims[i])
+
+    def build_vgg_imagenet(depth: int = 16, num_classes: int = 100) -> StagedBackbone:
+        """torchvision VGG-16 with BN, conv stack only, GAP+Linear head."""
+        tvm = _tv()
+        net = {11: tvm.vgg11_bn, 13: tvm.vgg13_bn,
+               16: tvm.vgg16_bn, 19: tvm.vgg19_bn}[depth](weights=None)
+        feats = list(net.features)
+        blocks, dims, cin = [], [], 3
+        i = 0
+        while i < len(feats):
+            m = feats[i]
+            if isinstance(m, nn.Conv2d):
+                # conv + bn + relu is one block, so a depth cut never lands
+                # between a convolution and its normalisation.
+                grp = [m]
+                j = i + 1
+                while j < len(feats) and not isinstance(feats[j],
+                                                        (nn.Conv2d, nn.MaxPool2d)):
+                    grp.append(feats[j])
+                    j += 1
+                blocks.append(nn.Sequential(*grp))
+                cin = m.out_channels
+                i = j
+            else:
+                blocks.append(m)
+                i += 1
+            dims.append(cin)
+        return StagedBackbone(nn.Identity(), blocks,
+                              nn.Linear(dims[-1], num_classes), lambda i: dims[i])
+
+    def build_shufflenetv2_imagenet(num_classes: int = 100,
+                                    width: str = "1.0x") -> StagedBackbone:
+        tvm = _tv()
+        net = {"0.5x": tvm.shufflenet_v2_x0_5, "1.0x": tvm.shufflenet_v2_x1_0,
+               "1.5x": tvm.shufflenet_v2_x1_5}[width](weights=None)
+        stem = nn.Sequential(net.conv1, net.maxpool)
+        blocks, dims = [], []
+        for stage in (net.stage2, net.stage3, net.stage4):
+            for b in stage:
+                blocks.append(b)
+                dims.append(b.branch2[-2].out_channels)
+        blocks.append(net.conv5)
+        dims.append(net.conv5[0].out_channels)
+        return StagedBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
+                              lambda i: dims[i])
+
+    def build_convnext_tiny(num_classes: int = 100,
+                            dims: Sequence[int] = (96, 192, 384, 768),
+                            depths: Sequence[int] = (3, 3, 9, 3),
+                            drop_path: float = 0.1,
+                            stem_patch: int = 4) -> StagedBackbone:
+        """ConvNeXt-T geometry, built from the same blocks as the CIFAR femto.
+
+        Ours rather than torchvision's, because `_ConvNeXtBlock` and
+        `_LayerNorm2d` already exist here, are already exercised by the CIFAR
+        self-checks, and decompose cleanly. `stem_patch` is 4 at ImageNet
+        resolution and 2 for the 32px variant -- the one parameter that differs.
+        """
+        stem = nn.Sequential(nn.Conv2d(3, dims[0], stem_patch, stem_patch),
+                             _LayerNorm2d(dims[0]))
+        blocks, bdims = [], []
+        total = sum(depths)
+        dp = [drop_path * i / max(1, total - 1) for i in range(total)]
+        k = 0
+        for si, (d, n) in enumerate(zip(dims, depths)):
+            if si > 0:
+                blocks.append(nn.Sequential(_LayerNorm2d(dims[si - 1]),
+                                            nn.Conv2d(dims[si - 1], d, 2, 2)))
+                bdims.append(d)
+            for _ in range(n):
+                blocks.append(_ConvNeXtBlock(d, dp[k]))
+                bdims.append(d)
+                k += 1
+        return StagedBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
+                              lambda i: bdims[i],
+                              final_norm=_LayerNorm2d(dims[-1]))
+
+    def build_vit_small(num_classes: int = 100, dim: int = 384, depth: int = 12,
+                        heads: int = 6, patch: int = 16, img: int = 224,
+                        drop_path: float = 0.05) -> TokenBackbone:
+        """ViT-S/16. `deit_small` is THIS FUNCTION with THESE ARGUMENTS.
+
+        The two entries in the zoo are deliberately built by one builder with
+        one set of geometry arguments, so they cannot drift apart. They differ
+        only in `base_config`'s recipe -- augmentation strength, drop-path and
+        weight decay.
+
+        That pairing is the control CIFAR did not have. If seed-reliability
+        differs between two models with identical parameter counts, identical
+        forward passes and identical exit structure, the difference is a
+        property of how they were trained and not of attention. Making them the
+        same function is what guarantees the comparison means that.
+        """
+        stem = _PatchEmbed(img, patch, 3, dim)
+        dp = [drop_path * i / max(1, depth - 1) for i in range(depth)]
+        blocks = [_TransformerBlock(dim, heads, 4.0, dp[i]) for i in range(depth)]
+        return TokenBackbone(stem, blocks, nn.Linear(dim, num_classes),
+                             lambda i: dim, final_norm=nn.LayerNorm(dim))
+
+    class SwinBackbone(StagedBackbone):
+        """torchvision Swin-T. Its blocks speak NHWC; everything else here
+        speaks NCHW.
+
+        Rather than teach `ExitHead`, `pooled` and the FLOPs profiler about a
+        second memory layout -- three more places to get it wrong -- the
+        permutation happens once, at the boundary where features leave the
+        backbone. Internals stay exactly as torchvision wrote them.
+        """
+
+        def _run_to(self, x, upto_block: int):
+            h = self.stem(x)
+            for i in range(upto_block):
+                h = self.blocks[i](h)
+            return h.permute(0, 3, 1, 2).contiguous()      # NHWC -> NCHW
+
+        def forward_features(self, x) -> List["torch.Tensor"]:
+            feats, h, prev = [], self.stem(x), 0
+            for c in self.stage_cuts:
+                for i in range(prev, c):
+                    h = self.blocks[i](h)
+                prev = c
+                feats.append(h.permute(0, 3, 1, 2).contiguous())
+            return feats
+
+        def forward(self, x):
+            h = self._run_to(x, len(self.blocks))           # already NCHW
+            if self.final_norm is not None:
+                h = self.final_norm(h)
+            return self.classifier(self.pooled(h))
+
+    def build_swin_tiny(num_classes: int = 100) -> "SwinBackbone":
+        tvm = _tv()
+        net = tvm.swin_t(weights=None)
+        feats = list(net.features)
+        stem = feats[0]                                    # patch embed
+        blocks, dims = [], []
+        for m in feats[1:]:
+            if isinstance(m, nn.Sequential):               # a stage of blocks
+                for b in m:
+                    blocks.append(b)
+                    dims.append(b.norm1.normalized_shape[0])
+            else:                                          # PatchMerging
+                blocks.append(m)
+                dims.append(m.reduction.out_features)
+        return SwinBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
+                            lambda i: dims[i],
+                            final_norm=_LayerNorm2d(dims[-1]))
+
 
 # --------------------------------------------------------------------------
 # Zoo registry
 # --------------------------------------------------------------------------
 # family is the Q3 grouping variable: within-family transfer is expected to
 # exceed across-family, which exceeds CNN->token. Keep it accurate.
+#
+# `zoo` says which dataset an entry belongs to. A `resnet20` is a CIFAR ResNet
+# with a stride-1 stem and no maxpool; feeding it 224px input works, produces a
+# 56x56 final feature map, runs ~40x slower than intended and is not the
+# architecture anyone means. It would not error -- which is why the check has to
+# be explicit (see `build_model`).
 ZOO: Dict[str, Dict[str, Any]] = {
+    # ---------------------------------------------------------- CIFAR, 32 px
     "resnet20":     dict(family="resnet", builder=("resnet", dict(depth=20, width_mult=1))),
     "resnet56":     dict(family="resnet", builder=("resnet", dict(depth=56, width_mult=1))),
     "resnet110":    dict(family="resnet", builder=("resnet", dict(depth=110, width_mult=1))),
@@ -2599,20 +3168,86 @@ ZOO: Dict[str, Dict[str, Any]] = {
     "convnext_femto": dict(family="convnext", builder=("convnext_femto", dict())),
     "vit_tiny":     dict(family="vit",    builder=("vit_tiny", dict())),
     "mixer_nano":   dict(family="mixer",  builder=("mixer_nano", dict())),
+
+    # ---------------------------------------------------- ImageNet-100, 224 px
+    # Eight architectures crossing the CNN/attention boundary four different
+    # ways. See 20_IN100_PORT_PLAN.md 1 for what each one isolates.
+    "resnet50":     dict(zoo="imagenet", family="resnet",
+                         builder=("resnet_in", dict(depth=50))),
+    "resnet18":     dict(zoo="imagenet", family="resnet",
+                         builder=("resnet_in", dict(depth=18))),
+    "vgg16":        dict(zoo="imagenet", family="vgg",
+                         builder=("vgg_in", dict(depth=16))),
+    "shufflenetv2_in": dict(zoo="imagenet", family="mobile",
+                            builder=("shufflenetv2_in", dict(width="1.0x"))),
+    # vit_small_p16 and deit_small are THE SAME BUILDER WITH THE SAME ARGUMENTS.
+    # They differ only in base_config's recipe. That is the point: it makes the
+    # comparison an experiment about training rather than about geometry, and
+    # building them from one function is what stops them silently diverging.
+    "vit_small_p16": dict(zoo="imagenet", family="vit",
+                          builder=("vit_small", dict())),
+    "deit_small":   dict(zoo="imagenet", family="vit",
+                         builder=("vit_small", dict())),
+    "swin_tiny":    dict(zoo="imagenet", family="swin",
+                         builder=("swin_tiny", dict())),
+    "convnext_tiny": dict(zoo="imagenet", family="convnext",
+                          builder=("convnext_tiny", dict())),
 }
+for _a, _m in ZOO.items():
+    _m.setdefault("zoo", "cifar")
+
+# `shufflenetv2` is the one architecture present in BOTH studies, which makes it
+# the only direct CIFAR<->ImageNet bridge in the design: whatever its ImageNet
+# rho_seed turns out to be, the DIFFERENCE from its CIFAR 0.6698 is a
+# measurement of what dataset scale does to this statistic with architecture
+# held exactly fixed. It calibrates every other comparison. The registry keys
+# have to differ because the two builds are different networks (stride-1 stem
+# vs stride-2 + maxpool), so the alias records that they are the same design.
+CROSS_STUDY_ALIAS = {"shufflenetv2_in": "shufflenetv2"}
 
 # Architectures that need the DeiT-style recipe (AdamW, long warmup, strong
-# augmentation, label smoothing). SGD flatlines these on CIFAR from scratch --
-# the same failure E2AM documented for ConvNeXtV2 under SGD.
-TRANSFORMER_LIKE = {"vit_tiny", "mixer_nano", "convnext_femto"}
+# augmentation, label smoothing). SGD flatlines these from scratch -- the same
+# failure E2AM documented for ConvNeXtV2 under SGD.
+TRANSFORMER_LIKE = {"vit_tiny", "mixer_nano", "convnext_femto",
+                    "vit_small_p16", "deit_small", "swin_tiny", "convnext_tiny"}
+
+# The DeiT arm of the recipe control: strong augmentation on top of AdamW.
+DEIT_RECIPE = {"deit_small"}
 
 
-def build_model(arch: str, num_classes: int = 100, **overrides):
+def zoo_for_dataset(dataset: str) -> List[str]:
+    """Every architecture belonging to this dataset's zoo, in registry order."""
+    want = dataset_spec(dataset)["zoo"]
+    return [a for a, m in ZOO.items() if m.get("zoo", "cifar") == want]
+
+
+def build_model(arch: str, num_classes: Optional[int] = None,
+                dataset: Optional[str] = None, **overrides):
+    """Build a backbone.
+
+    `dataset`, when given, is CHECKED rather than merely used for defaults. A
+    CIFAR `resnet20` fed 224px input does not raise -- it produces a 56x56 final
+    feature map, runs about forty times slower than intended, and trains to a
+    plausible-looking accuracy. That is the D-33 shape: a configuration that is
+    wrong and silent. So the mismatch is refused here, where it costs one line.
+    """
     if not _TORCH_OK:
         raise RuntimeError(f"torch unavailable: {_TORCH_ERR}")
     if arch not in ZOO:
         raise KeyError(f"unknown architecture '{arch}'. Known: {sorted(ZOO)}")
-    kind, kwargs = ZOO[arch]["builder"]
+    meta = ZOO[arch]
+    if dataset is not None:
+        want = dataset_spec(dataset)["zoo"]
+        if meta.get("zoo", "cifar") != want:
+            raise ValueError(
+                f"'{arch}' belongs to the '{meta.get('zoo','cifar')}' zoo but "
+                f"dataset '{dataset}' needs the '{want}' zoo. Available: "
+                f"{zoo_for_dataset(dataset)}")
+        if num_classes is None:
+            num_classes = num_classes_for(dataset)
+    num_classes = int(num_classes if num_classes is not None else 100)
+
+    kind, kwargs = meta["builder"]
     kwargs = dict(kwargs)
     kwargs.update(overrides)
     fn = {
@@ -2620,6 +3255,11 @@ def build_model(arch: str, num_classes: int = 100, **overrides):
         "mobilenetv2": build_mobilenetv2, "shufflenetv2": build_shufflenetv2,
         "convnext_femto": build_convnext_femto, "vit_tiny": build_vit_tiny,
         "mixer_nano": build_mixer_nano,
+        # ImageNet-100
+        "resnet_in": build_resnet_imagenet, "vgg_in": build_vgg_imagenet,
+        "shufflenetv2_in": build_shufflenetv2_imagenet,
+        "convnext_tiny": build_convnext_tiny, "vit_small": build_vit_small,
+        "swin_tiny": build_swin_tiny,
     }[kind]
     return fn(num_classes=num_classes, **kwargs)
 
@@ -2714,15 +3354,26 @@ def _analytic_flops(model, shape) -> int:
     return int(total[0])
 
 
-def measure_flops(model, input_shape=(1, 3, 32, 32)) -> int:
+def measure_flops(model, shape) -> int:
+    """FLOPs at `shape`. The shape is REQUIRED and has no default.
+
+    It used to default to `(1, 3, 32, 32)`, which was correct for every caller
+    right up to the moment a second dataset existed. A default that is silently
+    wrong produces a budget table that is internally consistent, plausible, and
+    describes a network nobody trained -- and rho is a ratio, so the error does
+    not even show up as an implausible magnitude. Callers now go through
+    `input_shape(dataset)`.
+    """
+    if not (isinstance(shape, (tuple, list)) and len(shape) == 4):
+        raise ValueError(f"measure_flops needs a 4-tuple (B,C,H,W), got {shape!r}")
     name, fn, _ = _get_profiler()
     model = model.eval()
     try:
         if fn is not None:
-            return int(fn(model, input_shape))
+            return int(fn(model, tuple(shape)))
     except Exception as e:
         log(f"profiler {name} failed ({str(e)[:80]}); using analytic fallback", "FLOP")
-    return _analytic_flops(model, input_shape)
+    return _analytic_flops(model, tuple(shape))
 
 
 if _TORCH_OK:
@@ -2743,8 +3394,8 @@ if _TORCH_OK:
             return self.head(f)
 
 
-def build_budget_table(arch: str, num_classes: int = 100,
-                       resolutions: Sequence[int] = RESOLUTIONS,
+def build_budget_table(arch: str, dataset: str, num_classes: Optional[int] = None,
+                       resolutions: Optional[Sequence[int]] = None,
                        depth_fractions: Sequence[float] = DEPTH_FRACTIONS,
                        precisions: Sequence[str] = PRECISIONS,
                        model=None) -> Dict[str, Any]:
@@ -2753,12 +3404,25 @@ def build_budget_table(arch: str, num_classes: int = 100,
     Measured once per architecture, written to budgets/{arch}.json, and never
     recomputed -- a budget table that drifts between sessions makes MSC values
     from different sessions incomparable.
+
+    `dataset` is required and supplies the input resolution, the class count and
+    the resolution grid. Nothing here spells a shape.
     """
-    model = model if model is not None else build_model(arch, num_classes)
+    spec = dataset_spec(dataset)
+    num_classes = int(num_classes if num_classes is not None else spec["num_classes"])
+    resolutions = tuple(resolutions if resolutions is not None else spec["resolutions"])
+    res0 = int(spec["native_res"])
+    if resolutions[-1] != res0:
+        raise ValueError(
+            f"{dataset}: the resolution grid must terminate at the native "
+            f"resolution ({res0}) so rho_res reaches exactly 1.0; got {resolutions}")
+
+    model = model if model is not None else build_model(arch, num_classes,
+                                                        dataset=dataset)
     model = model.eval().cpu()
     prof_name, _, prof_ver = _get_profiler()
 
-    full = measure_flops(model, (1, 3, 32, 32))
+    full = measure_flops(model, input_shape(dataset))
 
     # --- depth: prefix cost + a linear exit head -------------------------
     # K comes from the MODEL, not the global constant: a shallow backbone
@@ -2769,7 +3433,8 @@ def build_budget_table(arch: str, num_classes: int = 100,
     for k in range(len(feat_dims)):
         head = ExitHead(feat_dims[k], num_classes,
                         token_model=getattr(model, "is_token_model", False)).eval()
-        depth_flops.append(measure_flops(_PrefixWrapper(model, k, head), (1, 3, 32, 32)))
+        depth_flops.append(measure_flops(_PrefixWrapper(model, k, head),
+                                         input_shape(dataset)))
     depth_rho = [f / depth_flops[-1] for f in depth_flops]
     if not all(depth_rho[i] < depth_rho[i + 1] for i in range(len(depth_rho) - 1)):
         # The oracle needs strictly ascending costs; equal budgets make "the
@@ -2789,20 +3454,43 @@ def build_budget_table(arch: str, num_classes: int = 100,
     # We measure native where possible and always measure proxy, so the
     # resolution axis is defined uniformly across the whole zoo -- which is what
     # makes a cross-architecture comparison on this axis legitimate at all.
-    native_ok = bool(getattr(model, "supports_native_resolution", True))
-    res_flops, native_err = [], None
-    if native_ok:
-        try:
-            res_flops = [measure_flops(model, (1, 3, r, r)) for r in resolutions]
-        except Exception as e:
-            native_ok, native_err = False, f"{type(e).__name__}: {str(e)[:160]}"
-            log(f"{arch} cannot run at non-32px input ({native_err}); "
-                f"resolution axis will use the proxy only", "FLOP")
-    if not res_flops:
-        # Analytic stand-in: cost scales with pixel count for a convolutional
-        # network and with token count for a patch model -- both quadratic in r.
-        res_flops = [int(full * (r / 32.0) ** 2) for r in resolutions]
+    #
+    # Native support is probed PER RESOLUTION, not decided once for the whole
+    # axis. On CIFAR `supports_native_resolution` was a single boolean, and when
+    # MLP-Mixer failed (D-02) it took the entire axis with it. At 224px the
+    # failures are partial rather than total -- a Swin-T reduces its input by 32
+    # and its last stage is 7x7 at 224 but 3x3 at 96, which is smaller than its
+    # own attention window. Recording "this architecture manages 128-224 but not
+    # 96" is strictly more information than "this architecture is unsupported",
+    # and it costs one try/except per value.
+    declared = bool(getattr(model, "supports_native_resolution", True))
+    res_flops, native_ok_per_res, native_errs = [], [], {}
+    for r in resolutions:
+        f_r, ok = None, False
+        if declared:
+            try:
+                f_r, ok = measure_flops(model, input_shape(dataset, r)), True
+            except Exception as e:                              # noqa: BLE001
+                native_errs[str(r)] = f"{type(e).__name__}: {str(e)[:160]}"
+        if not ok:
+            # Analytic stand-in: cost scales with pixel count for a convolutional
+            # network and with token count for a patch model -- both quadratic in r.
+            f_r = int(full * (r / float(res0)) ** 2)
+        res_flops.append(int(f_r))
+        native_ok_per_res.append(bool(ok))
+    native_ok = all(native_ok_per_res)
+    if not native_ok:
+        bad = [r for r, o in zip(resolutions, native_ok_per_res) if not o]
+        log(f"{arch}: native resolution unavailable at {bad} "
+            f"({'declared unsupported' if not declared else 'probe failed'}); "
+            f"those entries use the analytic quadratic model. The PROXY sweep is "
+            f"primary for every architecture regardless (DC-3).", "FLOP")
     res_rho = [f / res_flops[-1] for f in res_flops]
+    if not all(res_rho[i] < res_rho[i + 1] for i in range(len(res_rho) - 1)):
+        raise ValueError(
+            f"{arch}: resolution costs are not strictly ascending: "
+            f"{[round(r, 4) for r in res_rho]}. MSC is undefined when two "
+            f"budgets cost the same (the D-01b failure, on a different axis).")
 
     # --- precision: analytic bit-operation accounting ---------------------
     # There is no INT4 kernel to time on a T4, so this axis is priced, not
@@ -2813,6 +3501,8 @@ def build_budget_table(arch: str, num_classes: int = 100,
 
     table = {
         "arch": arch,
+        "dataset": str(dataset),
+        "input_res": int(res0),
         "num_classes": int(num_classes),
         "full_flops": int(full),
         "profiler": {"name": prof_name, "version": prof_ver,
@@ -2840,7 +3530,8 @@ def build_budget_table(arch: str, num_classes: int = 100,
                 "flops": [int(f) for f in res_flops],
                 "rho": [float(r) for r in res_rho],
                 "native_supported": bool(native_ok),
-                "native_error": native_err,
+                "native_supported_per_res": list(native_ok_per_res),
+                "native_errors": native_errs,
                 "note": ("cost measured at NATIVE input size where the "
                          "architecture tolerates it; otherwise an analytic "
                          "quadratic-in-r model. The proxy sweep "
@@ -2861,16 +3552,59 @@ def build_budget_table(arch: str, num_classes: int = 100,
     return table
 
 
-def load_or_build_budgets(arch: str, data_dir, num_classes: int = 100,
+def budget_table_valid(table: Optional[Dict[str, Any]], arch: str,
+                       dataset: str, num_classes: Optional[int] = None
+                       ) -> Tuple[bool, str]:
+    """Is a CACHED budget table still the table we want?
+
+    Rule 5. `load_or_build_budgets` used to ask only "does the file exist and
+    have a full_flops key?", which was a correct question while one dataset
+    existed. It is the wrong question the moment a table can be stale for a
+    reason other than absence -- and a stale budget table is close to the worst
+    possible artifact, because rho is a ratio and a table built at 32px looks
+    entirely plausible when read at 224px. Every MSC value derived from it would
+    be a well-formed number describing a network nobody trained.
+
+    Returns (ok, reason). Deliberately conservative in the same direction as
+    `msckd_router_ok` (D-29): a table that predates this check has no `dataset`
+    key and is treated as UNKNOWN, which we rebuild rather than trust, because
+    rebuilding costs seconds and trusting costs the atlas.
+    """
+    if not table or not table.get("full_flops"):
+        return False, "absent or empty"
+    spec = dataset_spec(dataset)
+    want_res = int(spec["native_res"])
+    want_cls = int(num_classes if num_classes is not None else spec["num_classes"])
+    if table.get("arch") != arch:
+        return False, f"arch {table.get('arch')!r} != {arch!r}"
+    if "dataset" not in table or "input_res" not in table:
+        return False, "predates the dataset/input_res fields -- cannot be verified"
+    if str(table.get("dataset")) != str(dataset):
+        return False, f"built for dataset {table.get('dataset')!r}, want {dataset!r}"
+    if int(table.get("input_res", -1)) != want_res:
+        return False, (f"built at {table.get('input_res')}px, want {want_res}px")
+    if int(table.get("num_classes", -1)) != want_cls:
+        return False, (f"built for {table.get('num_classes')} classes, want {want_cls}")
+    got_r = list(table.get("axes", {}).get("resolution", {}).get("values", []))
+    if got_r != list(spec["resolutions"]):
+        return False, f"resolution grid {got_r} != {list(spec['resolutions'])}"
+    return True, "ok"
+
+
+def load_or_build_budgets(arch: str, data_dir, dataset: str,
+                          num_classes: Optional[int] = None,
                           hub: Optional[MSCHub] = None, force: bool = False,
                           model=None) -> Dict[str, Any]:
     p = Path(data_dir) / "budgets" / f"{arch}.json"
     if p.exists() and not force:
         t = read_json(p)
-        if t and t.get("full_flops"):
+        ok, why = budget_table_valid(t, arch, dataset, num_classes)
+        if ok:
             return t
-    log(f"measuring FLOPs budget for {arch}", "FLOP")
-    t = build_budget_table(arch, num_classes, model=model)
+        log(f"cached budget table for {arch} is INVALID ({why}) -- rebuilding", "FLOP")
+    log(f"measuring FLOPs budget for {arch} on {dataset} "
+        f"@{native_res(dataset)}px", "FLOP")
+    t = build_budget_table(arch, dataset, num_classes, model=model)
     atomic_write_json(p, t)
     if hub is not None and hub.enabled:
         hub.hub.enqueue(p, f"budgets/{arch}.json")
@@ -3342,6 +4076,116 @@ def run_meta(run_id: str, ledger_entry: Optional[Dict[str, Any]] = None
     return meta
 
 
+# =============================================================================
+# The ImageNet-100 recipe
+# =============================================================================
+# ONE epoch count for all eight architectures. This is the pre-registered
+# choice, and it is the weaker of the two options -- matching accuracy would
+# break the family/accuracy confound outright, and equal epochs does not.
+#
+# What it does buy is that SCHEDULE LENGTH stops being a third confounded
+# variable. On CIFAR the three modern architectures trained for 300 epochs and
+# the CNNs for 240, so family, accuracy and schedule moved together and the
+# lab notebook had to say so (1.2, "schedule length is not the difference
+# either" rested on convnext_femto alone). Here it is held exactly constant.
+#
+# The accuracy confound is reported, not engineered away, and the 2x2 in
+# 20_IN100_PORT_PLAN.md 1 is what carries the argument instead: if swin_tiny
+# lands at CNN-level reliability while sitting at ViT-level accuracy, the
+# accuracy explanation is dead regardless of the marginal means.
+IN100_EPOCHS = 100          # the single lever if the GPU budget binds
+IN100_BATCH = 128           # fits 20 GB VRAM for every architecture in the zoo
+IN100_REF_BATCH = 256       # LR is scaled linearly from this reference
+
+
+def _imagenet_config(arch: str, dataset: str, seed: int, phase: str,
+                     method: str, **overrides) -> Dict[str, Any]:
+    spec = dataset_spec(dataset)
+    transformer = arch in TRANSFORMER_LIKE
+    deit = arch in DEIT_RECIPE
+    bs = int(overrides.get("batch_size", IN100_BATCH))
+
+    if transformer:
+        # AdamW at the DeiT reference (5e-4 per 512 images), scaled linearly.
+        lr = 5e-4 * bs / 512.0
+        wd = 0.05
+    else:
+        # SGD at the ImageNet reference (0.1 per 256 images), scaled linearly.
+        lr = 0.1 * bs / IN100_REF_BATCH
+        wd = 1e-4
+
+    cfg: Dict[str, Any] = {
+        "run_id": make_run_id(phase, arch, dataset, method, seed),
+        "phase": phase, "arch": arch, "dataset_name": dataset, "method": method,
+        "seed": int(seed), "num_classes": int(spec["num_classes"]),
+        "family": ZOO.get(arch, {}).get("family", "unknown"),
+        "input_res": int(spec["native_res"]),
+
+        "num_epochs": IN100_EPOCHS,
+        "batch_size": bs,
+        "eval_batch_size": 256,
+        "optimizer": "adamw" if transformer else "sgd",
+        "learning_rate": float(lr),
+        "weight_decay": wd,
+        "momentum": 0.9,
+        "nesterov": not transformer,
+        "scheduler": "cosine",
+        "lr_milestones": [],
+        "lr_gamma": 0.1,
+        "warmup_epochs": 5,
+        "label_smoothing": 0.1,
+        "grad_clip_norm": 1.0 if transformer else 0.0,
+        "amp_enabled": True,
+        "gradient_accumulation_steps": 1,
+        "deterministic": False,
+        "channels_last": True,
+
+        # ---- the recipe contrast, and the ONLY thing that differs between
+        # ---- vit_small_p16 and deit_small ------------------------------------
+        # Same geometry, same optimiser, same LR, same weight decay, same
+        # schedule, same epochs. DeiT adds mixup/cutmix and a wider
+        # RandomResizedCrop. If seed-reliability differs across this pair, it is
+        # a property of training and not of attention -- which would reframe the
+        # CIFAR finding rather than confirm it.
+        "mixup_alpha": 0.8 if deit else 0.0,
+        "cutmix_alpha": 1.0 if deit else 0.0,
+        "rrc_scale": (0.08, 1.0) if deit else (0.35, 1.0),
+        "drop_path": 0.1 if deit else (0.05 if transformer else 0.0),
+
+        # Q4 instrumentation
+        "el2n_epoch": 10,
+        "train_holdout_n": 15000,
+
+        # exit heads: backbone frozen
+        "exit_epochs": 10,
+        "exit_lr": 0.01,
+
+        # infrastructure
+        "milestone_push_every_epochs": 5,
+        "timer_push_sec": 1800,
+        "session_limit_h": float(overrides.get("session_limit_h", 0.0)),
+        "cleanup_local_after_complete": False,
+        "energy_sample_hz": 10.0,
+        "carbon_intensity_kg_per_kwh": 0.475,
+        "force_rerun": False,
+        "msc_lib_version": __version__,
+    }
+    cfg.update(overrides)
+    cfg["config_hash"] = config_hash(cfg)
+    return cfg
+
+
+# No published from-scratch reference exists for this 100-class subset at this
+# recipe, so every entry is null and NO delta is claimed for anything. D-14 is
+# the cautionary case: `mobilenetv2`'s apparent +5.50 was against a half-width
+# baseline, and it was the largest margin in the CIFAR atlas. A reference
+# without a matching parameter count and recipe is unfalsifiable.
+REFERENCE_ACC_IN100: Dict[str, Optional[float]] = {
+    a: None for a in ("resnet50", "resnet18", "vgg16", "shufflenetv2_in",
+                      "vit_small_p16", "deit_small", "swin_tiny", "convnext_tiny")
+}
+
+
 def base_config(arch: str, dataset: str = "cifar100", seed: int = 1,
                 phase: str = "p1", method: str = "base", **overrides) -> Dict[str, Any]:
     """Standard CRD/DKD recipe for CNNs, DeiT-style recipe for token models.
@@ -3353,7 +4197,10 @@ def base_config(arch: str, dataset: str = "cifar100", seed: int = 1,
     model is meaningless, and an undertrained model is otherwise very hard to
     notice.
     """
-    n_classes = {"cifar100": 100, "cifar10": 10, "tinyimagenet": 200}[dataset]
+    if dataset_spec(dataset)["backend"] == "packed":
+        return _imagenet_config(arch, dataset, seed, phase, method, **overrides)
+
+    n_classes = num_classes_for(dataset)
     transformer = arch in TRANSFORMER_LIKE
 
     cfg: Dict[str, Any] = {
@@ -4674,7 +5521,7 @@ def msckd_router_ok(work, run_id: str, cfg: Dict[str, Any], data_out,
         stored = blob.get("rho")
         if not stored:
             return True, "checkpoint stores no rho"
-        b = load_or_build_budgets(cfg["arch"], data_out,
+        b = load_or_build_budgets(cfg["arch"], data_out, cfg["dataset_name"],
                                   int(cfg["num_classes"]), hub=hub)
         want = len(b["axes"]["depth"]["rho"])
     except Exception as e:                                   # noqa: BLE001
@@ -5311,9 +6158,10 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     # --- completion -------------------------------------------------------
     final = evaluate(model, val_loader, device, amp, criterion)
     _write_dynamics(L["per_sample"], dynamics)
-    budgets = load_or_build_budgets(cfg["arch"], data_out, cfg["num_classes"],
-                                    hub=hub, model=build_model(cfg["arch"],
-                                                               cfg["num_classes"]))
+    budgets = load_or_build_budgets(
+        cfg["arch"], data_out, cfg["dataset_name"], cfg["num_classes"], hub=hub,
+        model=build_model(cfg["arch"], cfg["num_classes"],
+                          dataset=cfg["dataset_name"]))
 
     summary = {
         "run_id": run_id, "arch": cfg["arch"], "family": cfg["family"],
@@ -5522,21 +6370,27 @@ def fake_quantized(model, bits: int, per_channel: bool = True):
                     p.copy_(saved[name])
 
 
-def _resize_proxy(x, r: int):
-    """Downsample to r then back to 32. Information content drops; shape does not.
+def _resize_proxy(x, r: int, native: Optional[int] = None):
+    """Downsample to r then back up. Information content drops; shape does not.
 
-    Idealised cost: the network really runs at 32px, so the FLOPs we attribute
-    are those of a native-r run. Labelled as such everywhere.
+    Idealised cost: the network really runs at its native resolution, so the
+    FLOPs attributed are those of a native-r run. Labelled as such everywhere.
+
+    `native` defaults to whatever the incoming tensor already is, which is the
+    only value that can be right without being told -- the old version restored
+    to a literal 32 and would have silently reshaped every ImageNet batch to
+    thumbnail size while reporting full-resolution costs.
     """
-    if r == x.shape[-1]:
+    n = int(native if native is not None else x.shape[-1])
+    if r == n and r == x.shape[-1]:
         return x
     small = F.interpolate(x, size=(r, r), mode="bilinear", align_corners=False)
-    return F.interpolate(small, size=(32, 32), mode="bilinear", align_corners=False)
+    return F.interpolate(small, size=(n, n), mode="bilinear", align_corners=False)
 
 
 @_no_grad()
 def sweep_all_axes(cfg: Dict[str, Any], multi_exit, loader, device,
-                   resolutions: Sequence[int] = RESOLUTIONS,
+                   resolutions: Optional[Sequence[int]] = None,
                    precisions: Sequence[str] = PRECISIONS,
                    amp: bool = True, show_progress: bool = True) -> Dict[str, np.ndarray]:
     """Run every configuration on every sample and return the full grid.
@@ -5551,6 +6405,14 @@ def sweep_all_axes(cfg: Dict[str, Any], multi_exit, loader, device,
     multi_exit.eval()
     backbone = multi_exit.backbone
     n_depth = len(multi_exit.heads)
+    # The grid and the native resolution come from the dataset, never from a
+    # module-level constant -- `RESOLUTIONS` is CIFAR's grid and using it here
+    # would sweep an ImageNet model over 16-32px inputs while the budget table
+    # priced 96-224px. Both halves would be internally consistent.
+    dsname = str(cfg.get("dataset_name", "cifar100"))
+    resolutions = tuple(resolutions if resolutions is not None
+                        else resolutions_for(dsname))
+    res0 = native_res(dsname)
 
     def _collect(fn, k: int, tag: str):
         P = np.zeros((0, k), dtype=np.int16)
@@ -5606,8 +6468,9 @@ def sweep_all_axes(cfg: Dict[str, Any], multi_exit, loader, device,
         def native_fn(x):
             outs = []
             for r in resolutions:
-                xr = x if r == 32 else F.interpolate(x, size=(r, r), mode="bilinear",
-                                                     align_corners=False)
+                xr = x if r == res0 else F.interpolate(x, size=(r, r),
+                                                       mode="bilinear",
+                                                       align_corners=False)
                 outs.append(backbone(xr))
             return outs
         try:
@@ -5617,15 +6480,15 @@ def sweep_all_axes(cfg: Dict[str, Any], multi_exit, loader, device,
             log(f"native-resolution sweep failed ({type(e).__name__}: "
                 f"{str(e)[:120]}); proxy only for this model", "ORACLE")
     else:
-        log("architecture cannot run at non-32px input -- resolution axis "
-            "measured with the proxy only", "ORACLE")
+        log(f"architecture cannot run at non-{res0}px input -- resolution axis "
+            f"measured with the proxy only", "ORACLE")
 
     # --- resolution, proxy -------------------------------------------------
     # Option (b): downsample-then-upsample, network shape unchanged, only
     # information content varies. Measuring both converts a methodological
     # wrinkle a reviewer would raise into a robustness check we already ran.
     def proxy_fn(x):
-        return [backbone(_resize_proxy(x, r)) for r in resolutions]
+        return [backbone(_resize_proxy(x, r, res0)) for r in resolutions]
     p, a, b, _, _ = _collect(proxy_fn, len(resolutions), "res-proxy")
     out["res_proxy"] = {"preds": p, "top1p": a, "top2p": b}
 
@@ -5808,7 +6671,8 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     sync.push_models(heavy=True)
 
     # --- budgets -----------------------------------------------------------
-    budgets = load_or_build_budgets(cfg["arch"], data_out, cfg["num_classes"], hub=hub)
+    budgets = load_or_build_budgets(cfg["arch"], data_out, cfg["dataset_name"],
+                                    cfg["num_classes"], hub=hub)
 
     # --- final evaluation (requirement 15.2) -------------------------------
     # Folded in here rather than given its own notebook: the checkpoint is
@@ -5852,10 +6716,12 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
             "Q4's battery is incomplete without them.", "WARN")
 
     # --- sweeps ------------------------------------------------------------
+    _res_grid = resolutions_for(cfg["dataset_name"])
     results = {}
     for split, loader in (("test", val_loader), ("train_holdout", holdout_loader)):
         log(f"sweeping {split} ({len(loader.dataset)} samples, "
-            f"{len(me.heads)}+{len(RESOLUTIONS)}x2+{len(PRECISIONS)} configs)", "ORACLE")
+            f"{len(me.heads)}+{len(_res_grid)}x2+{len(PRECISIONS)} configs "
+            f"@{native_res(cfg['dataset_name'])}px)", "ORACLE")
         sweep = sweep_all_axes(cfg, me, loader, device, show_progress=show_progress)
         battery = difficulty_battery(backbone, loader, device)
         try:
@@ -5891,7 +6757,9 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
             "dataset": cfg["dataset_name"], "seed": cfg["seed"],
             "sample_order_hash": order_hash, "config_hash": cfg["config_hash"],
             "budgets": budgets["axes"], "full_flops": budgets["full_flops"],
-            "exit_count": len(me.heads), "resolutions": list(RESOLUTIONS),
+            "exit_count": len(me.heads), "resolutions": list(_res_grid),
+            "input_res": native_res(cfg["dataset_name"]),
+            "data_fingerprint": cfg.get("data_fingerprint", NA),
             "precisions": list(PRECISIONS), "tau_grid": list(TAU_GRID),
             "created_utc": now_iso(), "msc_lib_version": __version__}
     atomic_write_json(ps_dir / "meta.json", meta)
@@ -6907,7 +7775,8 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     train_loader, val_loader, holdout_loader, classes, order_hash = build_loaders(cfg)
 
     # --- teacher ---------------------------------------------------------
-    t_budgets = load_or_build_budgets(teacher_arch, data_out, cfg["num_classes"], hub=hub)
+    t_budgets = load_or_build_budgets(teacher_arch, data_out, cfg["dataset_name"],
+                                      cfg["num_classes"], hub=hub)
     tL = run_layout(work, teacher_run)
     t_dir = tL["base"]
     t_ck = tL["checkpoints"] / "ckpt_best.pt"
@@ -7016,8 +7885,8 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     #
     # The teacher's MSC is a scalar fraction in [0, 1]; `sufficiency_targets`
     # projects it onto whichever grid it is given. Give it the student's.
-    s_budgets = load_or_build_budgets(cfg["arch"], data_out, cfg["num_classes"],
-                                      hub=hub)
+    s_budgets = load_or_build_budgets(cfg["arch"], data_out, cfg["dataset_name"],
+                                      cfg["num_classes"], hub=hub)
     rho_student = list(s_budgets["axes"]["depth"]["rho"])
     if len(rho_student) != len(rho_list):
         log(f"student {cfg['arch']} has {len(rho_student)} depth budgets vs the "
@@ -7344,7 +8213,13 @@ class Session:
 
     # ------------------------------------------------------------------
     def prepare_data(self) -> Path:
-        self.data_root = locate_cifar100()
+        if dataset_spec(self.dataset)["backend"] == "packed":
+            self.data_root = locate_imagenet100()
+            man = read_json(self.data_root / "manifest.json", {}) or {}
+            self.data_fingerprint = str(man.get("fingerprint", ""))
+        else:
+            self.data_root = locate_cifar100()
+            self.data_fingerprint = ""
         return self.data_root
 
     def config(self, arch: str, seed: int = 1, method: str = "base",
@@ -7354,6 +8229,13 @@ class Session:
         cfg = base_config(arch, self.dataset, seed, phase=self.phase, method=method)
         cfg.update({"data_root": str(self.data_root),
                     "output_root": str(self.work)})
+        # The fingerprint is set BEFORE overrides and BEFORE the hash, because
+        # it must participate in config_hash: two runs that disagree about which
+        # images are `val` produce per-sample tables that align by index and
+        # compare different pictures. See 25_IN100_DATA_CARD.md 4.
+        fp = getattr(self, "data_fingerprint", "")
+        if fp:
+            cfg["data_fingerprint"] = fp
         cfg.update(overrides)
         # Recompute after overrides -- an override that changes the recipe must
         # change the hash, or resume will happily continue under the new one.
@@ -7659,8 +8541,9 @@ class Session:
         return run_oracle(cfg, self.hub, self.registry,
                           work_root=self.work, data_root_out=self.data_dir, **kw)
 
-    def budgets(self, arch: str, num_classes: int = 100) -> Dict[str, Any]:
-        return load_or_build_budgets(arch, self.data_dir, num_classes, hub=self.hub)
+    def budgets(self, arch: str, num_classes: Optional[int] = None) -> Dict[str, Any]:
+        return load_or_build_budgets(arch, self.data_dir, self.dataset,
+                                     num_classes, hub=self.hub)
 
     # ------------------------------------------------------------------
     def _flush_all(self, reason: str) -> None:
@@ -7921,7 +8804,13 @@ def preflight(session: "Session", archs: Optional[Sequence[str]] = None,
     not match the exit heads, a missing HF write scope, a budget table whose
     deepest exit does not equal the full model.
     """
-    report: Dict[str, Any] = {"checked_utc": now_iso(), "checks": {}}
+    _ds = getattr(session, "dataset", "cifar100")
+    _grid = resolutions_for(_ds)
+    _res0 = native_res(_ds)
+    _ncls = num_classes_for(_ds)
+    report: Dict[str, Any] = {"checked_utc": now_iso(), "dataset": _ds,
+                              "input_res": _res0, "resolution_grid": list(_grid),
+                              "checks": {}}
 
     def rec(name, ok, detail=""):
         report["checks"][name] = {"ok": bool(ok), "detail": str(detail)}
@@ -7945,28 +8834,29 @@ def preflight(session: "Session", archs: Optional[Sequence[str]] = None,
 
     try:
         root = session.prepare_data()
-        rec("CIFAR-100 present", _has_cifar100(root), str(root))
+        ok, detail = data_present(_ds, root)
+        rec(f"{_ds} present", ok, detail)
     except Exception as e:
-        rec("CIFAR-100 present", False, str(e)[:160])
+        rec(f"{_ds} present", False, str(e)[:160])
 
     if _TORCH_OK and archs:
         dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         for a in archs:
             try:
-                m = build_model(a, 100).to(dev)
-                x = torch.randn(4, 3, 32, 32, device=dev)
+                m = build_model(a, _ncls, dataset=_ds).to(dev)
+                x = torch.randn(4, 3, _res0, _res0, device=dev)
                 out = m(x)
                 feats = m.forward_features(x)
                 pref = m.forward_prefix(x, 0)
                 # An exit head must actually attach, which is where a token
                 # model with an unexpected feature rank would blow up.
-                head = ExitHead(m.feature_dims[0], 100,
+                head = ExitHead(m.feature_dims[0], _ncls,
                                 getattr(m, "is_token_model", False)).to(dev)
                 _ = head(pref)
                 loss = out.sum()
                 loss.backward()
                 K = len(feats)
-                rec(f"model {a}", out.shape == (4, 100) and 2 <= K <= len(DEPTH_FRACTIONS),
+                rec(f"model {a}", out.shape == (4, _ncls) and 2 <= K <= len(DEPTH_FRACTIONS),
                     f"{count_parameters(m)/1e6:.2f}M params, K={K}, "
                     f"dims={m.feature_dims}, cuts={m.stage_cuts}")
 
@@ -7977,21 +8867,26 @@ def preflight(session: "Session", archs: Optional[Sequence[str]] = None,
                 native = bool(getattr(m, "supports_native_resolution", True))
                 if native:
                     bad_r = []
-                    for r in RESOLUTIONS:
+                    for r in _grid:
                         try:
                             m(torch.randn(2, 3, r, r, device=dev))
                         except Exception as e:
                             bad_r.append(f"{r}px:{type(e).__name__}")
+                    # A partial failure is recorded, not fatal: the budget table
+                    # probes per resolution too, and the PROXY sweep is primary
+                    # for every architecture (DC-3). What must never happen is
+                    # the failure going unrecorded.
                     rec(f"native resolutions {a}", not bad_r,
-                        f"runs at {list(RESOLUTIONS)}" if not bad_r
-                        else f"FAILS at {bad_r}")
+                        f"runs at {list(_grid)}" if not bad_r
+                        else f"FAILS at {bad_r} -- those entries fall back to the "
+                             f"analytic cost model; proxy sweep unaffected")
                 else:
                     rec(f"native resolutions {a}", True,
                         "not supported by design -- resolution axis uses the "
                         "proxy (documented limitation)")
 
                 if not quick:
-                    b = build_budget_table(a, 100, model=m.cpu())
+                    b = build_budget_table(a, _ds, _ncls, model=m.cpu())
                     d = b["axes"]["depth"]
                     rho = d["rho"]
                     strictly_up = all(rho[i] < rho[i + 1] for i in range(len(rho) - 1))
@@ -8163,6 +9058,21 @@ def _selftest() -> bool:
         ok &= bool(cond)
         d = str(detail)
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {d}" if d else ""))
+
+    def _raises(fn, exc=Exception) -> bool:
+        """Assert a call fails, and fails with the RIGHT exception.
+
+        Bare `except Exception` would let a typo inside the lambda pass as a
+        successful negative test -- the D-06 shape, a test that cannot fail for
+        the right reason.
+        """
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:                                       # noqa: BLE001
+            return False
+        return False
 
     print("utils")
     tmp = Path(SCRATCH_ROOT) / "msc_selftest"
@@ -9157,10 +10067,104 @@ def _selftest() -> bool:
           phase0_decision(0.7, 0.8, 0.1)["decision"] == "FULL-PROGRAM")
 
     print("zoo registry")
-    check("15 architectures registered", len(ZOO) == 15, f"{len(ZOO)}")
+    # The count is derived, not asserted against a literal. The previous
+    # version pinned `len(ZOO) == 15` and failed the moment a second dataset's
+    # architectures were registered -- rule 2's failure mode inside the test
+    # written to enforce rule 2.
+    check("CIFAR zoo has its 15 architectures",
+          len(zoo_for_dataset("cifar100")) == 15,
+          f"{len(zoo_for_dataset('cifar100'))}")
+    check("ImageNet zoo has its 8 architectures",
+          len(zoo_for_dataset("imagenet100")) == 8,
+          f"{sorted(zoo_for_dataset('imagenet100'))}")
+    check("every entry declares a zoo", all("zoo" in v for v in ZOO.values()))
+    check("the two zoos are disjoint",
+          not (set(zoo_for_dataset("cifar100")) & set(zoo_for_dataset("imagenet100"))))
     check("families cover the H3 ordering",
           {"resnet", "wrn", "vgg", "mobile", "vit", "mixer"}
           <= {v["family"] for v in ZOO.values()})
+
+    # --- the ImageNet-100 design, checked as a design -----------------------
+    _in = set(zoo_for_dataset("imagenet100"))
+    check("ImageNet zoo crosses the boundary four ways",
+          {"resnet50", "vit_small_p16", "swin_tiny", "convnext_tiny"} <= _in,
+          "resnet50/vit (pure corners) + swin/convnext (mixed) is the 2x2 that "
+          "separates 'attention' from 'weak spatial prior'")
+    check("vit_small_p16 and deit_small are built by ONE builder with ONE "
+          "argument set",
+          ZOO["vit_small_p16"]["builder"] == ZOO["deit_small"]["builder"],
+          "identical geometry is what makes the recipe contrast mean 'recipe'")
+    check("...and differ in recipe",
+          (base_config("deit_small", "imagenet100")["mixup_alpha"] > 0)
+          and (base_config("vit_small_p16", "imagenet100")["mixup_alpha"] == 0),
+          "deit arm carries mixup/cutmix; the vit arm does not")
+    check("...and are otherwise the same recipe",
+          all(base_config("deit_small", "imagenet100")[k]
+              == base_config("vit_small_p16", "imagenet100")[k]
+              for k in ("num_epochs", "batch_size", "optimizer", "learning_rate",
+                        "weight_decay", "scheduler", "warmup_epochs")),
+          "epochs, optimiser, LR, wd, schedule and warmup all held fixed")
+    check("shufflenetv2 is the CIFAR<->ImageNet bridge",
+          CROSS_STUDY_ALIAS.get("shufflenetv2_in") == "shufflenetv2"
+          and "shufflenetv2" in zoo_for_dataset("cifar100"),
+          "the only architecture measured in both studies")
+    check("equal epochs across the whole ImageNet zoo",
+          len({base_config(a, "imagenet100")["num_epochs"] for a in _in}) == 1,
+          f"{sorted({base_config(a,'imagenet100')['num_epochs'] for a in _in})} "
+          f"-- schedule length is held constant so it cannot join accuracy and "
+          f"family as a third confounded variable, which is what happened on "
+          f"CIFAR (240 vs 300 epochs)")
+
+    print("dataset registry")
+    check("cifar100 native resolution", native_res("cifar100") == 32)
+    check("imagenet100 native resolution", native_res("imagenet100") == 224)
+    check("unknown dataset raises rather than defaulting",
+          _raises(lambda: dataset_spec("imagenet1k"), KeyError))
+    check("every resolution grid terminates at native",
+          all(resolutions_for(d)[-1] == native_res(d) for d in DATASETS),
+          "otherwise rho_res never reaches exactly 1.0")
+    check("every resolution grid is strictly ascending",
+          all(all(g[i] < g[i + 1] for i in range(len(g) - 1))
+              for g in (resolutions_for(d) for d in DATASETS)))
+    check("ImageNet grid is divisible by 32 at every point",
+          all(r % 32 == 0 for r in resolutions_for("imagenet100")),
+          f"{list(resolutions_for('imagenet100'))} -- required by ViT-S/16's "
+          f"patch grid AND Swin-T's four-stage /32 reduction. 224 x the CIFAR "
+          f"fractions gives 140 and 196, which satisfy neither.")
+    check("input_shape never needs a literal",
+          input_shape("imagenet100") == (1, 3, 224, 224)
+          and input_shape("cifar100") == (1, 3, 32, 32)
+          and input_shape("imagenet100", 96) == (1, 3, 96, 96))
+    check("measure_flops refuses to guess a shape",
+          _raises(lambda: measure_flops(None, None), ValueError),
+          "it used to default to (1,3,32,32), which was right until it wasn't")
+
+    print("budget table validity (rule 5)")
+    _good = {"arch": "resnet50", "dataset": "imagenet100", "input_res": 224,
+             "num_classes": 100, "full_flops": 4_100_000_000,
+             "axes": {"resolution": {"values": list(resolutions_for("imagenet100"))}}}
+    check("a matching table is accepted",
+          budget_table_valid(_good, "resnet50", "imagenet100")[0])
+    check("a table built at the wrong resolution is REJECTED",
+          not budget_table_valid({**_good, "input_res": 32},
+                                 "resnet50", "imagenet100")[0],
+          "rho is a ratio, so a 32px table read at 224px yields well-formed "
+          "numbers describing a network nobody trained")
+    check("a table built for the wrong dataset is rejected",
+          not budget_table_valid({**_good, "dataset": "cifar100"},
+                                 "resnet50", "imagenet100")[0])
+    check("a table with the wrong resolution grid is rejected",
+          not budget_table_valid(
+              {**_good, "axes": {"resolution": {"values": [16, 20, 24, 28, 32]}}},
+              "resnet50", "imagenet100")[0])
+    check("a table predating the check is rejected, not trusted",
+          not budget_table_valid({"arch": "resnet50", "full_flops": 1},
+                                 "resnet50", "imagenet100")[0],
+          "presence is not validity -- the D-29 lesson, applied to budgets")
+    check("a table for another arch is rejected",
+          not budget_table_valid(_good, "resnet18", "imagenet100")[0])
+    check("absence is reported as absence", not budget_table_valid(
+        None, "resnet50", "imagenet100")[0])
     if _TORCH_OK:
         for a in ("resnet20", "vgg8", "vit_tiny", "mixer_nano"):
             try:
