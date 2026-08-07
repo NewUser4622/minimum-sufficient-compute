@@ -158,8 +158,10 @@ It must check, for **every one of the eight architectures**:
 | an `ExitHead` attaches to every feature | a rank or layout mismatch — Swin's blocks speak NHWC |
 | runs natively at **96, 128, 160, 192, 224** | **the expected partial failure**: Swin-T reduces by 32, so its last stage is 3×3 at 96px, smaller than its own attention window |
 | depth ρ strictly ascending, distinct, ending at 1.0 | D-01b — MSC is undefined when two budgets cost the same |
-| HF token has **write** scope, verified by pushing and re-listing | nine hours of training with nowhere to save it |
+| the results root is **writable**, verified by writing and reading back | ten hours of training with nowhere to put it. This replaced the HF write-scope check, and it is the same check against a different store |
+| free disk ≥ the run matrix's estimated footprint | running out at run 19 of 24 |
 | kill-and-resume equivalence, post-seam per-epoch loss | D-06 |
+| **no network is reached** — sockets blocked for the whole preflight | a dependency that quietly fetches on first use, discovered on the day the machine is offline |
 
 **Expect `swin_tiny` to fail native resolution at 96px, possibly 128px.** That
 is a recorded fact about the architecture, not a bug — the budget table probes
