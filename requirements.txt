@@ -1,0 +1,53 @@
+# MSC — ImageNet-100, local + offline
+#
+# Install ONCE with internet. Everything after that runs with no network.
+# Verify with:  python tools/fetch_assets.py --verify-offline
+#
+# Versions are deliberately pinned by MINIMUM, not exactly, except where a
+# change would alter the science. Read the note under torchvision.
+
+# ---------------------------------------------------------------- required
+# torch: install the CUDA build FIRST, from pytorch.org, not from PyPI.
+# The RTX 4000 Ada is sm_89 (Ada Lovelace) and needs cu121 or newer:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# A CPU-only torch will import, pass the self-tests, and then train at roughly
+# 1/200th of the speed while reporting entirely plausible numbers. Check with
+#   python -c "import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+torch>=2.1
+# torchvision supplies resnet18/50, vgg16_bn, shufflenet_v2, swin_t.
+#
+# ** PIN THIS ONCE IT WORKS. ** This pipeline decomposes every backbone into an
+# ordered block list so `forward_prefix(x, k)` genuinely stops at stage k. If a
+# torchvision upgrade changes that structure, `n_blocks` and `feature_dims`
+# change, the budget table changes, rho changes, and every MSC value shifts --
+# and rho is a ratio, so all of it still looks reasonable.
+# `tools/fetch_assets.py --check` detects exactly this.
+torchvision>=0.16
+
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0          # per_sample/*.parquet — the scientific artifact
+PyYAML>=6.0            # config.yaml per run
+scipy>=1.10            # Spearman — Q1 (noise ceiling) and Q3 (transfer)
+scikit-learn>=1.3      # Q4 nested-model ΔR², PCA for Q2
+Pillow>=10.0           # packing the dataset
+psutil>=5.9            # host CPU/RAM telemetry columns
+nvidia-ml-py>=12.535   # GPU power at 10 Hz. Without it every energy column
+                       # is NA and §1.8/§1.9-style analysis is impossible
+                       # after the fact. Imports as `pynvml`.
+fvcore>=0.1.5          # FLOPs profiler. rho(c) is DEFINED in FLOPs, so this
+                       # is load-bearing, not instrumentation.
+
+# ---------------------------------------------------------------- optional
+matplotlib>=3.7        # paper figures (NB15)
+tqdm>=4.65             # progress bars
+thop>=0.1.1            # fallback profiler if fvcore is unavailable
+
+# ---------------------------------------------------------------- NOT needed
+# huggingface_hub  — the ImageNet-100 programme is local-only. The import is
+#                    guarded; nothing is uploaded and nothing is fetched.
+# kaggle           — the dataset is already on disk.
+# timm             — every architecture comes from torchvision or from
+#                    src/msc_lib.py. No extra dependency for the zoo.

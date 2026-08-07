@@ -5,8 +5,52 @@ operating procedure: what to run, in what order, and — more importantly — wh
 to check after each step and what a wrong answer looks like.
 
 Target machine: **single RTX 4000 Ada (20 GB), 24 cores, 63 GB RAM.**
-Notebooks stay Kaggle-compatible; nothing below changes if you move them there
-except the paths, which the library detects.
+**Local disk only — no HuggingFace, and no network at run time.**
+
+---
+
+## Step −1 — Install, once, with internet
+
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+The CUDA index URL matters: the RTX 4000 Ada is sm_89 and needs cu121 or newer.
+**A CPU-only torch imports fine, passes every self-test, and then trains at
+about 1/200th of the speed while reporting entirely plausible numbers.** Check:
+
+```
+python -c "import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Then record the environment and fingerprint the zoo:
+
+```
+python tools/fetch_assets.py
+```
+
+**Nothing is downloaded, and that is correct.** `resnet50(weights=None)` is
+Python source inside torchvision — training from scratch fetches no weights.
+What this command actually does is pin the thing that *can* silently break you:
+it records every package version and fingerprints all eight architectures
+(parameter count, FLOPs, K, stage cuts, feature dims). A torchvision upgrade
+can change how a backbone decomposes into blocks, which changes the budget
+table, which changes ρ — and ρ is a ratio, so every resulting MSC value still
+looks reasonable. `--check` compares against the manifest later.
+
+Then **prove** you can run offline, rather than assuming it:
+
+```
+python tools/fetch_assets.py --verify-offline
+```
+
+This blocks the socket layer outright and then builds every architecture,
+prices every budget table, and runs both dry runs. Anything that reaches for
+the network raises with the host it wanted. Installing a package is not
+offline-readiness, the same way draining an upload queue is not confirmation.
+
+After this, unplug it.
 
 ---
 
@@ -14,13 +58,14 @@ except the paths, which the library detects.
 
 | | |
 |---|---|
-| ✅ | Library ported. 278 offline self-checks pass, exit code verified. |
+| ✅ | Library ported. **292** offline self-checks pass, exit code verified. |
+| ✅ | Local-only + offline. Nothing uploaded, nothing fetched, nothing deleted. |
 | ✅ | Packing tool, verified against the real data (dry run only — not yet packed). |
 | ✅ | Zoo registered, dry runs written and wired in. |
 | ⬜ | **Notebooks not yet regenerated** (O-23). `build_notebooks.py` still emits the CIFAR set. |
 | ⬜ | **Nothing has run on a GPU.** No architecture in this zoo has been built on hardware. |
 
-Steps 0–2 below are runnable now. Step 3 onward waits on O-23.
+Steps −1 to 1 below are runnable now. Step 3 onward waits on O-23.
 
 ---
 
@@ -34,7 +79,7 @@ echo $?          # must be 0
 Expect the last three lines to read:
 
 ```
-  278 checks run, 0 failed
+  292 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```
@@ -165,32 +210,61 @@ ceilings were computed on the same number of surviving samples after the τ mask
 
 ---
 
-## Every session, before you close the tab
+## Every session, before you stop
 
 ```python
 sess.finish()
-sess.confirm_on_hf(my_run_ids)
+sess.confirm_on_disk(my_run_ids)          # measured=True after NB08
 ```
 
-`finish()` drains the upload queue and prints `[SESSION] done`. **That is not
-confirmation** — it says the queue emptied, which is a fact about this process,
-not about the repository (rule 10). `confirm_on_hf` asks the repo, per file,
-through `resolve`.
+`finish()` prints `[SESSION] done`. **That is not confirmation** — it says this
+process finished tidying up, which is a fact about this process, not about what
+is on disk (rule 10).
 
-Read the three-state summary, not the word "done":
+`confirm_on_disk` **opens every required artifact.** This is stronger than the
+HuggingFace check ever was: `confirm_on_hf` established that a file arrived, and
+never looked inside it. Three states:
 
 ```
-[VERIFY] 3 run(s): 1 finished, 2 resumable, 0 at risk
+[VERIFY] 3 run(s) on local disk: 1 complete, 2 resumable, 0 at risk  (14.2 GiB)
 ```
 
-- **finished** — `summary.json` is there, nothing left to do
-- **resumable** — `ckpt_last.pt` is there. **Safe to close.** It resumes at its
+- **complete** — every required artifact present, non-empty and parseable
+- **resumable** — `ckpt_last.pt` is there. **Safe to stop.** It resumes at its
   epoch. Being unfinished is the normal state of a paused run (D-20)
-- **at risk** — neither. This alone is worth stopping for
+- **at risk** — missing, zero-byte, or corrupt
 
-If it prints `UNCONFIRMED`, that means the lookup failed, not that the work is
-lost. Retry before concluding anything — per the retracted 2026-08-02 audit, a
-negative finding deserves the same verification standard as a positive one.
+Read the reason, not just the count. Three failure classes, three meanings:
+
+| reported | means |
+|---|---|
+| `MISSING` | the step never ran, or crashed before writing |
+| `EMPTY` | the file was created and the write failed — what an interrupted non-atomic write produces routinely |
+| `UNREADABLE` | present, non-empty and **corrupt**. Only found by opening it. A presence check calls this run healthy, and you find out during analysis, weeks later |
+
+### Nothing is deleted, ever
+
+With HuggingFace off there is **no code path that removes a run directory** —
+the confirm-then-delete branch is gated on `hub.enabled`, and
+`cleanup_local_after_complete` is `False` in the ImageNet recipe. The only thing
+that wipes a run is an explicit `force_rerun`.
+
+`[SESSION] LOCAL-ONLY` is **not** a warning. On Kaggle, HF-off meant the work
+evaporated at session end and the alarm was correct. Here the disk is the
+permanent store.
+
+### Audit everything at any time
+
+```python
+for r in sess.completed_runs():
+    rep = verify_run_artifacts(sess.work, r["run_id"], measured=True)
+    if not rep["ok"]:
+        print(r["run_id"], rep["missing_required"], rep["empty"], rep["unreadable"])
+```
+
+Worth running before any analysis notebook. D-15 was six runs that were trained
+and never measured, discovered late, and it cost one of the fifteen
+architectures its entire contribution to the atlas.
 
 ---
 

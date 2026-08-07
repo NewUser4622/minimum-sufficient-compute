@@ -24,7 +24,8 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Data** | verified, not yet packed — [`25_IN100_DATA_CARD.md`](25_IN100_DATA_CARD.md) |
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
-| **Self-checks** | **278** offline, all passing, exit code verified |
+| **Storage** | **local disk only** — no HuggingFace, no network at run time |
+| **Self-checks** | **292** offline, all passing, exit code verified |
 | **Defects found this port** | **1** (D-37) · 1 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-imagenet100` — not yet created |
@@ -227,6 +228,46 @@ and that failure would surface in NB15 rather than where it was caused.
 | **IN-9** | Epoch budget | 240 CNN / 300 modern | **100, all eight** | Removes schedule length as a third confounded variable. Does **not** fix the accuracy confound, which is reported (plan §1). |
 | **IN-10** | GPU column count | literal 2 | **`device_count()`** | See D-37's sequel above. |
 | **IN-11** | Verdict accumulation in the test harness | scalar | **lists + canary + floor** | D-37. |
+| **IN-12** | Artifact store | HuggingFace, per-user rate limited | **local disk only** | Single machine, no network at run time. Everything HF guaranteed is now guaranteed locally — and one thing it never guaranteed is added (IN-14). |
+| **IN-13** | Network | required (HF, Kaggle CLI) | **forbidden, and proven** | `enforce_offline()` sets the guards; `no_network()` replaces `socket.socket` so a fetch raises with the host it wanted. Environment variables are a request; blocking the socket layer is a guarantee. |
+| **IN-14** | "Is my work safe?" | file present on HF | **present, non-empty, and parseable** | `confirm_on_hf` established that a file arrived. It never opened it. A run with a zero-byte `epochs.csv` or a truncated `summary.json` was indistinguishable from a healthy one until analysis. |
+
+### IN-12 note — what "no HuggingFace" actually removes, and what it doesn't
+
+HF was doing four jobs. Three of them were about *multiple machines*, and a
+single local box does not need them:
+
+| HF's job | local replacement |
+|---|---|
+| permanent store across ephemeral Kaggle sessions | the disk **is** permanent. `cleanup_local_after_complete` is `False`, and the confirm-then-delete branch is gated on `hub.enabled`, so **no code path removes a run directory** except an explicit `force_rerun` |
+| coordination between accounts | not needed — one worker |
+| rate limiting | not needed |
+| **evidence that the work landed** | **`verify_run_artifacts` / `confirm_on_disk`** |
+
+Only the fourth needed replacing, and the replacement is stronger than the
+original. `[SESSION] LOCAL-ONLY` is deliberately **not** phrased as an alarm:
+on Kaggle, HF-off genuinely meant the work evaporated at session end, and that
+warning was correct there. Repeating it here would be false, and a warning that
+is false teaches the operator to ignore the line — D-20's actual cost.
+
+### IN-13 note — nothing is downloaded, and that surprised me too
+
+**Training from scratch downloads no model weights.**
+`torchvision.models.resnet50(weights=None)` is Python source inside the
+installed package. So is `swin_t`. There is no architecture to fetch.
+
+What needs one-time internet is the **pip packages**, and what needs pinning is
+their **versions** — because this pipeline decomposes every backbone into an
+ordered block list so `forward_prefix(x, k)` genuinely stops at stage k. A
+torchvision upgrade that changes that structure changes `n_blocks`,
+`feature_dims`, the budget table and therefore ρ — and ρ is a ratio, so every
+resulting MSC value looks entirely reasonable.
+
+`tools/fetch_assets.py` therefore fingerprints all eight architectures
+(parameter count, FLOPs, K, stage cuts, feature dims, per-resolution native
+support) into `assets/environment_manifest.json`, and `--check` compares
+against it. That pin is the useful artifact; a directory of downloaded weights
+would have been theatre.
 
 ---
 
@@ -249,6 +290,7 @@ and that failure would surface in NB15 rather than where it was caused.
 
 | Date | Event |
 |---|---|
+| 2026-08-07 | **Local-only and offline.** HuggingFace removed; `verify_run_artifacts` opens every required artifact rather than stat-ing it, so a zero-byte or truncated file is caught where a presence check called the run healthy. `no_network()` proves offline operation by blocking the socket layer. `requirements.txt` + `tools/fetch_assets.py`. Self-checks 278 → 292 |
 | 2026-08-07 | **D-37 — the self-test harness could not fail.** A tuple unpack 960 lines below the definition rebound the verdict scalar; ~80% of checks could not affect the exit code. Fixed structurally with lists, a canary and a floor |
 | 2026-08-07 | Rule 1: `backbone_dry_run` and `oracle_dry_run` written **and wired in**, with build-time checks asserting the call *and its position*. The oracle dry run covers every axis at every resolution and reads its parquet back |
 | 2026-08-07 | Rules 9/10: HF verification moved off `list_repo_files` (tree endpoint) onto per-file `resolve`. The source-inspection checks initially matched their own docstrings — now they parse the AST, because a check that reads prose is checking the wrong artifact |

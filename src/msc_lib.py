@@ -1033,6 +1033,98 @@ class MSCHub:
 # Everything a run produces, under one folder. See 06_DATA_SCHEMA.md 2.
 RUN_SUBDIRS = ("metrics", "telemetry", "per_sample", "checkpoints", "env")
 
+# =============================================================================
+# 3a. offline operation
+# =============================================================================
+# The ImageNet-100 programme runs with no network. Two separate things follow,
+# and conflating them is how a "we're offline" claim turns out to be false at
+# hour three:
+#
+#   1. Nothing may ATTEMPT a fetch. Libraries that phone home on import or on
+#      first use must be told not to, via environment variables set BEFORE they
+#      are imported.
+#   2. That has to be PROVEN, not asserted. `tools/fetch_assets.py
+#      --verify-offline` blocks the socket layer outright and then builds every
+#      architecture and runs both dry runs. Rule 10's shape: draining a queue
+#      is not confirmation, and installing a package is not offline-readiness.
+#
+# Worth stating plainly because it is the opposite of what people expect:
+# **training from scratch downloads no model weights at all.** torchvision's
+# `resnet50(weights=None)` is Python source that ships with the package. There
+# is nothing to pre-download for the architectures. What needs one-time
+# internet is the pip packages, and what needs pinning is their VERSIONS --
+# because a torchvision upgrade can change how a model decomposes into blocks,
+# which would silently change every budget table.
+OFFLINE_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+    # Keep any torch.hub cache local and deterministic rather than in a home
+    # directory that may not exist or may be on a different volume.
+    "TORCH_HOME": str((SCRATCH_ROOT / "assets" / "torch")),
+}
+
+
+def enforce_offline(verbose: bool = True) -> Dict[str, str]:
+    """Set the environment so nothing tries to reach the network.
+
+    Call this BEFORE importing anything that might fetch. `msc_lib` calls it at
+    import time when `MSC_OFFLINE` is set, which is the default for the
+    ImageNet-100 profile.
+    """
+    ensure_dir(Path(OFFLINE_ENV["TORCH_HOME"]))
+    for k, v in OFFLINE_ENV.items():
+        os.environ.setdefault(k, v)
+    if verbose:
+        log(f"offline mode: {len(OFFLINE_ENV)} env guards set, "
+            f"TORCH_HOME={OFFLINE_ENV['TORCH_HOME']}", "OFFLINE")
+    return dict(OFFLINE_ENV)
+
+
+@contextmanager
+def no_network(allow_local: bool = True):
+    """Block the socket layer, so a fetch RAISES instead of hanging.
+
+    This is the verification half. Environment variables are a request;
+    replacing `socket.socket` is a guarantee. Used by the offline preflight and
+    available for any check that wants to prove a code path is self-contained.
+
+    Loopback stays open by default -- CUDA IPC and some dataloader backends use
+    it, and blocking it would make this test fail for reasons that have nothing
+    to do with the internet.
+    """
+    import socket as _s
+    real = _s.socket
+
+    class _Blocked(real):                                        # type: ignore
+        def connect(self, address, *a, **k):
+            host = address[0] if isinstance(address, tuple) else str(address)
+            if allow_local and str(host) in ("127.0.0.1", "::1", "localhost"):
+                return super().connect(address, *a, **k)
+            raise OSError(
+                f"network access to {host!r} was attempted while offline. "
+                f"This pipeline must run with no internet; find the call and "
+                f"remove it or pre-fetch what it wants.")
+
+        def connect_ex(self, address, *a, **k):
+            try:
+                self.connect(address, *a, **k)
+                return 0
+            except OSError:
+                return 1
+
+    _s.socket = _Blocked                                         # type: ignore
+    try:
+        yield
+    finally:
+        _s.socket = real                                         # type: ignore
+
+
+if os.environ.get("MSC_OFFLINE", "") not in ("", "0", "false", "False"):
+    enforce_offline(verbose=False)
+
 
 def run_layout(root, run_id: str) -> Dict[str, Path]:
     """Canonical paths for one run. Local tree mirrors the repo tree exactly,
@@ -1043,6 +1135,115 @@ def run_layout(root, run_id: str) -> Dict[str, Path]:
     for s in RUN_SUBDIRS:
         d[s] = base / s
     return d
+
+
+# =============================================================================
+# 3b. local store -- what a complete run must leave on disk
+# =============================================================================
+# With HuggingFace removed, local disk is the only copy. Everything the hub
+# used to guarantee now has to be guaranteed here, and one of those guarantees
+# was never really a guarantee even with HF: that the run actually produced
+# what it was supposed to produce.
+#
+# `sync.flush()` returning True meant the upload queue drained. `confirm_on_hf`
+# improved on that by asking the repository. Neither ever asked the more basic
+# question -- **is every artifact this run was meant to write actually there,
+# non-empty, and readable?** A run that finished with a corrupt parquet or a
+# zero-byte summary looked identical to a healthy one until analysis.
+#
+# `required` is what makes a run usable at all. `expected` is everything else;
+# its absence is reported, never fatal, because a missing telemetry stream
+# costs a column and a missing checkpoint costs the run.
+RUN_ARTIFACTS_REQUIRED = (
+    "config.yaml",
+    "config_hash.txt",
+    "summary.json",
+    "metrics/epochs.csv",
+    "metrics/final.csv",
+    "checkpoints/ckpt_last.pt",
+    "checkpoints/ckpt_best.pt",
+    "env/environment.json",
+)
+RUN_ARTIFACTS_MEASURED = (
+    "per_sample/test.parquet",
+    "per_sample/train_holdout.parquet",
+    "per_sample/meta.json",
+    "exit_heads.pt",
+)
+RUN_ARTIFACTS_EXPECTED = (
+    "STATUS.json",
+    "metrics/confusion_matrix.csv",
+    "metrics/per_class.csv",
+    "metrics/exit_metrics.csv",
+    "telemetry/energy_samples.csv",
+    "telemetry/system_samples.csv",
+    "telemetry/step_traces.jsonl",
+    "per_sample/train_dynamics.parquet",
+)
+
+
+def verify_run_artifacts(work, run_id: str, measured: bool = False,
+                         min_bytes: int = 8) -> Dict[str, Any]:
+    """Is everything this run was supposed to write actually on disk?
+
+    Returns a dict with `ok`, `missing_required`, `empty`, `unreadable`, and a
+    per-file table. Three failure classes, not one, because they mean different
+    things:
+
+      missing     the step never ran, or ran and crashed before writing
+      empty       the file was created and the write failed -- the shape that
+                  an interrupted `atomic_write` was designed to prevent and
+                  that a non-atomic write produces routinely
+      unreadable  present and non-empty and CORRUPT. Only found by opening it,
+                  which is why the parquet and JSON files are actually parsed
+                  here rather than stat-ed.
+
+    The third class is the one presence checks miss, and it is the one that
+    surfaces during analysis rather than during training.
+    """
+    L = run_layout(work, run_id)
+    base = L["base"]
+    want = list(RUN_ARTIFACTS_REQUIRED)
+    if measured:
+        want += list(RUN_ARTIFACTS_MEASURED)
+    optional = list(RUN_ARTIFACTS_EXPECTED) + (
+        [] if measured else list(RUN_ARTIFACTS_MEASURED))
+
+    table, missing, empty, unreadable = {}, [], [], []
+    for rel in want + optional:
+        p = base / rel
+        req = rel in want
+        if not p.exists():
+            table[rel] = {"state": "missing", "required": req, "bytes": 0}
+            if req:
+                missing.append(rel)
+            continue
+        n = p.stat().st_size
+        if n < min_bytes:
+            table[rel] = {"state": "empty", "required": req, "bytes": n}
+            if req:
+                empty.append(rel)
+            continue
+        state = "ok"
+        try:
+            if rel.endswith(".json"):
+                json.loads(p.read_text(encoding="utf-8"))
+            elif rel.endswith(".parquet") and pd is not None:
+                _ = pd.read_parquet(p, columns=None).shape
+            elif rel.endswith(".csv") and pd is not None:
+                _ = pd.read_csv(p, nrows=2).shape
+        except Exception as e:                                   # noqa: BLE001
+            state = f"unreadable: {type(e).__name__}"
+            if req:
+                unreadable.append(rel)
+        table[rel] = {"state": state, "required": req, "bytes": n}
+
+    return {"run_id": run_id, "root": str(base),
+            "ok": not (missing or empty or unreadable),
+            "missing_required": missing, "empty": empty,
+            "unreadable": unreadable,
+            "total_bytes": sum(v["bytes"] for v in table.values()),
+            "files": table}
 
 
 class RunSync:
@@ -8630,7 +8831,7 @@ class Session:
     """
 
     def __init__(self, account: str = "acct1", phase: str = "p1",
-                 dataset: str = "cifar100", enable_hf: bool = True,
+                 dataset: str = "cifar100", enable_hf: Optional[bool] = None,
                  work_root=None, session_limit_h: float = 8.5,
                  commits_per_hour_limit: int = 20,
                  batch_interval_sec: float = 1800.0,
@@ -8638,6 +8839,15 @@ class Session:
                  shard_mode: str = "cost"):
         assert 0 <= worker_id < num_workers, \
             f"WORKER_ID must be in 0..{num_workers-1}, got {worker_id}"
+        # `enable_hf=None` means "decide from the profile". The ImageNet-100
+        # programme runs local-only and offline, so HuggingFace is OFF unless
+        # explicitly switched on. Defaulting it to True and expecting the
+        # operator to remember to pass False is the D-27 shape: an invariant
+        # that lives in an argument nobody passes.
+        if enable_hf is None:
+            enable_hf = (os.environ.get("MSC_ENABLE_HF", "") in ("1", "true", "True")
+                         or dataset_spec(dataset)["backend"] != "packed")
+        self.local_only = not enable_hf
         self.account = account
         self.phase = phase
         self.dataset = dataset
@@ -8674,8 +8884,22 @@ class Session:
         print(f"[SESSION] work={self.work}  scratch={self.scratch}")
         print(f"[SESSION] disk free: working={free_mb(self.work)} MB  "
               f"scratch={free_mb(self.scratch)} MB")
-        if not self.hub.enabled:
-            print("[SESSION] *** HF DISABLED -- nothing will survive this session ***")
+        if self.local_only:
+            # NOT an alarm. On Kaggle, HF off genuinely meant the work
+            # evaporated at session end. Here the local tree IS the permanent
+            # store and nothing deletes it -- the confirm-then-delete branch in
+            # train_backbone is gated on `hub.enabled`, so with HF off there is
+            # no code path that removes a run directory except an explicit
+            # force_rerun. Saying "nothing will survive" would be false and,
+            # worse, would teach the operator to ignore this line.
+            print(f"[SESSION] LOCAL-ONLY store: {self.runs_dir}")
+            print(f"[SESSION] nothing is uploaded and nothing is deleted. "
+                  f"Call sess.confirm_on_disk(run_ids) before you stop.")
+            if os.environ.get("HF_HUB_OFFLINE") == "1":
+                print("[SESSION] offline guards active")
+        elif not self.hub.enabled:
+            print("[SESSION] *** HF requested but unavailable -- "
+                  "nothing will survive this session ***")
 
     # ------------------------------------------------------------------
     def prepare_data(self) -> Path:
@@ -9030,6 +9254,68 @@ class Session:
         self.hub.stop(drain=True)
         print(f"[SESSION] done. elapsed {self.guard.elapsed_h:.2f} h")
 
+    def confirm_on_disk(self, run_ids: Sequence[str], measured: bool = False,
+                        verbose: bool = True) -> Dict[str, List[str]]:
+        """Local-only analogue of `confirm_on_hf`. Same three states.
+
+        With no HuggingFace, local disk is the only copy, so the question
+        "is my work safe?" becomes "is my work COMPLETE and READABLE?" -- and
+        that is a stronger question than HF was ever asked. `confirm_on_hf`
+        establishes that a file arrived; this opens it.
+
+        Three states, and the distinction is the D-20 one:
+
+        - **finished**  -- summary present AND every required artifact verified
+        - **resumable** -- `ckpt_last.pt` present. Perfectly safe to stop; the
+          next session picks it up at its epoch. Being unfinished is the normal
+          state of a paused run, not a failure
+        - **at risk**   -- neither, or present-but-corrupt
+
+        A run whose summary exists but whose `epochs.csv` is zero bytes is
+        reported **at risk**, not finished. That case is invisible to any
+        presence check and shows up during analysis, weeks later.
+        """
+        ids = list(run_ids)
+        done, resumable, at_risk, detail = [], [], [], {}
+        for r in ids:
+            L = run_layout(self.work, r)
+            rep = verify_run_artifacts(self.work, r, measured=measured)
+            detail[r] = rep
+            if rep["ok"]:
+                done.append(r)
+            elif (L["checkpoints"] / "ckpt_last.pt").exists() and \
+                    (L["checkpoints"] / "ckpt_last.pt").stat().st_size > 1024:
+                resumable.append(r)
+            else:
+                at_risk.append(r)
+
+        if verbose:
+            gb = sum(d["total_bytes"] for d in detail.values()) / 2**30
+            print(f"\n[VERIFY] {len(ids)} run(s) on local disk: {len(done)} "
+                  f"complete, {len(resumable)} resumable, {len(at_risk)} at "
+                  f"risk  ({gb:.2f} GiB under {self.runs_dir})")
+            for r in done:
+                print(f"    COMPLETE   {r}")
+            for r in resumable:
+                d = detail[r]
+                print(f"    RESUMABLE  {r}  -- still missing "
+                      f"{d['missing_required'][:3]}")
+            for r in at_risk:
+                d = detail[r]
+                bad = (d["missing_required"] or d["empty"] or d["unreadable"])
+                print(f"    AT RISK    {r}  -- {bad[:4]}")
+                for k in ("empty", "unreadable"):
+                    if d[k]:
+                        print(f"               {k.upper()}: {d[k]} "
+                              f"<- present but unusable; a presence check "
+                              f"would have called this run healthy")
+            if not at_risk:
+                print("    Nothing is at risk. Safe to stop.")
+            else:
+                print("    *** Do not treat the AT RISK runs as done.")
+        return {"ok": done, "done": done, "resumable": resumable,
+                "at_risk": at_risk, "unknown": [], "detail": detail}
+
     def confirm_on_hf(self, run_ids: Sequence[str],
                       require: Optional[Sequence[str]] = None,
                       verbose: bool = True) -> Dict[str, List[str]]:
@@ -9055,6 +9341,10 @@ class Session:
 
         Pass `require=(...)` to check specific paths instead.
 
+        With HuggingFace disabled this delegates to `confirm_on_disk`, which
+        asks the same three-state question of local disk. The method is kept
+        under one name so no notebook has to know which store is in use.
+
         **Rule 9. Every lookup below goes through `resolve`, per file.** This
         used to call `list_repo_files` once and test membership of the result.
         That is the tree endpoint, it is CDN-cached, and on 2026-08-02 it served
@@ -9068,9 +9358,7 @@ class Session:
         empty = {"ok": [], "done": [], "resumable": [], "at_risk": [],
                  "unknown": ids}
         if not self.hub.enabled:
-            if verbose:
-                print("[VERIFY] HF disabled -- cannot confirm anything")
-            return empty
+            return self.confirm_on_disk(ids, verbose=verbose)
 
         latest = self.registry.latest()
         done, resumable, at_risk = [], [], []
@@ -10747,6 +11035,91 @@ def _selftest() -> bool:
           "resolve_meta" in _insp.getsource(BackgroundUploader.files_present),
           "the repo-info body was silently truncated mid-JSON at ~69 KB and the "
           "cut landed just past `vgg8`, exactly where the missing runs were")
+
+    print("offline and local-only operation")
+    _env = enforce_offline(verbose=False)
+    check("offline guards cover the fetching libraries",
+          {"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
+           "TORCH_HOME"} <= set(_env))
+    check("TORCH_HOME is local and exists", Path(_env["TORCH_HOME"]).is_dir(),
+          "a cache in an unwritable home directory fails on first use")
+    _blocked = []
+    try:
+        import socket as _sk
+        with no_network():
+            try:
+                _sk.socket().connect(("1.1.1.1", 443))
+            except OSError as e:
+                _blocked.append(str(e))
+        check("no_network() actually blocks an outbound connect",
+              any("while offline" in b for b in _blocked),
+              "environment variables are a request; replacing socket.socket "
+              "is a guarantee")
+        check("...and restores the real socket afterwards",
+              _sk.socket.__name__ == "socket")
+    except Exception as _e:                                      # noqa: BLE001
+        check("no_network() actually blocks an outbound connect", False, str(_e)[:80])
+    check("imagenet100 defaults to LOCAL-ONLY",
+          dataset_spec("imagenet100")["backend"] == "packed",
+          "Session(enable_hf=None) turns HF off for the packed backend -- "
+          "defaulting it on and expecting the operator to pass False is the "
+          "D-27 shape, an invariant living in an argument nobody passes")
+    # (a tautological `... or True` sat here briefly. That is precisely the
+    # D-37 antipattern -- a check that cannot fail -- so it is gone, and the
+    # check below does the real work by locating the guard around the delete.)
+    _cl_src = _insp.getsource(train_backbone)
+    _i = _cl_src.find("cleanup_local_after_complete")
+    check("confirm-then-delete is gated on hub.enabled",
+          _i > 0 and "hub.enabled" in _cl_src[max(0, _i - 900):_i],
+          "with HF off, local disk is the only copy and nothing may remove it")
+    check("the ImageNet recipe never asks for local cleanup",
+          base_config("resnet50", "imagenet100")["cleanup_local_after_complete"]
+          is False)
+
+    print("artifact completeness (the local store's version of 'is it safe?')")
+    _rt = ensure_dir(tmp / "store")
+    _rid = make_run_id("p1", "resnet50", "imagenet100", "base", 1)
+    _L = run_layout(_rt, _rid)
+    for _s in RUN_SUBDIRS:
+        ensure_dir(_L[_s])
+    _rep = verify_run_artifacts(_rt, _rid)
+    check("an empty run directory is not 'ok'", not _rep["ok"],
+          f"{len(_rep['missing_required'])} required artifacts missing")
+    for _f in RUN_ARTIFACTS_REQUIRED:
+        _p = _L["base"] / _f
+        ensure_dir(_p.parent)
+        _p.write_text('{"status": "completed", "x": 1}' if _f.endswith(".json")
+                      else "epoch,val_accuracy\n0,1.0\n" if _f.endswith(".csv")
+                      else "x" * 64)
+    _rep = verify_run_artifacts(_rt, _rid)
+    check("a complete run is 'ok'", _rep["ok"], str(_rep["missing_required"]))
+    (_L["metrics"] / "epochs.csv").write_text("")
+    _rep = verify_run_artifacts(_rt, _rid)
+    check("a ZERO-BYTE required artifact fails, and as 'empty' not 'missing'",
+          (not _rep["ok"]) and "metrics/epochs.csv" in _rep["empty"]
+          and "metrics/epochs.csv" not in _rep["missing_required"],
+          "a presence check calls this run healthy; it is the shape an "
+          "interrupted non-atomic write produces routinely")
+    (_L["metrics"] / "epochs.csv").write_text("epoch,val_accuracy\n0,1.0\n")
+    (_L["base"] / "summary.json").write_text("{not json at all")
+    _rep = verify_run_artifacts(_rt, _rid)
+    check("a CORRUPT required artifact fails, and as 'unreadable'",
+          (not _rep["ok"]) and "summary.json" in _rep["unreadable"],
+          "present, non-empty and unparseable -- found only by opening it, "
+          "which is why this check parses rather than stats")
+    (_L["base"] / "summary.json").write_text('{"status": "completed"}')
+    check("measured=True additionally demands the per-sample tables",
+          verify_run_artifacts(_rt, _rid)["ok"]
+          and not verify_run_artifacts(_rt, _rid, measured=True)["ok"],
+          "a trained run and a measured run are different states -- D-15 was "
+          "six runs that were the first and not the second")
+    check("required and optional artifacts are disjoint",
+          not (set(RUN_ARTIFACTS_REQUIRED) & set(RUN_ARTIFACTS_EXPECTED)))
+    check("a missing telemetry stream is reported, never fatal",
+          "telemetry/energy_samples.csv" in RUN_ARTIFACTS_EXPECTED
+          and "telemetry/energy_samples.csv" not in RUN_ARTIFACTS_REQUIRED,
+          "a missing telemetry column costs a column; a missing checkpoint "
+          "costs the run")
 
     print("dataset registry")
     check("cifar100 native resolution", native_res("cifar100") == 32)
