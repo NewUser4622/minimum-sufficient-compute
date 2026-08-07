@@ -3305,6 +3305,28 @@ def main() -> int:
         print(f"\n  library {LIB.stat().st_size/1024:.0f} KB · "
               f"core {CORE.stat().st_size/1024:.0f} KB · "
               f"{len(NOTEBOOKS)} notebooks → {OUT}")
+
+    # RULES 3 and 4, at BUILD time. Generation is refused if any notebook reads
+    # a column that exists in neither the schema, the library, nor the notebook
+    # itself.
+    #
+    # This is the only place the check can pay for itself. D-22's five wrong
+    # names raised at the END of the first epoch, after the training was done
+    # and the time unrecoverable, on nine runs. D-36's three surfaced at a
+    # display two lines after a guarded write had skipped them in silence.
+    # Both comparisons take milliseconds against a schema that was sitting
+    # right there.
+    print("\n  validating column names and repo paths against the schema")
+    sys.path.insert(0, str(ROOT / "tools"))
+    try:
+        import validate_notebooks as V
+        rc = V.validate(OUT, strict_paths="--strict-paths" in sys.argv)
+    except Exception as e:                                       # noqa: BLE001
+        print(f"  [FAIL] the validator could not run: {type(e).__name__}: {e}")
+        print("  Refusing to report success on a check that did not execute.")
+        return 1
+    if rc:
+        return 1
     return 1 if stale else 0
 
 

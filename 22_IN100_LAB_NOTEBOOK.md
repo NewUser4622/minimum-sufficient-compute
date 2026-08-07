@@ -132,6 +132,59 @@ good faith and, for most of the file, could not do its job.
 
 ---
 
+### Note · the notebook validator had to be built three times
+
+Not a defect — it never shipped wrong. Recorded because the failure mode it
+kept producing is the one D-17 and D-20 were about, and because the third
+version found something.
+
+`tools/validate_notebooks.py` enforces rules 3 and 4 at build time. First
+version: flag every subscript string literal absent from the schema.
+
+| version | rule | false positives on the 17 CIFAR notebooks |
+|---|---|---|
+| 1 | not in `HISTORY_FIELDS ∪ FINAL_FIELDS` | **73** |
+| 2 | ...and not assigned in the notebook | **61** |
+| 3 | ...and not created anywhere in the project's source | **0** |
+
+Versions 1 and 2 were useless. `n_runs`, `wall_clock_hours`, `fam_a`,
+`delta_r2_lo` are columns the notebooks and the library compute for
+themselves. **A check that fires on healthy data teaches you to ignore it, and
+the next alarm is the real one** — which is exactly what D-17 cost when the
+shuffled control halted NB11 on a perfectly aligned pair.
+
+Version 3 harvests every string key created by `msc_lib.py`, `msc_core.py` and
+`msc_torch.py`. Going from 2 to 3 was forced by a real finding:
+`partial_spearman`, `r2_difficulty_only` and `r2_difficulty_plus_msc` are
+produced by **`msc_core.py`**, the reference implementation, which version 2
+never read. A checker whose notion of "everything this project defines" omits
+a source file will keep crying wolf until someone switches it off.
+
+**The validator has its own self-test, and it changed the design.** Run the
+five real D-22 names and the three real D-36 names through it; assert it
+catches them; assert it accepts their correct counterparts. That test failed,
+and the reason is worth keeping:
+
+> `grad_norm` and `f1_score` are **legitimate internal dict keys** inside
+> `msc_lib` — `EpochTelemetry` returns `{"grad_norm": ...}`. They are simply
+> not CSV column names; those are `grad_norm_mean` and `f1_macro`. D-22 was
+> using the internal key where the column name was needed. **No static check
+> over string literals can tell those apart, because they are the same
+> string.**
+
+So the two defects have different owners, and saying otherwise would have been
+the kind of "it's handled" that D-16 was closed with:
+
+| defect | shape | owner |
+|---|---|---|
+| **D-22** | *writing* a row with keys the schema lacks | `append_history_row(strict=True)` — raises and names the column you meant. Verified against all five. |
+| **D-36** | *reading* a column that exists nowhere | this validator. Verified against both un-suffixed GPU names. |
+
+Rule 12 in miniature: the first version's "73 problems found" looked like the
+tool working. It was the tool being wrong 73 times.
+
+---
+
 ### The two failures D-37 was hiding
 
 Not numbered as defects because they are the port doing its job — a platform
@@ -183,7 +236,7 @@ and that failure would surface in NB15 rather than where it was caused.
 |---|---|---|---|---|
 | **O-22** | **Run the packing tool and verify.** Nothing downstream exists until the fingerprint is real | everything | ~30 min CPU | **highest** |
 | **O-23** | **Regenerate NB00–NB16 for the ImageNet path.** The library is ported; the notebooks are not | all runs | ~1 session | **highest** |
-| **O-24** | **Build-time schema and path validation in `build_notebooks.py`** — fail generation on a column literal absent from `HISTORY_FIELDS`, or a repo path spelled as a string (rules 3, 4) | the D-22/D-36 class recurring | ~2 h | **high** |
+| ~~O-24~~ | ~~Build-time schema and path validation~~ — **DONE.** `tools/validate_notebooks.py`, gating `build_notebooks.py`. Self-tested against the real D-22 and D-36 names. 0 false positives on the 17 CIFAR notebooks; 2 genuine rule-4 path warnings | — | — | shipped |
 | **O-25** | **Run NB00 preflight on the real GPU.** Every architecture, every resolution, kill-and-resume. This is where a Swin-T that cannot do 96px, or a torchvision decomposition that mis-orders blocks, will surface | Phase 0 | ~30 min GPU | **highest** |
 | **O-26** | Re-anchor `ARCH_COST_HINT` on measured epochs. Current values are estimates and D-10 showed the first guess was 40% low. Per DC-11 they refine the *display* only | honest ETAs | ~1 h | medium |
 | **O-18** | *(inherited, still open)* cross-session resume test. Five CIFAR defects were about resume and every test runs inside one session — the case that works. The new checkpoint round trip in `backbone_dry_run` does **not** close this; it proves the contract round-trips, not that a fresh process resumes | the next D-19 | ~1 h | **high** |
