@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 import traceback
+import textwrap
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -154,12 +155,42 @@ def ensure_dir(p) -> Path:
     return p
 
 
+def _atomic_replace(tmp, path, attempts: int = 20, pause: float = 0.15) -> None:
+    """`os.replace` with a bounded retry, because Windows is not POSIX.
+
+    On POSIX `os.replace` always succeeds over an existing file. On Windows it
+    raises `PermissionError` if any process holds a handle to the destination --
+    an antivirus scanner, a file indexer, an open Explorer preview, or a HF
+    uploader thread that is reading the very checkpoint being rewritten.
+
+    The failure mode is the one this function exists to prevent: the temp file
+    is complete and correct, the destination is the previous version, and the
+    exception propagates out of the middle of an epoch. Retrying is right
+    because the condition is transient by nature; giving up silently is not,
+    so the final attempt raises.
+
+    Without this the port would lose checkpoints on Windows at exactly the
+    moments the uploader is busiest, which is to say at every push cycle.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:                              # noqa: PERF203
+            last = e
+            time.sleep(pause * (1 + i * 0.5))
+    raise OSError(
+        f"could not atomically replace {path} after {attempts} attempts. "
+        f"Something is holding the destination open. The complete data is in "
+        f"{tmp} and has NOT been lost.") from last
+
+
 def atomic_write_text(path, text: str) -> None:
     """Write via a temp file and rename.
 
     Never write in place. A session killed mid-write leaves a truncated file,
-    and for ckpt_last.pt that means the run is gone. os.replace is atomic on
-    POSIX, which Kaggle is.
+    and for ckpt_last.pt that means the run is gone.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,7 +199,7 @@ def atomic_write_text(path, text: str) -> None:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _atomic_replace(tmp, path)
 
 
 def atomic_write_json(path, obj) -> None:
@@ -187,7 +218,7 @@ def atomic_save_torch(path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(obj, tmp)
-    os.replace(tmp, path)
+    _atomic_replace(tmp, path)
 
 
 def read_json(path, default=None):
@@ -683,6 +714,57 @@ class BackgroundUploader:
         except Exception:
             return None
 
+    # -- resolve-only verification -----------------------------------------
+    # RULE 9. `list_repo_files` goes through the tree / repo-info endpoints,
+    # and those are CDN-cached. On 2026-08-02 an audit concluded that only the
+    # NB04 runs existed on HF. That conclusion was wrong, it stood in the lab
+    # notebook for two days, and it was reached twice by two different methods
+    # that agreed with each other:
+    #
+    #   * `tree/main/runs` returned byte-identical `oid`s across audits hours
+    #     apart, which was read as "nothing changed" and actually meant "you
+    #     were served the same cached page twice";
+    #   * the full repo-info body was silently TRUNCATED mid-JSON at ~69 KB,
+    #     and the truncated file list happened to cut off just past `vgg8` --
+    #     exactly where `vit_tiny` and `wrn_*` would have appeared.
+    #
+    # `resolve` is the content endpoint. A HEAD against it either returns that
+    # file's metadata or 404s, per file, with no aggregate to truncate and no
+    # listing to cache. It is the only HF answer this project now trusts about
+    # whether a specific file exists.
+    def resolve_meta(self, repo_path: str, revision: str = "main"
+                     ) -> Optional[Dict[str, Any]]:
+        """Per-file metadata via `resolve`, or None if the file is not there.
+
+        None means "not present". It does NOT mean "the network failed" -- that
+        raises, because a negative finding produced by a dropped connection is
+        the D-20 false alarm all over again, and per the retracted audit a
+        negative finding deserves the same verification standard as a positive
+        one.
+        """
+        from huggingface_hub import get_hf_file_metadata, hf_hub_url
+        url = hf_hub_url(repo_id=self.repo_id, filename=repo_path,
+                         repo_type=self.repo_type, revision=revision)
+        try:
+            m = get_hf_file_metadata(url, token=self.token)
+        except Exception as e:                                    # noqa: BLE001
+            msg = str(e).lower()
+            if "404" in msg or "not found" in msg or "entrynotfound" in msg:
+                return None
+            raise RuntimeError(
+                f"could not determine whether {repo_path} exists: {e}. "
+                f"Refusing to report absence on a failed lookup.") from e
+        return {"path": repo_path, "size": getattr(m, "size", None),
+                "etag": getattr(m, "etag", None),
+                "commit": getattr(m, "commit_hash", None)}
+
+    def files_present(self, repo_paths: Sequence[str], revision: str = "main"
+                      ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """`{repo_path: meta or None}`, one `resolve` call each. Rule 10: this
+        is what "did the files land?" means. Draining the upload queue says the
+        queue emptied, which is a fact about this process, not about the repo."""
+        return {p: self.resolve_meta(p, revision) for p in repo_paths}
+
     def delete_prefix(self, prefix: str) -> int:
         """Remove every file under a repo prefix in one commit.
 
@@ -1067,15 +1149,24 @@ class RunSync:
         return self.hub.flush(timeout=timeout) if self.enabled else True
 
     def verify_present(self, required: Sequence[str]) -> Set[str]:
-        """Which required repo paths are NOT on HF.
+        """Which required repo paths are NOT on HF, asked FILE BY FILE.
 
-        Confirm-then-delete depends on this. Never wipe a local run on the
-        strength of a flush() that merely did not time out.
+        Confirm-then-delete depends on this, and it is the last thing standing
+        between a completed run and `shutil.rmtree`. Never wipe a local run on
+        the strength of a `flush()` that merely did not time out (rule 10).
+
+        Rule 9: this used to call `list_repo_files`, i.e. the tree endpoint,
+        which is cached and which truncates. Both failure modes report a file
+        as ABSENT when it is present -- and the caller's response to "absent"
+        is to keep the local copy, which is harmless, or to re-push, which is
+        wasteful but safe. The dangerous direction is the other one, and a
+        cached listing can produce that too: a stale page showing a file that
+        was since deleted. `resolve` has neither property.
         """
         if not self.enabled:
             return set(required)
-        have = self.hub.hub.list_repo_files()
-        return {r for r in required if r not in have}
+        got = self.hub.hub.files_present(list(required))
+        return {r for r, meta in got.items() if meta is None}
 
 
 # =============================================================================
@@ -4327,9 +4418,28 @@ REFERENCE_ACC = {
 OPTIONAL_LOSS_TERMS = ("feature", "attention", "energy_boundary",
                        "counterfactual", "pareto")
 
-# Number of GPUs given their own columns. Dual T4 is the platform; anything
-# beyond is still captured per device in telemetry/system_samples.csv.
-N_GPU_COLUMNS = 2
+# Number of GPUs given their own columns. ASKED OF THE MACHINE, not assumed.
+#
+# This was a literal 2 because dual T4 was the only platform. The port target is
+# a single RTX 4000 Ada, and D-36 is precisely what a wrong GPU column count
+# looks like downstream: NB15 asked for `gpu_util_mean_pct`, which does not
+# exist because the fields are per device (`gpu0_*`, `gpu1_*`). A schema pinned
+# to the wrong device count produces a table full of NA columns for hardware
+# that was never present, and a reader that asks for a device that was.
+#
+# Floor of 1 so the schema is stable on a CPU-only analysis session -- the
+# column set must not depend on whether the machine writing it had a GPU, or
+# two runs become un-concatenable.
+def _detect_gpu_columns(default: int = 1) -> int:
+    try:
+        if _TORCH_OK and torch.cuda.is_available():
+            return max(1, int(torch.cuda.device_count()))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return max(1, int(os.environ.get("MSC_GPU_COLUMNS", default)))
+
+
+N_GPU_COLUMNS = _detect_gpu_columns()
 
 NA = "NA"          # what a column holds when the quantity does not exist
 
@@ -4730,6 +4840,65 @@ ENERGY_SAMPLE_COLUMNS = [
     "unix_ts", "datetime_utc", "monotonic_sec", "epoch", "stage",
     "gpu_index", "power_w",
 ]
+
+
+def soft_target_ce(logits, target, crit=None):
+    """Cross-entropy against a soft target, honouring label smoothing.
+
+    `nn.CrossEntropyLoss` accepts probability targets from torch 1.10, so this
+    delegates rather than reimplementing -- but it exists as a named function so
+    the mixup path has one obvious place to be tested, and so the training loop
+    reads the same whether targets are hard or soft.
+    """
+    crit = crit or nn.CrossEntropyLoss()
+    return crit(logits, target)
+
+
+def mixup_cutmix(x, y, num_classes: int, cfg: Dict[str, Any],
+                 generator=None) -> Tuple[Any, Any, bool]:
+    """The DeiT augmentation arm. Returns `(x, target, target_is_soft)`.
+
+    Off unless `mixup_alpha` or `cutmix_alpha` is positive, so it is a no-op for
+    seven of the eight architectures and returns the hard labels unchanged.
+
+    This is the ONLY thing that differs between `vit_small_p16` and
+    `deit_small` besides drop-path and the crop range -- same geometry, same
+    optimiser, same LR, same weight decay, same schedule, same epoch count. The
+    pair is the study's recipe-versus-architecture control, so what varies
+    across it has to be exactly this and nothing else.
+
+    Applied to backbone training only. It is deliberately NOT applied in
+    `train_msc_kd`: the MSC target is a per-sample property of a specific image,
+    and mixing two images produces a sample whose "minimum sufficient compute"
+    is undefined. Mixing there would silently train the router on targets that
+    do not correspond to their inputs.
+    """
+    ma = float(cfg.get("mixup_alpha", 0.0) or 0.0)
+    ca = float(cfg.get("cutmix_alpha", 0.0) or 0.0)
+    if ma <= 0 and ca <= 0:
+        return x, y, False
+    n = x.shape[0]
+    perm = torch.randperm(n, device=x.device)
+    y1 = F.one_hot(y, num_classes).float()
+    y2 = y1[perm]
+    use_cutmix = ca > 0 and (ma <= 0 or float(torch.rand(1)) < 0.5)
+    if use_cutmix:
+        lam = float(np.random.beta(ca, ca))
+        h, w = x.shape[-2], x.shape[-1]
+        rh, rw = int(h * math.sqrt(1 - lam)), int(w * math.sqrt(1 - lam))
+        cy, cx = int(torch.randint(0, h, (1,))), int(torch.randint(0, w, (1,)))
+        y0_, y1_ = max(0, cy - rh // 2), min(h, cy + rh // 2)
+        x0_, x1_ = max(0, cx - rw // 2), min(w, cx + rw // 2)
+        x = x.clone()
+        x[:, :, y0_:y1_, x0_:x1_] = x[perm][:, :, y0_:y1_, x0_:x1_]
+        # lam is RECOMPUTED from the box that was actually pasted, not from the
+        # sampled value. Clipping at the image edge makes them differ, and using
+        # the sampled lam would mislabel every clipped sample.
+        lam = 1.0 - ((y1_ - y0_) * (x1_ - x0_) / float(h * w))
+    else:
+        lam = float(np.random.beta(ma, ma))
+        x = lam * x + (1.0 - lam) * x[perm]
+    return x, lam * y1 + (1.0 - lam) * y2, True
 
 
 def build_optimizer(model, cfg):
@@ -5218,6 +5387,266 @@ def save_checkpoint(path, cfg, model, optimizer, scheduler, scaler, epoch: int,
     })
 
 
+class _SyntheticLoader:
+    """A loader-shaped object over `n` batches of noise, with the same
+    `(x, y, sample_idx)` contract the real loaders yield.
+
+    `sample_idx` is real and distinct, because every per-sample artifact is
+    written back in `sample_idx` order and a dry run over indistinguishable
+    indices would not exercise the reordering that alignment depends on.
+    """
+
+    def __init__(self, device, n_batches: int, batch: int, res: int,
+                 n_cls: int, seed: int = 0):
+        g = torch.Generator().manual_seed(seed)
+        self._b = []
+        for i in range(n_batches):
+            x = torch.randn(batch, 3, res, res, generator=g)
+            y = torch.randint(0, n_cls, (batch,), generator=g)
+            idx = torch.arange(i * batch, (i + 1) * batch)
+            self._b.append((x, y, idx))
+        self.dataset = list(range(n_batches * batch))
+        self.batch_size = batch
+
+    def __iter__(self):
+        return iter(self._b)
+
+    def __len__(self):
+        return len(self._b)
+
+
+def backbone_dry_run(cfg: Dict[str, Any], device=None,
+                     amp: Optional[bool] = None) -> Tuple[bool, str]:
+    """Push one synthetic batch through the ENTIRE backbone-training path
+    before any real work. Returns (ok, reason). Sub-second.
+
+    Rule 1, and the reason it is phrased as "the entire path including
+    evaluation": D-21 and D-22 each cost an hour of GPU time and each was
+    findable in milliseconds, but they were findable at *different* stages.
+    D-21 was the first training step; D-22 was the history write at the END of
+    epoch 0. A dry run that stopped after `loss.backward()` would have caught
+    one and not the other -- it would have moved the boundary of what can hide,
+    not removed it.
+
+    So this covers, in order, every stage `train_backbone` performs per epoch:
+
+        build -> forward -> loss -> backward -> optimiser step -> scaler
+        -> optimisation_health -> evaluate() -> calibration
+        -> history row -> append_history_row(strict=True)
+        -> save_checkpoint -> load_checkpoint (config_hash asserted)
+
+    The checkpoint round trip is here deliberately. Five defects in this
+    project have been about resume (D-05, D-06, D-09, D-12, D-19) and the
+    cheapest of them cost 30 GPU-hours. Reading the checkpoint back in the same
+    second it was written cannot prove cross-session resume works -- that is
+    O-18 and needs a real session boundary -- but it does prove the contract
+    round-trips at all, which is the part that was silently broken.
+    """
+    if not _TORCH_OK:
+        return True, "torch unavailable; dry run skipped"
+    import tempfile as _tf
+    t0 = time.time()
+    dev = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    ds = str(cfg.get("dataset_name", "cifar100"))
+    amp = bool(cfg.get("amp_enabled", True)) if amp is None else bool(amp)
+    amp = amp and dev.type == "cuda"
+    stage = "build"
+    try:
+        n_cls = num_classes_for(ds)
+        res = int(cfg.get("input_res", native_res(ds)))
+        model = build_model(cfg["arch"], n_cls, dataset=ds).to(dev)
+        if cfg.get("channels_last"):
+            model = model.to(memory_format=torch.channels_last)
+
+        stage = "optimizer"
+        opt, sched = build_optimizer(model, cfg)
+        scaler = torch.amp.GradScaler(dev.type, enabled=amp)
+        crit = nn.CrossEntropyLoss(
+            label_smoothing=float(cfg.get("label_smoothing", 0.0)))
+
+        loader = _SyntheticLoader(dev, 2, 2, res, n_cls, seed=int(cfg.get("seed", 1)))
+        x, y, _ = next(iter(loader))
+        x, y = x.to(dev), y.to(dev)
+        if cfg.get("channels_last"):
+            x = x.contiguous(memory_format=torch.channels_last)
+
+        stage = "forward/loss/backward"
+        # Mixup is part of the deit arm's recipe, so it is part of the path and
+        # must be exercised. A soft-target loss that cannot autocast is exactly
+        # the D-21 shape.
+        xm, ym, soft = mixup_cutmix(x, y, n_cls, cfg)
+        with torch.amp.autocast(device_type=dev.type, enabled=amp):
+            out = model(xm)
+            loss = soft_target_ce(out, ym, crit) if soft else crit(out, ym)
+        if not bool(torch.isfinite(loss).item()):
+            return False, f"loss is not finite ({float(loss)}) on synthetic input"
+        scaler.scale(loss).backward()
+        if float(cfg.get("grad_clip_norm", 0.0)) > 0:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                           float(cfg["grad_clip_norm"]))
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+        if sched is not None:
+            sched.step()
+
+        stage = "optimisation_health"
+        _h, _flat = optimisation_health(model)
+
+        stage = "evaluate"
+        val = evaluate(model, loader, dev, amp=amp, criterion=crit,
+                       collect_probs=True)
+        for k in ("loss", "accuracy", "accuracy_top5", "f1_macro"):
+            if k not in val:
+                return False, f"evaluate() did not return '{k}'"
+
+        stage = "history row"
+        with _tf.TemporaryDirectory() as td:
+            row = {"run_id": cfg["run_id"], "epoch": 0,
+                   "arch": cfg["arch"], "seed": cfg["seed"],
+                   "phase": cfg.get("phase", "p1"),
+                   "config_hash": cfg["config_hash"],
+                   "train_loss": float(loss), "val_loss": float(val["loss"]),
+                   "val_accuracy": float(val["accuracy"]),
+                   "learning_rate": float(opt.param_groups[0]["lr"]),
+                   "amp_enabled": bool(amp)}
+            row.update({k: v for k, v in _h.items() if k in _HISTORY_SET})
+            # strict=True: an unknown column RAISES and names the column you
+            # probably meant. This is the check that would have caught D-22's
+            # five wrong names in microseconds instead of at the end of epoch 0
+            # on a real teacher.
+            append_history_row(Path(td) / "epochs.csv", row, strict=True)
+
+            stage = "checkpoint round trip"
+            ck = Path(td) / "ckpt.pt"
+            save_checkpoint(ck, cfg, model, opt, sched, scaler, epoch=0,
+                            best_metric=float(val["accuracy"]), dynamics=None,
+                            wall_seconds=1.0, energy_joules=0.0)
+            m2 = build_model(cfg["arch"], n_cls, dataset=ds).to(dev)
+            o2, s2 = build_optimizer(m2, cfg)
+            sc2 = torch.amp.GradScaler(dev.type, enabled=amp)
+            start, best, _dyn, wall, joules = load_checkpoint(
+                ck, cfg, m2, o2, s2, sc2)
+            if int(start) != 1:
+                return False, (f"checkpoint says resume at epoch {start}, "
+                               f"expected 1 after writing epoch 0")
+            if abs(float(best) - float(val["accuracy"])) > 1e-6:
+                return False, f"best_metric did not round-trip ({best})"
+
+        del model, opt, scaler
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        return True, f"ok ({time.time() - t0:.2f}s, {res}px, {n_cls} classes)"
+    except Exception as e:                                       # noqa: BLE001
+        return False, f"at stage '{stage}': {type(e).__name__}: {e}"
+
+
+def oracle_dry_run(cfg: Dict[str, Any], device=None,
+                   amp: Optional[bool] = None) -> Tuple[bool, str]:
+    """Push two synthetic images through the ENTIRE measurement path.
+
+    `run_oracle` trains exit heads over the full training set and then sweeps
+    every configuration on every sample, so the first artifact it writes is
+    roughly an hour in. Everything downstream of that hour is covered here:
+
+        multi-exit build -> sweep_all_axes over EVERY axis at EVERY resolution
+        and EVERY precision -> difficulty_battery -> prediction_depth
+        -> build_per_sample_frame -> parquet WRITE -> parquet READ BACK
+        -> compute_msc on the result
+
+    The resolution sweep is the expensive part to get wrong and the cheapest to
+    check. On CIFAR this exact class of failure produced D-01a (a ViT whose
+    positional embedding is sized for one grid) and D-02 (a Mixer whose
+    token-mixing weights ARE the token count). At 224px there is a third: a
+    Swin-T reduces its input by 32, so its final stage is 7x7 at 224 and 3x3 at
+    96 -- smaller than its own attention window.
+
+    The parquet round trip is here because `build_per_sample_frame` is where
+    column names are invented, and a column name that is wrong is invisible
+    until analysis (D-22, D-36).
+    """
+    if not _TORCH_OK:
+        return True, "torch unavailable; dry run skipped"
+    import tempfile as _tf
+    t0 = time.time()
+    dev = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    ds = str(cfg.get("dataset_name", "cifar100"))
+    amp = bool(cfg.get("amp_enabled", True)) if amp is None else bool(amp)
+    amp = amp and dev.type == "cuda"
+    stage = "build"
+    try:
+        n_cls = num_classes_for(ds)
+        res = int(cfg.get("input_res", native_res(ds)))
+        grid = resolutions_for(ds)
+        bb = build_model(cfg["arch"], n_cls, dataset=ds).to(dev).eval()
+        # K from the model. Never a literal -- D-01b, D-28 and D-33 were all
+        # this, and D-33 was a hardcoded 5 inside the check written for D-28.
+        me = MultiExit(bb, n_cls).to(dev).eval()
+        n_heads = len(me.heads)
+        if n_heads != len(bb.feature_dims):
+            return False, (f"MultiExit built {n_heads} heads for a backbone "
+                           f"with {len(bb.feature_dims)} feature dims")
+
+        loader = _SyntheticLoader(dev, 2, 2, res, n_cls, seed=1)
+
+        stage = f"sweep_all_axes ({n_heads} depth + {len(grid)}x2 res + "\
+                f"{len(PRECISIONS)} precision)"
+        sweep = sweep_all_axes(cfg, me, loader, dev, amp=amp, show_progress=False)
+        n = len(loader.dataset)
+        for axis in ("depth", "res_proxy", "precision"):
+            if axis not in sweep:
+                return False, f"sweep produced no '{axis}' axis"
+            got = sweep[axis]["preds"].shape
+            want_k = {"depth": n_heads, "res_proxy": len(grid),
+                      "precision": len(PRECISIONS)}[axis]
+            if got != (n, want_k):
+                return False, f"{axis} preds are {got}, expected {(n, want_k)}"
+        native_ok = "res_native" in sweep
+
+        stage = "difficulty_battery"
+        battery = difficulty_battery(bb, loader, dev, amp=amp)
+
+        stage = "prediction_depth"
+        pdep = prediction_depth(me, loader, dev, k_neighbors=2, max_support=n)
+
+        stage = "build_per_sample_frame"
+        frame = build_per_sample_frame(
+            sweep, battery, pdep, None, order_hash="dryrun",
+            run_id=cfg["run_id"], split="test")
+        if frame is None or len(frame) != n:
+            return False, f"per-sample frame has {0 if frame is None else len(frame)} rows, expected {n}"
+
+        stage = "parquet round trip"
+        with _tf.TemporaryDirectory() as td:
+            p = Path(td) / "test.parquet"
+            frame.to_parquet(p, index=False)
+            back = pd.read_parquet(p)
+            missing = set(frame.columns) - set(back.columns)
+            if missing:
+                return False, f"parquet lost columns: {sorted(missing)[:6]}"
+            if len(back) != n:
+                return False, f"parquet round trip lost rows ({len(back)} of {n})"
+
+        stage = "compute_msc"
+        budgets = build_budget_table(cfg["arch"], ds, n_cls, model=bb.cpu())
+        rho = budgets["axes"]["depth"]["rho"]
+        if not all(rho[i] < rho[i + 1] for i in range(len(rho) - 1)):
+            return False, f"depth rho is not strictly ascending: {rho}"
+        msc = msc_for_run(back, budgets, axis="depth", tau=0.1)
+        if msc is None or len(msc) != n:
+            return False, "msc_for_run did not return one value per sample"
+
+        del bb, me
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        return True, (f"ok ({time.time() - t0:.2f}s, K={n_heads}, "
+                      f"native-res sweep {'available' if native_ok else 'PROXY ONLY'}, "
+                      f"{len(frame.columns)} per-sample columns)")
+    except Exception as e:                                       # noqa: BLE001
+        return False, f"at stage '{stage}': {type(e).__name__}: {e}"
+
+
 def msckd_dry_run(cfg: Dict[str, Any], teacher, device, amp: bool,
                   alpha: float, beta: float, temperature: float
                   ) -> Tuple[bool, str]:
@@ -5247,8 +5676,14 @@ def msckd_dry_run(cfg: Dict[str, Any], teacher, device, amp: bool,
         _bb = build_model(cfg["arch"], n_cls)
         n_heads = len(_bb.feature_dims)
         student = MSCStudent(_bb, n_cls, n_heads).to(device)
-        x = torch.randn(2, 3, int(cfg.get("image_size", 32)),
-                        int(cfg.get("image_size", 32)), device=device)
+        # Resolution from the dataset, not from a `cfg.get(..., 32)` default.
+        # The old fallback meant an ImageNet run whose config happened to omit
+        # `image_size` would dry-run at 32px, pass, and then fail for real an
+        # hour later at 224 -- a dry run that certifies the wrong shape is worse
+        # than none, because it manufactures confidence (D-06).
+        _r = int(cfg.get("input_res",
+                         native_res(cfg.get("dataset_name", "cifar100"))))
+        x = torch.randn(2, 3, _r, _r, device=device)
         y = torch.zeros(2, dtype=torch.long, device=device)
         tgt = torch.zeros(2, n_heads, device=device)   # D-33: not a literal
         tgt[:, max(0, n_heads - 2):] = 1.0
@@ -5671,6 +6106,21 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     """
     if not _TORCH_OK:
         raise RuntimeError(f"torch unavailable: {_TORCH_ERR}")
+
+    # RULE 1. The entire path -- forward, loss, backward, optimiser step,
+    # evaluate(), history write, checkpoint save AND reload -- on one synthetic
+    # batch, before the dataset is touched. Under a second.
+    #
+    # BEFORE the claim, deliberately. A run that cannot train should not appear
+    # in the ledger as `running` and should not need its claim released; and a
+    # broken config then fails identically on every worker rather than on
+    # whichever one happened to claim it first.
+    _dry_ok, _dry_why = backbone_dry_run(cfg)
+    if not _dry_ok:
+        raise RuntimeError(
+            f"[DRY RUN FAILED] {cfg['run_id']}: {_dry_why}\n"
+            f"No GPU time has been spent and nothing has been claimed.")
+    log(f"backbone dry run {_dry_why}", "DRY")
 
     run_id = cfg["run_id"]
     work = Path(work_root or (WORK_ROOT / "msc"))
@@ -6611,6 +7061,22 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     """
     if not _TORCH_OK:
         raise RuntimeError(f"torch unavailable: {_TORCH_ERR}")
+
+    # RULE 1. Two synthetic images through the ENTIRE measurement path --
+    # every axis at every resolution and every precision, the difficulty
+    # battery, prediction depth, the per-sample frame, a parquet write and
+    # READ BACK, and compute_msc on the result -- before the exit heads are
+    # trained over the full training set. Under a second against an hour.
+    _dry_ok, _dry_why = oracle_dry_run(cfg)
+    if not _dry_ok:
+        raise RuntimeError(
+            f"[DRY RUN FAILED] {cfg['run_id']}: {_dry_why}\n"
+            f"No GPU time has been spent. The resolution sweep is the part "
+            f"this exists for: D-01a and D-02 were both an architecture that "
+            f"could not run at a resolution the oracle assumed, and at 224px "
+            f"Swin-T's final stage is smaller than its own attention window "
+            f"at the low end of the grid.")
+    log(f"oracle dry run {_dry_why}", "DRY")
 
     run_id = cfg["run_id"]
     work = Path(work_root or (WORK_ROOT / "msc"))
@@ -8588,6 +9054,15 @@ class Session:
         - **at risk**   -- neither. This alone is worth an alarm.
 
         Pass `require=(...)` to check specific paths instead.
+
+        **Rule 9. Every lookup below goes through `resolve`, per file.** This
+        used to call `list_repo_files` once and test membership of the result.
+        That is the tree endpoint, it is CDN-cached, and on 2026-08-02 it served
+        this project a stale page twice and a silently truncated body once --
+        producing a confident, wrong, negative finding that stood in the lab
+        notebook for two days. A method whose entire job is answering "is my
+        work safe?" cannot be built on an endpoint that has lied to us three
+        times.
         """
         ids = list(run_ids)
         empty = {"ok": [], "done": [], "resumable": [], "at_risk": [],
@@ -8596,26 +9071,36 @@ class Session:
             if verbose:
                 print("[VERIFY] HF disabled -- cannot confirm anything")
             return empty
-        try:
-            have = set(self.hub.hub.list_repo_files())
-        except Exception as e:                               # noqa: BLE001
-            log(f"could not list the repo: {type(e).__name__}: {e}. "
-                f"Treat this as UNCONFIRMED, not as success.", "ALARM")
-            return empty
 
         latest = self.registry.latest()
         done, resumable, at_risk = [], [], []
-        for r in ids:
-            base = f"runs/{r}/"
-            if require:
-                (done if all(f"{base}{x}" in have for x in require)
-                 else at_risk).append(r)
-            elif f"{base}summary.json" in have:
-                done.append(r)
-            elif f"{base}checkpoints/ckpt_last.pt" in have:
-                resumable.append(r)
-            else:
-                at_risk.append(r)
+        try:
+            for r in ids:
+                base = f"runs/{r}/"
+                if require:
+                    got = self.hub.hub.files_present([f"{base}{x}" for x in require])
+                    (done if all(v is not None for v in got.values())
+                     else at_risk).append(r)
+                    continue
+                # Cheapest sufficient question first: a finished run needs one
+                # lookup, not two.
+                if self.hub.hub.resolve_meta(f"{base}summary.json") is not None:
+                    done.append(r)
+                elif self.hub.hub.resolve_meta(
+                        f"{base}checkpoints/ckpt_last.pt") is not None:
+                    resumable.append(r)
+                else:
+                    at_risk.append(r)
+        except Exception as e:                               # noqa: BLE001
+            # `resolve_meta` raises rather than returning None on a lookup that
+            # failed for any reason other than 404, so this branch means we do
+            # not know -- which must be reported as not knowing. Reporting
+            # "at risk" here would be the D-20 false alarm; reporting "safe"
+            # would be worse.
+            log(f"could not confirm against the repo: {type(e).__name__}: {e}. "
+                f"Treat this as UNCONFIRMED, not as success and not as loss.",
+                "ALARM")
+            return empty
 
         if verbose:
             print(f"\n[VERIFY] {len(ids)} run(s): {len(done)} finished, "
@@ -9051,11 +9536,27 @@ def resume_acceptance_test(session: "Session", arch: str = "resnet20",
 # 18. selftest -- offline, no GPU, no network
 # =============================================================================
 def _selftest() -> bool:
-    ok = True
+    # D-37. The verdict is accumulated in LISTS, not in a boolean.
+    #
+    # This used to be `ok = True` plus `ok &= cond`, and 900 lines later a line
+    # reading `ok, z, sd = shuffled_control_verdict(...)` REBOUND it -- wiping
+    # every result before that point and replacing it with the outcome of one
+    # unrelated test. The suite printed `[FAIL]` and then `ALL CHECKS PASSED`
+    # and exited 0. Roughly 80% of the checks could not affect the verdict.
+    #
+    # A list cannot be destroyed by an accidental `_ran = ...` the way a scalar
+    # can: appending mutates, so the only way to lose a result is to rebind the
+    # name AND that shows up immediately as a count that stopped growing --
+    # which the floor check below detects. A test harness that cannot fail is
+    # worse than no harness, because it manufactures confidence (D-06), and the
+    # fix has to be structural rather than "do not shadow that name".
+    _ran: List[str] = []
+    _failed: List[str] = []
 
     def check(name, cond, detail=""):
-        nonlocal ok
-        ok &= bool(cond)
+        _ran.append(name)
+        if not cond:
+            _failed.append(name)
         d = str(detail)
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {d}" if d else ""))
 
@@ -9401,11 +9902,20 @@ def _selftest() -> bool:
         "training time": ["train_time_sec"],
         "validation time": ["val_time_sec"],
         "gpu memory usage": ["peak_vram_mb", "vram_allocated_mb", "gpu0_mem_used_mb"],
-        "gpu utilization (per gpu)": ["gpu0_util_mean_pct", "gpu1_util_mean_pct"],
+        # Derived from N_GPU_COLUMNS, not pinned to two. The requirement is
+        # "utilisation, per GPU" -- which means one column per device the
+        # machine ACTUALLY has, not per device the original platform had.
+        # Pinning it to 2 is the same defect as D-36 read from the other end:
+        # there, a reader asked for an un-suffixed `gpu_util_mean_pct` that
+        # never existed; here, a test demanded a `gpu1_*` that should not exist
+        # on a single-GPU box.
+        "gpu utilization (per gpu)": [f"gpu{i}_util_mean_pct"
+                                      for i in range(N_GPU_COLUMNS)],
         "energy consumed": ["epoch_energy_j", "epoch_energy_kwh",
                             "cumulative_energy_kwh"],
         "carbon emission": ["epoch_co2_g", "epoch_co2_kg", "cumulative_co2_kg"],
-        "temperature": ["gpu0_temp_mean_c", "gpu0_temp_max_c", "gpu1_temp_max_c"],
+        "temperature": (["gpu0_temp_mean_c"]
+                        + [f"gpu{i}_temp_max_c" for i in range(N_GPU_COLUMNS)]),
         "kd loss": ["loss_kd"],
         "feature loss": ["loss_feature"],
         "attention loss": ["loss_attention"],
@@ -9416,9 +9926,17 @@ def _selftest() -> bool:
     missing = {k: [c for c in v if c not in H] for k, v in REQ_151.items()}
     missing = {k: v for k, v in missing.items() if v}
     check("every 15.1 requirement has a column", not missing, str(missing))
-    check("per-GPU columns exist for both T4s",
-          all(f"gpu{i}_{k}" in H for i in range(2)
-              for k in ("util_mean_pct", "temp_max_c", "mem_used_mb", "energy_j")))
+    check(f"per-GPU columns exist for all {N_GPU_COLUMNS} device(s)",
+          all(f"gpu{i}_{k}" in H for i in range(N_GPU_COLUMNS)
+              for k in ("util_mean_pct", "temp_max_c", "mem_used_mb", "energy_j")),
+          f"detected {N_GPU_COLUMNS} GPU(s)")
+    check("the GPU column count is derived, not assumed",
+          N_GPU_COLUMNS == _detect_gpu_columns(),
+          "dual T4 was the CIFAR platform; the port target has one RTX 4000 Ada")
+    check("there is at least one GPU device column even with no GPU",
+          N_GPU_COLUMNS >= 1 and "gpu0_util_mean_pct" in H,
+          "the schema must not change shape depending on whether the machine "
+          "writing it had a GPU, or two runs become un-concatenable")
     check("deleted loss terms have columns, to be filled NA",
           all(f"loss_{t}" in H for t in OPTIONAL_LOSS_TERMS))
     check("no duplicate columns", len(HISTORY_FIELDS) == len(H),
@@ -10011,8 +10529,8 @@ def _selftest() -> bool:
     # The exact case that failed NB11: convnext_femto x resnet20, raw rho of
     # -0.0341 at n=5872. That is 2.6 sigma -- a 1-in-113 draw, seen once across
     # 78 pairs, which is precisely what "expected" looks like.
-    ok, z, sd = shuffled_control_verdict(-0.0341, 5872)
-    check("D-17: a healthy 2.6-sigma residual passes", ok, f"z={z:+.2f}")
+    _sc_ok, z, sd = shuffled_control_verdict(-0.0341, 5872)
+    check("D-17: a healthy 2.6-sigma residual passes", _sc_ok, f"z={z:+.2f}")
     check("D-17: null SD matches 1/sqrt(n-1)", abs(sd - 1 / math.sqrt(5871)) < 1e-12)
     check("D-17: the old |T|<0.05 rule would have failed it",
           abs(-0.0341 / math.sqrt(0.7084 * 0.6425)) > 0.05,
@@ -10114,6 +10632,121 @@ def _selftest() -> bool:
           f"-- schedule length is held constant so it cannot join accuracy and "
           f"family as a third confounded variable, which is what happened on "
           f"CIFAR (240 vs 300 epochs)")
+
+    print("dry runs are WIRED IN, not merely written (rule 1)")
+    # Rule 7: an invariant in a comment is not a mechanism. Writing three dry
+    # runs is worth nothing if a later edit drops the call, and the symptom of
+    # that is an hour of GPU time, not an error. So the wiring is asserted from
+    # the source itself.
+    #
+    # It checks POSITION, not just presence: the dry run must appear before the
+    # first expensive call in each function. `msckd_dry_run` was written for
+    # O-19 and then filed for later, which cost two more hour-long cycles
+    # before it was actually installed.
+    import inspect as _insp
+    for _fn, _dry, _expensive in (
+            (train_backbone, "backbone_dry_run", "build_loaders"),
+            (run_oracle, "oracle_dry_run", "build_loaders"),
+            (train_msc_kd, "msckd_dry_run", "sweep_all_axes")):
+        try:
+            _src = _insp.getsource(_fn)
+        except Exception:                                        # noqa: BLE001
+            check(f"{_fn.__name__} source readable", False)
+            continue
+        _has = _dry in _src
+        _pos_ok = _has and (_expensive not in _src
+                            or _src.index(_dry) < _src.index(_expensive))
+        check(f"{_fn.__name__} calls {_dry}", _has)
+        check(f"{_fn.__name__} calls it BEFORE {_expensive}", _pos_ok,
+              "a dry run that runs after the expensive part is decoration")
+    check("the backbone dry run goes all the way to a checkpoint round trip",
+          "load_checkpoint" in _insp.getsource(backbone_dry_run)
+          and "evaluate(" in _insp.getsource(backbone_dry_run),
+          "D-22 failed at the END of epoch 0; stopping the dry run at "
+          "backward() would move where bugs hide rather than remove the hiding "
+          "place")
+    check("the oracle dry run reads its parquet BACK",
+          "read_parquet" in _insp.getsource(oracle_dry_run),
+          "writing correctly and reading correctly are different claims")
+    check("the oracle dry run sweeps every axis and every score",
+          all(x in _insp.getsource(oracle_dry_run)
+              for x in ("sweep_all_axes", "difficulty_battery",
+                        "prediction_depth", "msc_for_run")))
+    check("every dry run derives its resolution from the dataset",
+          all(("native_res" in _insp.getsource(f)) or ("input_res" in _insp.getsource(f))
+              for f in (backbone_dry_run, oracle_dry_run, msckd_dry_run)),
+          "msckd_dry_run defaulted to `cfg.get('image_size', 32)`, which would "
+          "have certified an ImageNet run at 32px -- a dry run that passes on "
+          "the wrong shape is worse than none (D-06)")
+    check("...and none of them spells a resolution literal",
+          not any(re.search(r"torch\.randn\(\s*\d+\s*,\s*3\s*,\s*\d+\s*,",
+                            _insp.getsource(f))
+                  for f in (backbone_dry_run, oracle_dry_run, msckd_dry_run)),
+          "a literal in the shape is the D-33 defect: two hardcoded 5s built a "
+          "5-output router on a 3-exit backbone INSIDE the check written to "
+          "catch exactly that")
+
+    print("atomic writes survive Windows")
+    _ar = tmp / "atomic"
+    ensure_dir(_ar)
+    atomic_write_text(_ar / "x.txt", "one")
+    atomic_write_text(_ar / "x.txt", "two")
+    check("overwrite via atomic replace", (_ar / "x.txt").read_text() == "two")
+    check("no .tmp survives", not (_ar / "x.txt.tmp").exists())
+    check("_atomic_replace retries rather than raising immediately",
+          "PermissionError" in _insp.getsource(_atomic_replace)
+          and "attempts" in _insp.getsource(_atomic_replace),
+          "os.replace is unconditional on POSIX but raises on Windows if any "
+          "process holds the destination open -- an indexer, a preview, or the "
+          "uploader thread reading the very checkpoint being rewritten")
+    check("...and raises at the end rather than losing data silently",
+          "has NOT been lost" in _insp.getsource(_atomic_replace))
+
+    print("HF verification goes through resolve only (rule 9)")
+    _hubsrc = _insp.getsource(MSCHub)
+    def _calls(fn) -> Set[str]:
+        """Names actually CALLED by a function, parsed rather than grepped.
+
+        A substring search over the source matched the docstrings that explain
+        why `list_repo_files` must not be used, and reported the fix as absent.
+        A check that reads prose is checking the wrong artifact -- the same
+        mistake as trusting a comment to be a mechanism (rule 7), one level up.
+        """
+        import ast as _ast
+        try:
+            t = _ast.parse(textwrap.dedent(_insp.getsource(fn)))
+        except Exception:                                        # noqa: BLE001
+            return set()
+        out = set()
+        for nd in _ast.walk(t):
+            if isinstance(nd, _ast.Call):
+                f = nd.func
+                out.add(getattr(f, "attr", None) or getattr(f, "id", None) or "")
+        return out - {""}
+
+    _vp, _cf = _calls(RunSync.verify_present), _calls(Session.confirm_on_hf)
+    check("verify_present CALLS files_present and not list_repo_files",
+          "files_present" in _vp and "list_repo_files" not in _vp,
+          "confirm-then-delete is the last thing between a completed run and "
+          "rmtree")
+    check("confirm_on_hf CALLS resolve_meta/files_present, not list_repo_files",
+          ({"resolve_meta", "files_present"} & _cf) and "list_repo_files" not in _cf,
+          "the tree endpoint served this project stale data three times and "
+          "produced a confident wrong negative that stood for two days")
+    check("the parse-based check can tell prose from code",
+          "list_repo_files" in _insp.getsource(RunSync.verify_present)
+          and "list_repo_files" not in _vp,
+          "the docstring names it precisely to say it must not be called; a "
+          "substring check called that a failure")
+    check("resolve_meta returns None ONLY for a real 404",
+          "Refusing to report absence" in
+          _insp.getsource(BackgroundUploader.resolve_meta),
+          "a negative finding produced by a dropped connection is the D-20 "
+          "false alarm; absence must be established, not inferred from failure")
+    check("files_present asks per file, with no aggregate to truncate",
+          "resolve_meta" in _insp.getsource(BackgroundUploader.files_present),
+          "the repo-info body was silently truncated mid-JSON at ~69 KB and the "
+          "cut landed just past `vgg8`, exactly where the missing runs were")
 
     print("dataset registry")
     check("cifar100 native resolution", native_res("cifar100") == 32)
@@ -10229,6 +10862,28 @@ def _selftest() -> bool:
         print("  [SKIP] torch unavailable -- model checks run in notebook 00")
 
     shutil.rmtree(tmp, ignore_errors=True)
+    # The harness checks ITSELF before reporting. Rule 8: test the thing you
+    # wrote. `check` is the thing this whole file is written around, and until
+    # D-37 nothing verified that a failing check could actually fail the run.
+    _probe_before = len(_failed)
+    check("D-37: the harness registers a failure", False, "canary -- expected FAIL")
+    canary_worked = len(_failed) == _probe_before + 1
+    _failed.pop() if canary_worked else None
+    _ran.pop()
+
+    N_FLOOR = 250          # checks that must RUN, not merely pass
+    ran_enough = len(_ran) >= N_FLOOR
+    ok = (not _failed) and canary_worked and ran_enough
+
+    print(f"\n  {len(_ran)} checks run, {len(_failed)} failed")
+    if not canary_worked:
+        print("  *** THE HARNESS ITSELF IS BROKEN -- a failing check did not "
+              "register. Every result above is meaningless.")
+    if not ran_enough:
+        print(f"  *** ONLY {len(_ran)} CHECKS RAN, expected at least {N_FLOOR}. "
+              f"The suite stopped early or a section was lost.")
+    for _f in _failed:
+        print(f"  FAILED: {_f}")
     print("\n" + ("ALL CHECKS PASSED" if ok else "FAILURES PRESENT"))
     return ok
 
