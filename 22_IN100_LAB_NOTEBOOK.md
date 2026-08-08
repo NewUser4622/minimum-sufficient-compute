@@ -103,7 +103,7 @@ have been.
 | `set_per_process_memory_fraction(0.70)` | caps the process at ~14 of 20 GiB, so an oversized batch raises a **catchable Python OOM** long before the driver is starved. Prevention, not reaction |
 | **every configuration in its own subprocess** | a child that OOMs, hangs or dies takes nothing with it; the OS reclaims its CUDA context and its workers on exit |
 | **hard timeout, killing the process *tree*** | a hung config is killed in seconds. The tree matters: an orphaned worker holding the 24 GiB memmap is how the *next* config runs out of RAM |
-| batch ceiling 256 → 192, workers 16 → 8 | the top of the old ladder existed to find the OOM point. It is not worth finding |
+| **the batch ladder deleted outright** (second pass) | it was the dangerous stage and a useless one — see below |
 | `torch.compile` **off by default** | Triton on Windows is unreliable and compilation can hang for minutes with no output |
 | results written **after every configuration** | an interruption costs one data point, not the run |
 | `--plan-only`, `--vram-frac` | the operator can see what it will do, and lower the ceiling further, before it does anything |
@@ -113,10 +113,38 @@ that fails emits a structured result and the parent survives; a deliberately
 hung child is killed at the timeout with the parent alive; the results file
 exists and is valid after every append with no `.tmp` left behind.
 
-**The lesson.** The playbook's rule about dry runs is "never spend an hour
-discovering something findable in a second". This is its neighbour: **a tool
-that probes for a limit must be built so that reaching the limit is survivable**
-— because the whole point of it is to get there.
+**Second pass, after the user asked for the risky parts to be removed
+rather than guarded.** They were right, and the reason is sharper than
+"be careful":
+
+**The batch-size ladder was the dangerous stage AND a scientifically useless
+one.** All eight architectures must share one batch size, or batch joins
+accuracy and family as a confounded variable — learning rate is scaled linearly
+from a reference batch, so eight per-architecture "winners" would be eight
+different recipes. There was never anything to *do* with the ladder's output. It
+risked the machine to produce a number that could not be used.
+
+So it is **gone**, not tuned. Batch is fixed at 64 for every architecture, and
+headroom for larger batches is **predicted from measured peak VRAM** instead:
+
+```
+peak 4.2 GB at batch 64  ->  largest estimated batch 182
+peak 9.1 GB at batch 64  ->  largest estimated batch  84
+```
+
+Activation memory is close to linear in batch, so measuring 64 says what 128
+would cost **without allocating it** — and allocating it is what took the
+machine down. `torch.compile` removed too, as the likeliest thing to hang on
+Windows. 80 configurations → 29, VRAM cap 70% → **50%**, timeout 240 s → 120 s.
+
+**The lesson, in two parts.** The playbook's dry-run rule is "never spend an
+hour discovering something findable in a second". Its neighbour: **a tool that
+probes for a limit must be built so that reaching the limit is survivable.**
+
+And the part I missed until told: **before making a dangerous measurement safe,
+check whether the measurement was needed at all.** I spent a round hardening a
+sweep I should have deleted. The safest configuration is the one that is never
+run.
 
 ---
 

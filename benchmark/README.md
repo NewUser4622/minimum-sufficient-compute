@@ -1,174 +1,172 @@
-# Throughput benchmark — run this before the atlas
+# Throughput benchmark
 
-## ⚠ The first version of this crashed a workstation. Read this section.
-
-It swept batch sizes to 256 at 224px on a 20 GB card with **no VRAM ceiling and
-no isolation between configurations**. On a GPU that is also driving the
-display, that starves the desktop compositor, the driver stops responding for
-more than two seconds, and Windows fires a TDR (Timeout Detection & Recovery)
-reset — which hangs the machine.
-
-Three things were wrong. All three are fixed, and each is verified rather than
-asserted:
-
-| was | now |
-|---|---|
-| PyTorch could allocate all 20 GB | **`set_per_process_memory_fraction(0.70)`** — an oversized batch raises a clean, catchable Python OOM well before the driver runs short. ~6 GB always stays free for the display |
-| every config in one process; one bad allocation poisoned the CUDA context for everything after, and dataloader workers leaked across the sweep | **every configuration runs in its own subprocess.** A child that OOMs, hangs or dies takes nothing with it, and the OS reclaims its CUDA context and workers on exit |
-| a hung kernel hung the sweep, and the machine | **hard timeout per config, then the whole process *tree* is killed** — orphaned workers holding a 24 GiB memmap are how the next config runs out of RAM |
-
-Also: batch ceiling 256 → **192**, workers 16 → **8**, `torch.compile` now **off
-by default** (Triton on Windows is unreliable and compilation can hang), and
-results are written to disk **after every configuration**, so an interruption
-costs one data point rather than the run.
-
-**If the display still stutters, drop the ceiling further:** `--vram-frac 0.5`.
-
-**To see exactly what it will do without running anything:** `--plan-only`.
+**~17 minutes. Send me the JSON it writes.**
 
 ---
 
-## Run it
+## The batch-size ladder is gone
 
-Your command works as-is:
+It was the dangerous stage **and** a useless one, and the second part is why it
+was removed rather than made safer.
+
+> All eight architectures must train at the **same batch size**, or batch size
+> joins accuracy and family as a confounded variable. Learning rate is scaled
+> linearly from a reference batch, so a per-architecture batch "winner" would
+> mean eight different recipes — and the seed-reliability comparison would be
+> measuring the recipe as much as the architecture.
+
+There was never anything to *do* with a per-architecture optimum. The sweep
+risked the machine to produce a number that could not have been used.
+
+What is actually needed: how fast does each architecture train at the batch size
+we are going to use, and does it fit with room to spare. Both are answerable at
+a **fixed batch of 64**, and headroom is now **predicted from measured peak
+VRAM** rather than probed:
 
 ```
-python benchmark/bench_throughput.py --synthetic --data-dir "D:\msc_data\in100"
+peak 4.2 GB at batch 64  ->  largest estimated batch 182   safe: [32, 64, 96, 128]
+peak 9.1 GB at batch 64  ->  largest estimated batch  84   safe: [32, 64]
 ```
 
-though note `--synthetic` *skips* the loader stage, so `--data-dir` does nothing
-alongside it — the script says so and continues. To measure the loader too
-(recommended, it is the stage that tells you whether the small models are
-data-bound), drop `--synthetic`:
+Activation memory is close to linear in batch size, so measuring 64 tells you
+what 128 would cost **without ever allocating it** — and allocating it is what
+took the machine down. *Predict, don't probe.*
+
+`torch.compile` is also removed: it is the thing most likely to hang on Windows.
+
+| | before | now |
+|---|---|---|
+| batch sizes tried | up to **256** | **64 only** (hard ceiling 96) |
+| configurations | ~80 | **~29** |
+| wall time | ~45 min | **~17 min** |
+| VRAM cap | none | **50%** — 10 GiB always free |
+| timeout | none | **120 s**, kills the process tree |
+| `torch.compile` | tried | **removed** |
+| workers ceiling | 16 | **8** |
+
+---
+
+## Run it, in this order
+
+```
+python benchmark/bench_throughput.py --plan-only
+```
+
+Executes **nothing**. Prints the VRAM cap in GiB, the batch size, the timeout,
+the configuration count and the worst case. Read it before anything runs.
+
+```
+python benchmark/bench_throughput.py --quick --vram-frac 0.4
+```
+
+~6 minutes, 40% of the card — the most cautious setting available. **If the
+display stutters at all, stop and tell me.**
 
 ```
 python benchmark/bench_throughput.py --data-dir "D:\msc_data\in100"
 ```
 
+The full run, once you trust it.
+
 | flag | effect |
 |---|---|
-| `--quick` | ~8 min instead of ~30 |
-| `--plan-only` | print the plan, execute nothing |
-| `--vram-frac 0.5` | more headroom for the display |
-| `--timeout 120` | kill a config sooner |
-| `--archs swin_tiny` | one architecture |
-| `--compile` | opt in to `torch.compile` |
-
-Start with `--plan-only`, then `--quick`, then the full run once you trust it.
-
----
-
-## Why bother
-
-The atlas is **~235 GPU-hours** by estimate. A 20% throughput win is 47 hours; a
-40% win is 94. That is worth 45 minutes of measurement.
-
-And it is worth *measuring* rather than assuming, because every number in
-`20_IN100_PORT_PLAN.md` §6 is an estimate anchored on one guessed figure for
-`resnet50`. The CIFAR programme's first cost table was **40% low**, and it only
-found out by running (D-10). The benchmark ends by printing how far the plan was
-off.
-
-It also answers a question the plan cannot: **is this pipeline GPU-bound or
-loader-bound, and does the answer differ by architecture?** If `resnet18` is
-sitting at the loader ceiling, tuning the model buys nothing and the lever is
-workers or the pack format. If everything is GPU-bound, worker count barely
-matters and the lever is batch size and dtype.
+| `--plan-only` | print the plan, run nothing |
+| `--quick` | one variant per architecture (~6 min) |
+| `--vram-frac 0.4` | more headroom for the display |
+| `--timeout 60` | kill a config sooner |
+| `--archs swin_tiny` | one architecture only |
+| `--synthetic` | skip the loader stage |
+| `--batch N` | capped at 96 whatever you pass |
 
 ---
 
-## What it sweeps, and what it deliberately doesn't
+## What remains, and why each is safe
 
-**Not a full grid.** 8 architectures × 5 batch sizes × 5 worker counts × 2
-dtypes × 2 layouts × 3 compile modes is 2,400 configurations and would take
-longer than it saves. Instead a **staged coordinate descent**, each stage fixing
-the winner of the last:
+**dtype × memory layout at batch 64** — 1–3 short runs per architecture. Real
+10–40% effects, and at batch 64 even `vgg16` sits at a few GB. Your card is Ada
+(sm_89) so **bf16 is native**: often the same speed as fp16, with better
+numerics and no loss-scale overflow.
 
-| stage | sweeps | why here |
-|---|---|---|
-| **A** | fp16 vs bf16 × channels_last on/off | 4 configs, biggest per-config effect, cheapest to test. Your card is Ada (sm_89) so **bf16 is native** — often the same speed as fp16 with better numerics and no loss-scale overflow |
-| **B** | batch size 32 → 256, stopping at OOM | finds both the largest that fits and the fastest, which are not always the same |
-| **C** | 0 → 16 dataloader workers, **with no model at all** | the loader's own ceiling. This is the number that says whether stages A/B/D matter |
-| **D** | `torch.compile` at each winner | expensive to compile (30–90 s), so only at one config per architecture. Compile time is charged to warmup, not throughput |
-| **E** | confirmation, longer run, from cold | the stage bests are each a local maximum found under slightly different conditions. A plan built by adding them up would be a *sum of measurements* rather than a measurement |
-
-Coordinate descent can miss an interaction a grid would find. It is used anyway
-because the interactions here are weak — batch size and worker count are close
-to separable once neither is starving — and because a sweep that takes six hours
-will not be run.
+**the loader ceiling** — measured with **no model on the GPU at all**, so it is
+the least risky part of the run. It is also the only way to learn whether
+`resnet18` and `shufflenetv2` are data-bound, which no amount of model tuning
+would reveal. Worth keeping unless you have a reason not to.
 
 ---
 
-## Measurement details that change the answer
+## Safety mechanisms, all exercised
 
-- **`torch.cuda.synchronize()` around every timed region.** CUDA is
-  asynchronous; timing without a sync measures how fast Python can *submit* work
-  to the queue, which is a number about Python.
-- **Warmup before timing** — 6 to 15 steps. Covers CUDA context creation, cuDNN
-  autotuning, and for `torch.compile` the entire graph capture. Without it a
-  compiled model looks catastrophically slow.
-- **Peak VRAM is reported per configuration**, so the chosen batch size has
-  headroom rather than sitting one allocation away from an OOM at epoch 60.
-- **OOM is caught and recorded, not raised.** The ladder stops climbing rather
-  than crashing the sweep.
-- **Stages A, B and D use GPU-resident synthetic batches**, so they measure the
-  *model* with no loader in the way. Stage C measures the loader with no model
-  in the way. Mixing them would give one number that explains nothing.
+| mechanism | what it prevents |
+|---|---|
+| `set_per_process_memory_fraction(0.50)` | an oversized allocation raises a **catchable Python OOM** instead of starving the display driver into a TDR reset |
+| every config in **its own subprocess** | a child that OOMs, hangs or dies takes nothing with it; the OS reclaims its CUDA context and workers on exit |
+| **timeout kills the process *tree*** | an orphaned worker holding the 24 GiB memmap is how the *next* config runs out of RAM |
+| results written **after every config** | an interruption costs one data point, not the run |
+
+Verified rather than asserted: a failing child returns a structured result with
+the parent alive; a deliberately hung child is killed at the timeout; the
+results file is valid after every append with no `.tmp` left behind.
 
 ---
 
-## What it writes
+## Why bother at all
 
-`benchmark/results/bench_<host>_<timestamp>.json`, containing:
+The atlas is **~235 GPU-hours** by estimate. A 20% throughput win is 47 hours.
 
-- every configuration tried, with `img_s`, `peak_vram_gb`, and any error
-- the chosen configuration per architecture
-- the loader ceiling and the wait-vs-augment split
-- a **re-planned run matrix**: seconds per epoch, hours per run, hours × 3
-  seeds, and the atlas total — against measured throughput rather than a guess
-
-Plus a printed table ending with a line comparing the measurement to the plan's
-235-hour estimate.
-
-**Send me that JSON.** I will rewrite `20_IN100_PORT_PLAN.md` §6, re-anchor
-`ARCH_COST_HINT`, and set the per-architecture batch size and dtype in
-`base_config` from it.
+More to the point, every number in `20_IN100_PORT_PLAN.md` §6 is an estimate
+anchored on one guessed figure for `resnet50`. The CIFAR programme's first cost
+table was **40% low** and only found out by running (D-10). This one ends by
+printing how far the plan was off.
 
 ---
 
-## What I expect to see, so you can tell if something is off
+## What I expect to see
 
-Rough priors for an RTX 4000 Ada at 224px. If the measurement is wildly
-different from these, something is misconfigured and worth looking at before
-trusting the sweep:
+Rough priors for an RTX 4000 Ada at 224px, batch 64. Wildly different numbers
+suggest something is misconfigured rather than a property of the hardware.
 
 | arch | expected img/s | if much lower |
 |---|---|---|
-| `resnet18` | 700–1100 | probably loader-bound — check stage C |
+| `resnet18` | 700–1100 | probably loader-bound — check the loader stage |
 | `shufflenetv2_in` | 600–1000 | depthwise convs are bandwidth-bound; low is plausible |
-| `resnet50` | 350–500 | check `channels_last` won stage A |
+| `resnet50` | 350–500 | check `channels_last` won |
 | `vit_small_p16` | 300–450 | check bf16 is being used |
-| `deit_small` | 300–450 | should be within a few % of `vit_small_p16` — **they are the same network**, so a large gap means a bug |
+| `deit_small` | 300–450 | should be within a few % of `vit_small_p16` |
 | `convnext_tiny` | 250–400 | 7×7 depthwise; sensitive to `channels_last` |
-| `swin_tiny` | 200–350 | window attention has poor kernel efficiency; low is expected |
+| `swin_tiny` | 200–350 | window attention has poor kernel efficiency |
 | `vgg16` | 120–200 | very compute-dense |
 
-**`deit_small` and `vit_small_p16` being far apart is the one result that would
-indicate a defect rather than a property of the hardware** — they are built by
-one function with one argument set and differ only in recipe, which the
-benchmark does not exercise.
+**`deit_small` and `vit_small_p16` far apart is the one result that would
+indicate a defect** rather than hardware. They are built by one function with
+one argument set and differ only in training recipe, which this does not touch.
 
 ---
 
-## Two things the benchmark will *not* tell you
+## Two things it will not tell you
 
-- **Whether the models train well.** It measures speed at a fixed number of
-  steps on noise. A configuration can be fast and wrong — bf16 in particular
-  changes numerics. The accuracy question is settled by Phase 0, not here.
-- **Whether the chosen batch size is scientifically right.** Learning rate is
-  scaled linearly from a reference batch, so changing batch size changes the
-  recipe. If the benchmark picks a much larger batch than the plan's 128, that
-  is a *recipe* change and needs to be applied uniformly across all eight
-  architectures — otherwise batch size joins accuracy and family as a
-  confounded variable, which is exactly the mistake the equal-epoch decision
-  was made to avoid.
+- **Whether the models train well.** It measures speed on noise at a fixed step
+  count. A configuration can be fast and wrong — bf16 changes numerics. Accuracy
+  is settled by Phase 0, not here.
+- **Whether to raise the batch size.** The headroom figure is an estimate from a
+  linear model. If you want a larger batch, step **one notch** and re-run this
+  — do not jump to the largest number it prints. And it would have to be applied
+  to all eight architectures uniformly, for the reason at the top of this file.
+
+---
+
+## What went wrong the first time
+
+The original swept to batch 256 at 224px on a 20 GB card that also drives the
+display, in-process, with no VRAM cap and no timeout. That starves the desktop
+compositor; when the driver stops responding for more than ~2 s Windows fires a
+TDR reset and the machine hangs.
+
+The reasoning error, not just the coding one: I wrote a tool whose purpose is to
+find the limits of the hardware and did not treat approaching those limits as
+dangerous. Catching `OutOfMemoryError` felt like sufficient handling — but a
+caught OOM is the *benign* case. The damaging case is the allocation that
+**succeeds** and leaves the display driver with nothing, which no exception
+handler ever sees.
+
+Full write-up, including what it cost: **D-41** in
+[`22_IN100_LAB_NOTEBOOK.md`](../22_IN100_LAB_NOTEBOOK.md).
