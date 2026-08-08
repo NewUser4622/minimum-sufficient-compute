@@ -2500,6 +2500,8 @@ if _TORCH_OK:
             # to prevent (playbook 8).
             self._g = torch.Generator(device="cpu")
             self._g.manual_seed(int(seed))
+            self._wait_s = self._aug_s = 0.0
+            self._n_batches = self._n_sampled = 0
 
         # -- delegation ------------------------------------------------------
         def __len__(self):
@@ -2550,8 +2552,49 @@ if _TORCH_OK:
             th[:, 1, 2] = dy
             return th
 
+        # -- timing -----------------------------------------------------------
+        # `dataload_frac` is one of the five columns the playbook calls out as
+        # impossible to recover after the fact: high means the GPU is starving
+        # and the fix is the loader, not the model.
+        #
+        # Moving augmentation onto the GPU broke that column's MEANING without
+        # changing its name. The training loop measures "time until the next
+        # batch arrives", which used to be CPU data preparation and is now CPU
+        # wait PLUS an H2D copy PLUS crop/resize/normalise on the device. The
+        # number would still be produced, would still look reasonable, and
+        # would no longer answer the question it exists to answer.
+        #
+        # So the loader reports the split itself. `wait_s` is the genuine block
+        # on the worker pool and is free to measure. `aug_s` needs a device
+        # sync, which costs throughput, so it is sampled every `sync_every`
+        # batches and extrapolated -- an estimate that is labelled as one,
+        # rather than a per-batch sync that would slow the run it is measuring.
+        SYNC_EVERY = 50
+
+        def timing(self) -> Dict[str, float]:
+            n = max(1, self._n_batches)
+            sampled = max(1, self._n_sampled)
+            return {"wait_s": self._wait_s,
+                    "augment_s": self._aug_s * (n / sampled),
+                    "batches": n, "augment_sampled": sampled}
+
+        def reset_timing(self) -> None:
+            self._wait_s = 0.0
+            self._aug_s = 0.0
+            self._n_batches = 0
+            self._n_sampled = 0
+
         def __iter__(self):
-            for batch in self.loader:
+            self.reset_timing()
+            _t = time.time()
+            for i, batch in enumerate(self.loader):
+                self._wait_s += time.time() - _t
+                self._n_batches += 1
+                measure = (i % self.SYNC_EVERY == 0) and self.device.type == "cuda"
+                if measure:
+                    torch.cuda.synchronize(self.device)
+                    _ta = time.time()
+
                 xb, y, idx = batch[0], batch[1], batch[2]
                 x = xb.to(self.device, non_blocking=True)
                 if x.dim() == 4 and x.shape[-1] == 3:       # NHWC uint8 -> NCHW
@@ -2564,8 +2607,15 @@ if _TORCH_OK:
                 x = F.grid_sample(x, grid, mode="bilinear",
                                   padding_mode="reflection", align_corners=False)
                 x = (x - self._mean) / self._std
-                yield (x.contiguous(memory_format=torch.channels_last),
-                       y.to(self.device, non_blocking=True), idx)
+                x = x.contiguous(memory_format=torch.channels_last)
+                yb = y.to(self.device, non_blocking=True)
+
+                if measure:
+                    torch.cuda.synchronize(self.device)
+                    self._aug_s += time.time() - _ta
+                    self._n_sampled += 1
+                yield x, yb, idx
+                _t = time.time()
 
 
 def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
@@ -4766,6 +4816,13 @@ HISTORY_FIELDS = (
     + ["epoch_time_sec", "train_time_sec", "val_time_sec", "cumulative_time_sec",
        "dataload_time_sec", "compute_time_sec", "backward_time_sec",
        "optimizer_time_sec", "dataload_frac",
+       # D-40. On the packed backend the augmentation runs on the GPU inside
+       # the loader, so "time until the next batch" is no longer the same
+       # quantity it was on CIFAR. These two separate it: `augment_time_sec`
+       # is device work, `dataload_time_sec` is a genuine block on the worker
+       # pool. Conflating them makes `dataload_frac` say "the loader is the
+       # bottleneck" when the loader is idle.
+       "augment_time_sec", "augment_frac",
        "step_time_mean_ms", "step_time_p50_ms", "step_time_p90_ms",
        "step_time_p99_ms", "step_time_max_ms",
        "throughput_train_img_s", "throughput_val_img_s",
@@ -4821,6 +4878,10 @@ class EpochTelemetry:
         self.bad_batches = 0
         self.samples = 0
         self.amp_decreases = 0
+        # Device-side augmentation time, reported by the loader if it does any.
+        # Zero on the CIFAR backend, where augmentation is CPU work inside the
+        # Dataset and is therefore genuinely part of dataload.
+        self.augment_sec = 0.0
 
     def add_batch(self, loss: float, step_t: float, load_t: float, comp_t: float,
                   backward_t: float = 0.0, opt_t: float = 0.0,
@@ -4888,7 +4949,17 @@ class EpochTelemetry:
             "compute_time_sec": float(np.sum(self.compute_times)),
             "backward_time_sec": float(np.sum(self.backward_times)),
             "optimizer_time_sec": float(np.sum(self.optimizer_times)),
-            "dataload_frac": (float(np.sum(self.dataload_times)) / tot_step)
+            # D-40. `dataload_frac` is the CPU-starvation signal and must stay
+            # that: on the packed backend the device-side augmentation is
+            # subtracted out, so a high value still means "the loader is the
+            # bottleneck" and never "the GPU did some work between batches".
+            "dataload_time_sec": max(0.0, float(np.sum(self.dataload_times))
+                                     - self.augment_sec),
+            "augment_time_sec": float(self.augment_sec),
+            "augment_frac": (float(self.augment_sec) / tot_step)
+                            if tot_step > 0 else NA,
+            "dataload_frac": (max(0.0, float(np.sum(self.dataload_times))
+                                  - self.augment_sec) / tot_step)
                              if tot_step > 0 else NA,
         }
 
@@ -6545,6 +6616,11 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                 it = tqdm(train_loader, desc=f"{run_id} ep {epoch+1}/{num_epochs}",
                           leave=False, dynamic_ncols=True, mininterval=2.0)
 
+            # D-40: a loader that augments on the device knows how much of the
+            # inter-batch gap was its own GPU work, and the loop cannot. Ask it.
+            _timed_loader = hasattr(train_loader, "timing")
+            if _timed_loader:
+                tel.augment_sec = 0.0
             _t_batch = time.time()
             for step, batch in enumerate(it):
                 # Time spent waiting for data vs. time spent computing. If
@@ -6669,6 +6745,12 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
             # zero are different facts.
             cal = val.get("calibration", {}) or {}
             lrs = [pg["lr"] for pg in optimizer.param_groups]
+            # Pull the device-side augmentation time out of the loader before
+            # summarising, so `dataload_frac` measures CPU starvation and not
+            # "the GPU did some work between batches" (D-40).
+            if _timed_loader:
+                _lt = train_loader.timing()
+                tel.augment_sec = float(_lt.get("augment_s", 0.0))
             g = tel.summary()
             sysagg = SystemMonitor.aggregate(sys_samples)
             pw = GPUEnergyMonitor.power_stats(samples)
@@ -8545,6 +8627,60 @@ def compare_routing_methods(session, run_ids: Sequence[str],
         # The paper's central number: the fraction of the B2->B11 gap closed.
         df["frac_b2_b11_gap_closed"] = closed / gap.replace(0, np.nan)
     return df
+
+
+# =============================================================================
+# paper artifacts -- what each claimed contribution has to leave behind
+# =============================================================================
+# Protocol 8.1 lists six contributions. A contribution with no artifact behind
+# it is a claim, and the difference is not visible while writing -- you find out
+# when you go to cite the table and it is not there.
+#
+# This list lives HERE and not in a notebook cell, for the D-16 reason: the
+# writer and the reader must not be two independent spellings of the same path.
+# `verify_paper_artifacts` is the reader, `save_analysis`/`save_figure` are the
+# writers, and both go through these names.
+PAPER_ARTIFACTS: Tuple[Tuple[str, str], ...] = (
+    ("tables/table1_atlas.csv",
+     "contribution 6 -- what was trained, and did it converge"),
+    ("tables/table2_q1_ceilings.csv",
+     "contribution 3 -- THE headline: rho_seed beside accuracy"),
+    ("tables/table3_q2_axis_structure.csv", "contribution 2"),
+    ("tables/table4_q3_transfer.csv", "contribution 3 -- transfer"),
+    ("tables/table5_q4_irreducibility.csv", "contribution 4"),
+    ("tables/table6_cifar_vs_imagenet.csv",
+     "the replication result itself -- did the gap survive?"),
+    ("analysis/q1_seed_ceilings_all.csv", "Q1 raw"),
+    ("analysis/q2_axis_structure_all.csv", "Q2 raw"),
+    ("analysis/q3_transfer_matrix.csv", "Q3 raw"),
+    ("analysis/q3_shuffled_control.csv",
+     "the alignment control -- without it Q3 is uninterpretable"),
+    ("analysis/q4_irreducibility_all.csv", "Q4 raw"),
+    ("paper/provenance.csv", "contribution 6 -- every number to a run_id"),
+    ("paper/figures/fig1_q1_ceilings.png", "Figure 1"),
+    ("paper/figures/fig2_tau_curves.png",
+     "Figure 2 -- no conclusion may depend on tau, so the curve is shown"),
+    ("paper/figures/fig3_ceiling_vs_accuracy.png",
+     "Figure 3 -- the confound, plotted rather than asserted"),
+)
+
+PAPER_ARTIFACTS_METHOD: Tuple[Tuple[str, str], ...] = (
+    ("analysis/q5_method_comparison.csv", "contribution 5 -- MSC-KD at matched FLOPs"),
+)
+
+
+def verify_paper_artifacts(data_dir, method: bool = False) -> Dict[str, Any]:
+    """Which claimed contributions do NOT yet have an artifact behind them."""
+    want = list(PAPER_ARTIFACTS) + (list(PAPER_ARTIFACTS_METHOD) if method else [])
+    rows, missing = [], []
+    for rel, why in want:
+        p = Path(data_dir) / rel
+        n = p.stat().st_size if p.exists() else 0
+        state = "ok" if n > 32 else ("empty" if p.exists() else "missing")
+        if state != "ok":
+            missing.append(rel)
+        rows.append({"artifact": rel, "state": state, "bytes": n, "backs": why})
+    return {"ok": not missing, "missing": missing, "rows": rows}
 
 
 def phase0_decision(seed_rho: float, transfer_T: float, delta_r2: float) -> Dict[str, Any]:

@@ -905,11 +905,161 @@ print('A noisier measurement necessarily explains less variance, so a low')
 print('transformer delta-R2 is NOT an independent finding from a low Q1')
 print('ceiling -- report them together or a reader double-counts them.')
 """),
+        md("""
+---
+## Paper outputs
+
+Every contribution the protocol claims has to be backed by an artifact on disk,
+or it is a claim and not a result. This cell writes them and then **checks the
+list**, so a missing table is reported rather than discovered while writing.
+
+| # | contribution (protocol §8.1) | artifact |
+|---|---|---|
+| 1 | MSC: per-sample, cost-normalised, multi-axis, stability-closed | `runs/*/per_sample/*.parquet` + `budgets/*.json` |
+| 2 | first measurement of whether compute-need is one-dimensional across axes | `analysis/q2_axis_structure_all.csv`, Table 3 |
+| 3 | first noise-ceiling-corrected cross-architecture transfer study | `analysis/q1_seed_ceilings_all.csv`, `q3_transfer_matrix.csv`, Tables 2 and 4 |
+| 4 | irreducibility to seven classical difficulty scores | `analysis/q4_irreducibility_all.csv`, Table 5 |
+| 5 | MSC-KD, benchmarked at matched FLOPs | NB5 → `analysis/q5_method_comparison.csv` |
+| 6 | fully reproducible artifact | `paper/provenance.csv`, `tables/`, every config and log |
+
+### The one this replication adds
+
+**Contribution 3 is where the novelty concentrates**, and it is sharper here
+than on CIFAR. The methodological point is that *measurement reliability is
+itself architecture-dependent*, so a cross-architecture difficulty study that
+does not disattenuate is comparing quantities measured with unequal precision —
+and the example-difficulty literature generally does not.
+
+CIFAR demonstrated that. This tests whether it **survives a 40× increase in
+dataset size and a 49× increase in pixels**, with four independent crossings of
+the CNN/attention boundary and one architecture held fixed across both studies.
+Either answer is a result; the second is a self-retraction, which is rarer and
+more useful than the first.
+"""),
+        code("""
+from pathlib import Path
+import pandas as pd
+
+tables = Path(sess.data_dir) / 'tables'
+tables.mkdir(parents=True, exist_ok=True)
+
+# Table 1 -- the atlas: what was trained, and did it converge.
+rows = []
+for r in sess.completed_runs(phase='p1'):
+    s = M.read_json(M.run_layout(sess.work, r['run_id'])['base'] / 'summary.json', {})
+    if not s:
+        continue
+    m = M.parse_run_id(r['run_id'])
+    rows.append({'arch': m['arch'], 'family': M.ZOO.get(m['arch'], {}).get('family'),
+                 'seed': m['seed'], 'top1': s.get('best_accuracy'),
+                 'epochs': s.get('num_epochs_run'),
+                 'params_M': (s.get('num_parameters') or 0) / 1e6,
+                 'gflops': (s.get('full_flops') or 0) / 1e9,
+                 'gpu_hours': (s.get('total_time_sec') or 0) / 3600,
+                 'kwh': s.get('total_energy_kwh'),
+                 'measured': sess.measured(r['run_id'])})
+t1 = pd.DataFrame(rows)
+t1.to_csv(tables / 'table1_atlas.csv', index=False)
+display(t1)
+
+# Table 2 -- Q1, the headline. rho_seed beside accuracy, because the confound
+# has to be visible in the same table rather than argued around afterwards.
+t2 = q1[['arch', 'family', 'n_seeds', 'n_pairs', 'top1_mean', 'top1_spread',
+         'rho_seed_tau0.1', 'rho_seed_sd_tau0.1', 'j10_tau0.1']].copy()
+t2 = t2.sort_values('rho_seed_tau0.1', ascending=False)
+t2.to_csv(tables / 'table2_q1_ceilings.csv', index=False)
+display(t2)
+"""),
+        code("""
+# Table 3 (Q2), Table 4 (Q3), Table 5 (Q4)
+q2.to_csv(tables / 'table3_q2_axis_structure.csv', index=False)
+q3.to_csv(tables / 'table4_q3_transfer.csv', index=False)
+q4.to_csv(tables / 'table5_q4_irreducibility.csv', index=False)
+
+# Table 6 -- the CIFAR<->ImageNet comparison. This table IS the paper.
+CIFAR = {'shufflenetv2': 0.6698, 'vit_tiny': 0.5475, 'mixer_nano': 0.5470,
+         'convnext_femto': 0.7084, 'resnet32x4': 0.7256, 'vgg8': 0.7216}
+comp = []
+for _, r in q1.iterrows():
+    prior = CIFAR.get(M.CROSS_STUDY_ALIAS.get(r['arch'], r['arch']))
+    comp.append({'arch': r['arch'], 'family': r['family'],
+                 'in100_rho_seed': r['rho_seed_tau0.1'],
+                 'cifar_rho_seed': prior,
+                 'delta': (r['rho_seed_tau0.1'] - prior) if prior else None,
+                 'same_architecture': prior is not None
+                                      and r['arch'] in M.CROSS_STUDY_ALIAS})
+t6 = pd.DataFrame(comp)
+t6.to_csv(tables / 'table6_cifar_vs_imagenet.csv', index=False)
+display(t6)
+print()
+print('Only the row with same_architecture=True is a controlled comparison.')
+print('The others differ in architecture AND scale, so their delta mixes two')
+print('effects and cannot be read as "what scale did".')
+"""),
+        code("""
+# Figures. Small, because a paper needs few and each has to earn its place.
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+figs = Path(sess.data_dir) / 'paper' / 'figures'
+figs.mkdir(parents=True, exist_ok=True)
+
+# Fig 1 -- rho_seed by architecture, coloured by family, with the CIFAR band.
+fig, ax = plt.subplots(figsize=(7, 4))
+d = q1.sort_values('rho_seed_tau0.1')
+cols = ['tab:red' if f in ('vit', 'swin') else 'tab:blue' for f in d['family']]
+ax.barh(d['arch'], d['rho_seed_tau0.1'], color=cols)
+ax.axvline(0.60, ls='--', c='k', lw=1, label='pre-registered gate 0.60')
+ax.axvspan(0.6217, 0.7256, alpha=0.10, color='tab:blue', label='CIFAR CNN band')
+ax.axvspan(0.5470, 0.5475, alpha=0.25, color='tab:red', label='CIFAR ViT/Mixer')
+ax.set_xlabel(r'$\\rho_{seed}$  ($\\tau$=0.1, depth axis)')
+ax.legend(fontsize=7)
+fig.tight_layout()
+M.save_figure(fig, sess.data_dir, 'fig1_q1_ceilings')
+
+# Fig 2 -- the tau curve. No conclusion may depend on tau, so show it.
+fig, ax = plt.subplots(figsize=(7, 4))
+taus = [0.0, 0.1, 0.2, 0.3, 0.5]
+for _, r in q1.iterrows():
+    c = 'tab:red' if r['family'] in ('vit', 'swin') else 'tab:blue'
+    ax.plot(taus, [r.get(f'rho_seed_tau{t}') for t in taus], marker='o',
+            color=c, alpha=0.7, label=r['arch'])
+ax.set_xlabel(r'$\\tau$'); ax.set_ylabel(r'$\\rho_{seed}$')
+ax.legend(fontsize=6, ncol=2)
+fig.tight_layout()
+M.save_figure(fig, sess.data_dir, 'fig2_tau_curves')
+
+# Fig 3 -- the confound, plotted rather than asserted.
+fig, ax = plt.subplots(figsize=(5, 4))
+for _, r in q1.iterrows():
+    c = 'tab:red' if r['family'] in ('vit', 'swin') else 'tab:blue'
+    ax.scatter(r['top1_mean'], r['rho_seed_tau0.1'], color=c)
+    ax.annotate(r['arch'], (r['top1_mean'], r['rho_seed_tau0.1']), fontsize=6)
+ax.set_xlabel('top-1 (%)'); ax.set_ylabel(r'$\\rho_{seed}$')
+ax.set_title('the confound, shown')
+fig.tight_layout()
+M.save_figure(fig, sess.data_dir, 'fig3_ceiling_vs_accuracy')
+print('figures written to paper/figures/')
+"""),
         code("""
 M.provenance_manifest(sess.data_dir)
-print('analysis/ written. Every number above traces to a run_id.')
+
+# Check the list rather than trusting it. A missing table found here costs a
+# re-run of a CPU notebook; found while writing, it costs a day.
+rep = M.verify_paper_artifacts(sess.data_dir)
+for r in rep['rows']:
+    print(f"  [{r['state']:7s}] {r['artifact']:46s} {r['backs']}")
+
 print()
-print('Now go back to NB2 and read the Phase 0 gate before spending anything else.')
+if not rep['ok']:
+    print(f"  *** {len(rep['missing'])} paper artifact(s) absent. The")
+    print(f"  *** contributions they back are claims, not results.")
+else:
+    print('  every claimed contribution has an artifact behind it.')
+    print()
+    print('  Q5 (the method) needs NB5. Q1-Q4 stand without it -- that')
+    print('  separation is the point of the protocol restructure.')
 """),
     ]
     return notebook(c)

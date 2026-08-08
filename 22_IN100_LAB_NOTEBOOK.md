@@ -26,8 +26,9 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
 | **Self-checks** | **310** offline, all passing, exit code verified |
+| **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **3** (D-37, D-38, D-39) · 3 fixed · 0 open |
+| **Defects found this port** | **4** (D-37 … D-40) · 4 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -51,6 +52,67 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-40 · GPU-side augmentation silently changed what `dataload_frac` means
+
+**Severity:** a recorded column would have answered a different question than
+its name · **Status:** **fixed** · **Found:** 2026-08-08 auditing telemetry
+parity against the CIFAR run
+
+The training loop measures data cost as *time until the next batch arrives*:
+
+```python
+_t_batch = time.time()
+for step, batch in enumerate(it):
+    load_t = time.time() - _t_batch        # "waiting for data"
+```
+
+On CIFAR that was exactly right. `CIFARTensor` did augmentation on the CPU
+inside `__getitem__`, so the gap between batches genuinely was data preparation.
+
+**On the packed ImageNet backend it is not.** `GPUBatchLoader` performs the
+H2D copy, the `grid_sample` crop/resize and the normalisation *inside* that gap
+— all device work. So `dataload_frac` would have measured "CPU wait **plus**
+GPU augmentation", `compute_time_sec` would have been correspondingly short,
+and both numbers would have looked entirely reasonable.
+
+**Why this matters more than it sounds.** `dataload_frac` is one of the five
+columns the playbook singles out as impossible to recover after the fact, and
+its entire purpose is one decision: *high means the GPU is starving and the fix
+is the loader, not the model.* A version of it that also counts GPU work says
+"the loader is the bottleneck" when the loader is idle — which is the opposite
+of the truth, and would have sent tuning effort at the wrong thing for the whole
+programme.
+
+**Contamination analysis.** None — no run has produced a row. But this is
+squarely the shape the lab notebook exists to catch: **a quantity whose meaning
+changed without its name changing.** Nothing would have errored. The CIFAR
+numbers remain valid; they were measured under the CPU-augmentation design where
+the column meant what it says.
+
+**Fix.** `GPUBatchLoader` reports its own split. `wait_s` — the genuine block on
+the worker pool — is free to measure. `augment_s` needs a device synchronise,
+which costs throughput, so it is **sampled every 50 batches and extrapolated**
+rather than measured per batch: a per-batch sync would slow the run it is
+measuring, and an estimate that is labelled as one is better than a precise
+number bought with the thing being observed.
+
+Two new columns, `augment_time_sec` and `augment_frac`, and
+`dataload_time_sec`/`dataload_frac` now have the device time subtracted out —
+so `dataload_frac` still answers exactly the question it answered on CIFAR.
+Zero on the CIFAR backend, where augmentation *is* CPU work and belongs in
+dataload.
+
+`HISTORY_FIELDS` 158 → **160**.
+
+**A note on 158 vs CIFAR's 171.** The difference is the second T4's thirteen
+per-device columns, correctly absent on a single-GPU machine — `N_GPU_COLUMNS`
+is derived, not assumed. Every other column CIFAR collected is collected here.
+The consequence to remember: **the schema width depends on the hardware**, so
+history CSVs from machines with different GPU counts cannot be naively
+concatenated. That is why the floor is 1 rather than 0.
+
+---
 
 ### D-38 · Five offline-verify failures, three of which needed no hardware
 
@@ -389,6 +451,9 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **Throughput benchmark written** (`benchmark/`). Staged coordinate descent over dtype x layout, batch size, workers, torch.compile, then a cold confirmation run. The plan's 235 GPU-hours is an estimate anchored on one guess; D-10 was that estimate being 40% low |
+| 2026-08-08 | **Paper artifacts wired.** Six tables, three figures, and `verify_paper_artifacts` — each of the protocol's six contributions now has a named artifact, and the notebook checks the list rather than trusting it |
+| 2026-08-08 | **D-40 — GPU-side augmentation changed what `dataload_frac` measures.** A recorded column that would have answered a different question than its name. Split into `dataload_time_sec` (CPU wait) and `augment_time_sec` (device work). Schema 158 → 160 |
 | 2026-08-07 | **Five notebooks generated** (`notebooks_in100/`), down from seventeen. The CIFAR split followed Kaggle's failure modes; this one follows the stages of the experiment |
 | 2026-08-07 | **D-39 — six invented library names in one sitting.** The validator now checks library names as well as column names: a wrong column yields a KeyError with a suggestion, a wrong function name yields an AttributeError several cells into a run that has already spent GPU-hours. The six functions moved into the library, which also fixes D-18's root cause |
 | 2026-08-07 | **D-38 — five offline-verify failures, three findable without hardware.** The zoo stops guessing at other packages' module internals and derives feature dims from a forward pass. Guards: every free name must resolve, every unpack arity is checked, no builder may name a foreign attribute |
