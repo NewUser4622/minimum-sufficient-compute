@@ -738,7 +738,10 @@ runs are skipped, partial runs continue from their last completed epoch with
 optimiser, scheduler, AMP scaler and all four RNG streams restored.
 """),
         code("""
-results = sess.run_all(cfgs, M.train_backbone)
+# `sess.train` -- NOT `M.train_backbone`. The bound method supplies hub,
+# registry, work_root and data_root_out; the raw function takes them as
+# required positional arguments and run_all passes only the config (D-54).
+results = sess.run_all(cfgs, title='Phase 0 / atlas training')
 
 print()
 for r in results:
@@ -846,7 +849,7 @@ if not todo and trained:
         code("""
 cfgs = [sess.config(M.parse_run_id(r)['arch'], seed=M.parse_run_id(r)['seed'])
         for r in todo]
-results = sess.run_all(cfgs, M.run_oracle)
+results = sess.run_all(cfgs, fn=sess.oracle, title='measurement')
 
 for r in results:
     print(f"  {r.get('status','?'):9s} {r['run_id']}")
@@ -1316,12 +1319,28 @@ for shuffled in ARMS:
         for s in SEEDS:
             method = ('mscKDshuffrom' if shuffled else 'mscKDfrom') + TEACHER
             cfgs.append(sess.config(a, seed=s, method=method,
-                                    teacher_run=teacher_run,
-                                    shuffle_msc_targets=bool(shuffled)))
+                                    teacher_run=teacher_run))
 print(f'{{len(cfgs)}} student run(s): {{len(STUDENTS)}} arch x {{len(SEEDS)}} seeds x 2 arms')
 """),
         code("""
-results = sess.run_all(cfgs, M.train_msc_kd)
+# train_msc_kd needs the teacher as well, so it goes through a closure --
+# the same shape Session.train and Session.oracle use internally.
+#
+# The arm is read back out of `method`, which is ALREADY in the run_id, rather
+# than carried in a second config field. The first draft passed
+# `shuffle_msc_targets=` to sess.config -- which is a library FUNCTION name,
+# not a config key. `config(**overrides)` takes any key without complaint, so
+# it would have entered config_hash while train_msc_kd's real parameter
+# (`shuffle_targets`) quietly stayed False, and the "control" arm would have
+# trained on unshuffled targets under a run_id that says shuffled (D-54b).
+def _train_student(cfg):
+    return M.train_msc_kd(cfg, sess.hub, sess.registry, teacher_run,
+                          TEACHER, work_root=sess.work,
+                          data_root_out=sess.data_dir,
+                          shuffle_targets='shuff' in cfg['method'])
+
+results = sess.run_all(cfgs, fn=_train_student, done_fn=sess.msckd_valid,
+                       title='MSC-KD students')
 real = [r for r in results if 'shuff' not in r['run_id']]
 print(f"\\n{len([r for r in real if r.get('status') != 'skipped'])}/"
       f"{len(real)} REAL-method students trained -- the comparison needs all of them")

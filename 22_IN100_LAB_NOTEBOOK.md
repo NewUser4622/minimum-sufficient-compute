@@ -1367,3 +1367,92 @@ would have been theatre.
 
 *Append new entries at the top of each log. Every claim here should be
 traceable to a file in the HuggingFace repository or a commit in this one.*
+
+---
+
+## D-54 — `run_all` was handed a callable it cannot call
+
+**Symptom.** All four Phase-0 runs, identically:
+
+```
+[ERROR] p0-resnet50-imagenet100-base-s1 failed: TypeError:
+    train_backbone() missing 2 required positional arguments: 'hub' and 'registry'
+    -- continuing
+File "...msc_lib.py", line 10392, in run_all
+    s = fn(by_id[rid], **kw)
+```
+
+**Cause.** `run_all` invokes `fn(cfg, **kw)` — one positional argument.
+`train_backbone(cfg, hub, registry, ...)` requires three. `Session.train` and
+`Session.oracle` exist for exactly this reason: they are thin bound wrappers
+that supply `hub`, `registry`, `work_root` and `data_root_out` from the session.
+The notebook passed the raw library function, so the two the session owns were
+never supplied.
+
+**This is D-53 one layer out, and that is the interesting part.** D-53 was
+`sess.run_all(M.train_backbone, cfgs)` — arguments swapped. I fixed the *order*
+and shipped, because the order was what the error named. But the same line was
+wrong in a second, independent way that the order fix could not touch: even in
+the right slot, that callable cannot be invoked the way `run_all` invokes it.
+Every existing check passed it. The argument is a function (D-53), the name
+exists (D-39), the count and keywords are right (D-47/D-48), the column names
+are clean (D-22). Nothing asked whether the callee could *call* it.
+
+Fixing what the traceback names is not the same as fixing the line.
+
+**Contamination.** Three notebooks, one line each — NB2 (train), NB3
+(measure), NB5 (MSC-KD). Zero runs completed, so no artifact is affected. Cost
+is wall-clock only: the failure is per-run inside the try/except, so the work
+plan computed and printed normally and four identical tracebacks scrolled past
+as "continuing", which reads like four problems rather than one.
+
+**Fix — two mechanisms, because a fixed call site protects one line.**
+
+1. *Runtime, in `run_all`, before the plan is built.* Arity is knowable
+   before any work: if `fn` requires more than one positional argument and has
+   no `*args`, raise immediately, naming the missing parameters and the bound
+   wrapper to use instead. Fails once, before the plan, instead of N times
+   inside it.
+2. *Build time, in `validate_notebooks.py`.* `_callback_arity_problems`
+   rejects any `M.*` function passed as `fn`/`done_fn` to `run_all` whose
+   minimum arity exceeds 1 — checked against `LIB_SIGS`, the signature table
+   already parsed from source. Its self-test asserts it catches the literal
+   D-54 line **and** accepts all three valid forms, so it cannot pass by being
+   permissive.
+
+**Correct forms (from the CIFAR generator, which had this right):**
+
+```python
+sess.run_all(cfgs, title='...')                  # fn=None -> sess.train
+sess.run_all(cfgs, fn=sess.oracle, title='...')  # bound wrapper
+sess.run_all(cfgs, fn=_closure, done_fn=sess.msckd_valid, ...)
+```
+
+---
+
+## D-54b — an invented config key that silently disabled the control arm
+
+Found by the column checker while fixing D-54, in the closure written *for*
+D-54. NB5 read `cfg.get('shuffle_msc_targets')` to decide the ablation arm.
+
+`shuffle_msc_targets` is a **library function name**, not a config key. It was
+set via `sess.config(..., shuffle_msc_targets=bool(shuffled))`, and
+`config(**overrides)` accepts any key without complaint. The key the library
+actually reads is the `shuffle_targets` **parameter** of `train_msc_kd`.
+
+**What that would have produced.** The invented key enters `config_hash`, so
+the two arms hash differently and both run. The run_id says `mscKDshuff...`.
+The teacher targets are never permuted. The shuffled-target control — the test
+that proves MSC-KD transfers *MSC structure* rather than generic distillation
+— would have returned a healthy-looking result under a name asserting it was
+the null, and healthy is exactly the direction rule 12 says to distrust. It
+would have been read as evidence *for* the method.
+
+**Fix.** Delete the key. Derive the arm from `method`, which is already in the
+run_id and is what the status line two cells later already keys on — one
+source of truth for the arm, and it is the one that names the artifact.
+
+**Standing note.** `Session.config(**overrides)` silently accepts unknown
+keys. It absorbed a typo here; it will absorb the next one. The column checker
+caught this one only because the key was *read* in a notebook — a key that is
+set and never read is still invisible.

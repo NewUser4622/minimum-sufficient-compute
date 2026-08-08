@@ -60,6 +60,7 @@ import time
 import traceback
 import textwrap
 import warnings
+from inspect import signature as _inspect_signature
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10361,6 +10362,45 @@ class Session:
                 done_fn, stage = self.measured, "measure"
             else:
                 done_fn = self.trained
+        # D-54. FAIL BEFORE THE PLAN, not once per run inside it.
+        #
+        # `run_all` calls `fn(cfg, **kw)` -- one positional argument. The raw
+        # library entry points take three (`cfg, hub, registry`); the bound
+        # `Session.train` / `Session.oracle` wrappers exist precisely to supply
+        # the other two. Passing `M.train_backbone` produced
+        #
+        #   TypeError: train_backbone() missing 2 required positional
+        #   arguments: 'hub' and 'registry'
+        #
+        # once per run, swallowed by the per-run except so the plan printed
+        # normally and four runs "failed ... continuing" -- four identical
+        # tracebacks for one mistake, after the work plan had already been
+        # computed and displayed. Arity is knowable before any of that.
+        if fn is not None:
+            try:
+                _sig = _inspect_signature(fn)
+                _req = sum(1 for q in _sig.parameters.values()
+                           if q.default is q.empty
+                           and q.kind in (q.POSITIONAL_ONLY,
+                                          q.POSITIONAL_OR_KEYWORD))
+                _has_var = any(q.kind is q.VAR_POSITIONAL
+                               for q in _sig.parameters.values())
+                if _req > 1 and not _has_var:
+                    _missing = [q.name for q in _sig.parameters.values()
+                                if q.default is q.empty
+                                and q.kind in (q.POSITIONAL_ONLY,
+                                               q.POSITIONAL_OR_KEYWORD)][1:]
+                    raise TypeError(
+                        f"run_all calls fn(cfg) with ONE argument, but "
+                        f"{getattr(fn, '__name__', fn)} requires {_req}: it "
+                        f"still needs {_missing}.\n"
+                        f"  Use the bound wrapper, which supplies them:\n"
+                        f"    sess.run_all(cfgs)                  # -> sess.train\n"
+                        f"    sess.run_all(cfgs, fn=sess.oracle)\n"
+                        f"  or pass a closure that captures them (D-54).")
+            except (TypeError, ValueError) as _e:
+                if "run_all calls fn(cfg)" in str(_e):
+                    raise
         by_id = {c["run_id"]: c for c in cfgs}
         plan = self.plan(list(by_id), steal_stale=steal_stale, title=title,
                          done_fn=done_fn, stage=stage)

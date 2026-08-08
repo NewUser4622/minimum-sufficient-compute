@@ -338,6 +338,8 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | **D-39** | `AttributeError: module 'msc_lib' has no attribute 'analyse_q1_all'` | six invented function names | the validator checks library names at build time |
 | **D-38** | `AttributeError: 'BatchNorm2d' object has no attribute 'out_channels'` | builders guessed at torchvision internals | `feature_dims` derived from a forward probe |
 | **D-37** | self-test prints `[FAIL]` then `ALL CHECKS PASSED`, exits 0 | a tuple unpack rebound the verdict scalar | lists + canary + floor |
+| `TypeError: train_backbone() missing 2 required positional arguments: 'hub' and 'registry'` | `run_all` was passed the raw library function; it calls `fn(cfg)` with one argument | D-54 — use `sess.run_all(cfgs)` (defaults to `sess.train`), `fn=sess.oracle`, or a closure. Guarded at run time in `run_all` and at build time by `_callback_arity_problems`. |
+| Shuffled-target control looks as good as the real method | the arm never actually shuffled: an invented config key (`shuffle_msc_targets`) that nothing reads | D-54b — derive the arm from `method`. Distrust the favourable reading first (rule 12). |
 
 ### Reading the self-test after any change
 

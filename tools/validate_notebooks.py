@@ -494,6 +494,51 @@ def _arg_order_problems(tree: ast.AST):
     return bad
 
 
+# Functions that call their `fn` argument with exactly one positional value.
+# Passing a callable that needs more is D-54.
+ONE_ARG_CALLBACK = {"run_all": 1}
+
+
+def _callback_arity_problems(tree: ast.AST):
+    """A callback handed to `run_all` that cannot be called with one argument.
+
+    D-54. `sess.run_all(cfgs, M.train_backbone)` -- correct order, correct
+    count, correct kind. And still wrong: `run_all` invokes `fn(cfg)` with ONE
+    argument, while `train_backbone(cfg, hub, registry)` requires three. The
+    bound `Session.train` / `Session.oracle` wrappers exist to supply the other
+    two.
+
+    Every previous layer passes this. The argument IS a function and the
+    parameter DOES want one (D-53), the name exists (D-39), the count and
+    keywords are right (D-47/D-48). What no earlier check looked at is whether
+    the callable can be *invoked the way the callee will invoke it*.
+    """
+    bad = []
+    for nd in ast.walk(tree):
+        if not isinstance(nd, ast.Call) or not isinstance(nd.func, ast.Attribute):
+            continue
+        n_pos = ONE_ARG_CALLBACK.get(nd.func.attr)
+        if n_pos is None:
+            continue
+        cands = list(nd.args[1:]) + [k.value for k in nd.keywords
+                                     if k.arg in ("fn", "done_fn")]
+        for arg in cands:
+            if not (isinstance(arg, ast.Attribute)
+                    and getattr(arg.value, "id", None) in ("M", "msc_lib")):
+                continue                       # a closure or bound method: fine
+            sg = LIB_SIGS.get(arg.attr)
+            if not sg or sg["star"]:
+                continue
+            if sg["min"] > n_pos:
+                need = sg["order"][n_pos:sg["min"]]
+                bad.append((f"{nd.func.attr}() calls fn with {n_pos} argument, "
+                            f"but M.{arg.attr} requires {sg['min']} -- it still "
+                            f"needs {need}. Use the bound wrapper "
+                            f"(sess.train / sess.oracle) or a closure (D-54)",
+                            getattr(nd, "lineno", 0)))
+    return bad
+
+
 def _result_key_problems(tree: ast.AST):
     """Keys read off a library result that the library does not declare.
 
@@ -633,6 +678,20 @@ def self_test() -> bool:
                   f"notebooks and does not exist")
             ok = False
 
+    # -- the callback-arity check must be able to fail (D-54) ---------------
+    if not _callback_arity_problems(
+            ast.parse("sess.run_all(cfgs, M.train_backbone)")):
+        print("  [SELFTEST FAIL] the callback-arity check does not catch the "
+              "exact D-54 line, sess.run_all(cfgs, M.train_backbone)")
+        ok = False
+    for good in ("sess.run_all(cfgs, title='x')",
+                 "sess.run_all(cfgs, fn=sess.oracle)",
+                 "sess.run_all(cfgs, fn=_train_student)"):
+        if _callback_arity_problems(ast.parse(good)):
+            print(f"  [SELFTEST FAIL] the callback-arity check rejects a VALID "
+                  f"call: {good}")
+            ok = False
+
     # -- the argument-order check must be able to fail (D-53) ---------------
     if not _arg_order_problems(ast.parse("sess.run_all(M.train_backbone, cfgs)")):
         print("  [SELFTEST FAIL] the arg-order check does not catch the exact "
@@ -743,6 +802,9 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                 problems.append(
                     f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
                     f"exist" + (f" -- did you mean {near}?" if near else ""))
+
+            for msg, ln in _callback_arity_problems(tree):
+                problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")
 
             for msg, ln in _arg_order_problems(tree):
                 problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")

@@ -33,3 +33,8 @@ cifar-10-batches-py/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# storage roots resolve_storage() probes and fills -- data, not source
+msc_data/
+msc_results/
+.msc_write_probe

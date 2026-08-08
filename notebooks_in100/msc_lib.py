@@ -12717,7 +12717,8 @@ def _selftest() -> bool:
           "declaring the set is opt-in; a check that guesses at undeclared "
           "contracts would be the 73-false-positive mistake again")
     check("the shuffled control wrapper demands `passed` explicitly",
-          "no 'passed' column" in _insp.getsource(analyse_q3_shuffled_control_all),
+          '"passed" not in df.columns' in
+          _insp.getsource(analyse_q3_shuffled_control_all),
           "silently producing a frame without the gate column is how D-52 "
           "would have survived to analysis")
 
