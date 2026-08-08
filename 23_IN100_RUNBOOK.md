@@ -58,7 +58,7 @@ After this, unplug it.
 
 | | |
 |---|---|
-| ✅ | Library ported. **359** offline self-checks pass, exit code verified. |
+| ✅ | Library ported. **366** offline self-checks pass, exit code verified. |
 | ✅ | Local-only + offline. Nothing uploaded, nothing fetched, nothing deleted. |
 | ✅ | Packing tool, verified against the real data (dry run only — not yet packed). |
 | ✅ | Zoo registered, dry runs written and wired in. |
@@ -82,7 +82,7 @@ echo $?          # must be 0
 Expect the last three lines to read:
 
 ```
-  359 checks run, 0 failed
+  366 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```
@@ -320,6 +320,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 
 | # | symptom | cause | now |
 |---|---|---|---|
+| **D-50** | `[LIFE] session limit reached at 0.1 h -- pausing cleanly at epoch 1`, every epoch | `session_limit_h = 0.0` meant "no limit" and was read as "zero hours" | `<= 0`, `None` and negative are all unbounded; the armed line says `NONE -- runs to completion` |
 | **D-49** | `IndexError: index 121978 is out of bounds for axis 0 with size 119395` | `sample_idx` is the GLOBAL pack index; dynamics arrays were sized by the split length | datasets declare `index_space`; `train_backbone` asks rather than assumes |
 | **D-48** | `TypeError: resume_acceptance_test() got an unexpected keyword argument` | a notebook call named a parameter that does not exist; the existence check could not see it | validator now checks notebook call signatures, suggesting the closest real parameter |
 | **D-47** | `TypeError: load_checkpoint() missing 2 required positional arguments` / `MSCResult has no len()` | calls named real functions but passed the wrong things; existence guards cannot see arity | AST arity check over every internal call |
@@ -343,7 +344,7 @@ python src/msc_lib.py --selftest
 Look at the **counts**, not the last line:
 
 ```
-  359 checks run, 0 failed
+  366 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```

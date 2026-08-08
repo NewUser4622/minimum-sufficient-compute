@@ -25,10 +25,10 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **359** offline, all passing, exit code verified |
+| **Self-checks** | **366** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **13** (D-37 … D-49) · 13 fixed · 0 open |
+| **Defects found this port** | **14** (D-37 … D-50) · 14 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,93 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-50 · "No session limit" was read as "a limit of zero"
+
+**Severity:** **every run would pause after epoch 1, for the whole programme**
+**Status:** **fixed** · **Found:** 2026-08-08 by the user, in the resume test
+
+```
+ep   1/4  train 16.57%  val 24.32%  ...  *BEST*
+[LIFE] session limit reached at 0.1 h -- pausing cleanly at epoch 1
+```
+
+The watchdog exists for Kaggle, where a session dies at 8–12 hours without
+warning, so stopping cleanly first is the civilised move. A local machine has
+no such deadline, and the ImageNet-100 profile sets `session_limit_h = 0.0` to
+say so.
+
+`LifecycleGuard` read that as **a limit of zero hours**. `session_expiring()`
+was true on the first call, so every run paused at epoch 1.
+
+**What this would have cost.** The atlas is ~10 days of training. A run that
+pauses after every epoch needs a manual restart every three to eight minutes,
+around the clock, for the entire programme. It would have been noticed
+immediately — but only *after* Phase 0 had been started and babysat.
+
+**It also broke the test that found it, in a way that pointed elsewhere.** The
+resume test reported:
+
+```
+interrupt actually fired : False
+epochs  reference=1  resumed=2   (want 4)
+RESUME TEST: FAIL
+```
+
+Every leg paused at epoch 1, so the debug interrupt never reached `kill_at=2`.
+**The test failed for a reason with nothing to do with resume**, and its report
+named the symptom (`interrupt_fired: False`) rather than the cause. That is the
+**D-06 shape** — a test that can fail for the wrong reason — and it cost a
+round trip.
+
+**Contamination analysis.** None. No completed run exists. Any run that *had*
+completed would be valid: pausing is a clean, resumable stop, not corruption.
+The cost was entirely diagnostic time.
+
+**Fix.**
+
+- `session_limit_h <= 0`, `None`, or negative → **unbounded**, explicitly, with
+  `self.unlimited` as a named property rather than an `inf` comparison buried in
+  arithmetic.
+- The armed message now reads `session limit NONE -- runs to completion)`
+  instead of `0.0 h`, so the state is visible rather than inferred.
+- The config comment says what `0` means at the place someone reads it.
+- `resume_acceptance_test` sets `session_limit_h=0.0` explicitly: a test whose
+  purpose is one stop reason must not be interruptible by a different one.
+
+**And the report now names the failure MODE.** `interrupt_fired: False` is true
+of both "resume is broken" and "something else stopped the run first", and
+those need completely different responses. The test now prints one of six
+diagnoses, e.g.:
+
+> *the REFERENCE leg stopped at epoch 1 of 4 without being asked to. Nothing
+> about resume has been tested. Check the session watchdog (`session_limit_h <=
+> 0` means no limit)…*
+
+versus the one it exists to catch:
+
+> *post-seam loss drifted 8.3% — RNG or optimiser state did not survive the
+> seam.*
+
+**Guards added:** 7 self-checks — zero, negative and `None` are unbounded; 8.5 h
+is still honoured; **a real limit that has elapsed still fires** (a watchdog
+that can never say yes is decoration); and each recipe asks for the right one.
+
+Self-checks 359 → **366**.
+
+---
+
+### Note · a status line that printed a dict
+
+`[DRY] backbone dry run ok (0.27s, {'start_epoch': 1, ...}px, 100 classes)`
+
+The D-47 fix introduced `res = load_checkpoint(...)`, shadowing the `res` that
+held the input resolution. Harmless to the run, and fixed — but a status line
+that prints a dict where a number belongs is a status line nobody reads
+carefully afterwards, and this project has now paid twice for output that was
+technically correct and practically unreadable (D-46, D-47).
+
+---
 
 ### D-49 · `sample_idx` became global; the dynamics arrays did not
 
@@ -1026,6 +1113,7 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-50 — "no session limit" read as "a limit of zero".** Every run paused after epoch 1; over a ten-day atlas that is a manual restart every few minutes. It also broke the resume test in a way that pointed at resume rather than at the watchdog — the D-06 shape. The test now names the failure MODE, not just the verdict |
 | 2026-08-08 | **D-49 — `sample_idx` became global; the dynamics arrays did not.** `IndexError: index 121978 out of bounds for size 119395`. Both halves were deliberate; the index's MEANING moved while its name did not — D-40's shape on a different quantity. Datasets now declare `index_space`. Found by the kill-and-resume test, which is what it is for |
 | 2026-08-08 | **Dataset packed.** The pipeline is now reading real data |
 | 2026-08-08 | **D-48 — the same defect one layer out.** `M.resume_acceptance_test(..., interrupt_after=2)`; the parameter is `kill_at`. D-47's arity check covered library-internal calls only, so the class survived in the notebooks. D-32's lesson verbatim: fixing one of N skip points relocates the symptom. The validator now checks notebook call signatures too |

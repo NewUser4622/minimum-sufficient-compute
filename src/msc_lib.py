@@ -2109,11 +2109,37 @@ class LifecycleGuard:
     30 minutes of a 3-hour run is exactly the outcome the push policy exists to
     prevent.
     """
+    # `session_limit_h <= 0` == unbounded. See __init__ (D-50).
 
     def __init__(self, on_flush: Callable[[str], None],
                  session_limit_h: float = 8.5, verbose: bool = True):
+        """`session_limit_h <= 0` means NO LIMIT, not a limit of zero.
+
+        **D-50.** The watchdog exists for Kaggle, where a session dies at 8-12
+        hours without warning, so the civilised thing is to stop cleanly first.
+        A local machine has no such deadline, and the ImageNet-100 profile sets
+        `session_limit_h = 0.0` to say so.
+
+        It was read as "the limit is zero hours", so `session_expiring()` was
+        true on the first call and **every run paused after epoch 1**:
+
+            [LIFE] session limit reached at 0.1 h -- pausing cleanly at epoch 1
+
+        Over a ten-day programme that is a manual restart every few minutes,
+        and it silently defeated the kill-and-resume test as well -- the run
+        paused before the debug interrupt could fire, so the test reported
+        `interrupt actually fired: False` and failed for a reason that had
+        nothing to do with resume.
+
+        Zero as a sentinel for "unbounded" is a reasonable convention and a
+        bad default to leave implicit, so it is now explicit here, in the
+        config, and in a self-check.
+        """
         self.on_flush = on_flush
-        self.session_limit_sec = session_limit_h * 3600.0
+        self.session_limit_sec = (float("inf") if session_limit_h is None
+                                  or session_limit_h <= 0
+                                  else session_limit_h * 3600.0)
+        self.unlimited = not math.isfinite(self.session_limit_sec)
         self.started = time.time()
         self.verbose = verbose
         self._fired = threading.Event()
@@ -2131,8 +2157,9 @@ class LifecycleGuard:
         atexit.register(self._handle_atexit)
         self._installed = True
         if self.verbose:
-            log(f"lifecycle guard armed (SIGTERM + atexit, "
-                f"session limit {self.session_limit_sec/3600:.1f} h)", "LIFE")
+            log(f"lifecycle guard armed (SIGTERM + atexit, session limit "
+                + ("NONE -- runs to completion)" if self.unlimited
+                   else f"{self.session_limit_sec/3600:.1f} h)"), "LIFE")
         return self
 
     def _fire(self, reason: str) -> None:
@@ -2162,6 +2189,9 @@ class LifecycleGuard:
         return (time.time() - self.started) / 3600.0
 
     def session_expiring(self) -> bool:
+        """True only when a real deadline has been reached (D-50)."""
+        if self.unlimited:
+            return False
         return (time.time() - self.started) >= self.session_limit_sec
 
     def rearm(self) -> None:
@@ -4993,6 +5023,10 @@ def _imagenet_config(arch: str, dataset: str, seed: int, phase: str,
         # infrastructure
         "milestone_push_every_epochs": 5,
         "timer_push_sec": 1800,
+        # 0 = NO LIMIT. This is a local machine with no session deadline; the
+        # watchdog exists for Kaggle, where a session dies without warning and
+        # stopping cleanly first is the civilised move. Read as "zero hours" it
+        # paused every run after epoch 1 (D-50).
         "session_limit_h": float(overrides.get("session_limit_h", 0.0)),
         "cleanup_local_after_complete": False,
         "energy_sample_hz": 10.0,
@@ -6305,10 +6339,15 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
             # Eight positional arguments, and it returns a DICT. Getting either
             # wrong is the D-47 defect: a signature mismatch that no
             # name-resolution check can see, because every name involved exists.
-            res = load_checkpoint(ck, cfg, m2, o2, s2, sc2, None, dev,
-                                  strict_hash=True)
-            start = int(res["start_epoch"])
-            best = float(res["best_metric"])
+            # NOT `res` -- that name already holds the input resolution, and
+            # shadowing it put a checkpoint dict into the success message:
+            #   "backbone dry run ok (0.27s, {'start_epoch': 1, ...}px, ...)"
+            # Harmless, but a status line that prints a dict where a number
+            # belongs is a status line nobody reads carefully afterwards.
+            ck_res = load_checkpoint(ck, cfg, m2, o2, s2, sc2, None, dev,
+                                     strict_hash=True)
+            start = int(ck_res["start_epoch"])
+            best = float(ck_res["best_metric"])
             if int(start) != 1:
                 return False, (f"checkpoint says resume at epoch {start}, "
                                f"expected 1 after writing epoch 0")
@@ -10770,6 +10809,15 @@ def resume_acceptance_test(session: "Session", arch: str = "resnet20",
     cfg = session.config(arch, seed=99, method="resumetest",
                          num_epochs=epochs, phase="test",
                          milestone_push_every_epochs=10 ** 6,
+                         # D-50. The watchdog must not fire during a test whose
+                         # whole purpose is a DIFFERENT stop reason. When
+                         # session_limit_h was read as "zero hours" every leg
+                         # paused at epoch 1, the debug interrupt never
+                         # reached kill_at, and the test reported
+                         # `interrupt actually fired: False` -- failing for a
+                         # reason with nothing to do with resume. A test that
+                         # can fail for the wrong reason is the D-06 shape.
+                         session_limit_h=0.0,
                          cleanup_local_after_complete=False)
     hub_off = MSCHub(enable=False)
     reg = RunRegistry(hub_off, tmp / "reg", account="selftest")
@@ -10825,13 +10873,51 @@ def resume_acceptance_test(session: "Session", arch: str = "resnet20",
             out["history_error"] = str(e)
 
     out["ref_run"], out["cut_run"] = ref_id, cut_id
+
+    # Name the failure MODE, not just the verdict. "interrupt_fired: False" is
+    # true of both "resume is broken" and "something else stopped the run
+    # first", and those need completely different responses. D-50 was the
+    # second, and the report pointed at the first for a whole round trip.
+    if int(out.get("epochs_ref", 0)) < epochs:
+        out["diagnosis"] = (
+            f"the REFERENCE leg stopped at epoch {out.get('epochs_ref')} of "
+            f"{epochs} without being asked to. Nothing about resume has been "
+            f"tested. Check the session watchdog (session_limit_h <= 0 means "
+            f"no limit) and for an out-of-disk or an exception above.")
+    elif not out.get("interrupt_fired"):
+        out["diagnosis"] = (
+            f"the debug interrupt never fired at epoch {kill_at}, so the "
+            f"'interrupted' leg was a clean run. The test exercised nothing.")
+    elif int(out.get("epochs_cut", 0)) < epochs:
+        out["diagnosis"] = (
+            f"resumed but stopped at epoch {out.get('epochs_cut')} of "
+            f"{epochs} -- it did not run to completion after the seam.")
+    elif int(out.get("duplicate_epochs", 1)) != 0:
+        out["diagnosis"] = ("history has duplicate epoch rows -- the log was "
+                            "not truncated on resume, so every cumulative "
+                            "statistic is wrong")
+    elif int(out.get("post_seam_epochs_compared", 0)) <= 0:
+        out["diagnosis"] = ("no post-seam epochs to compare; the comparison "
+                            "that matters did not happen")
+    elif float(out.get("max_post_seam_loss_deviation", 1.0)) >= tol:
+        out["diagnosis"] = (
+            f"post-seam loss drifted "
+            f"{100*float(out['max_post_seam_loss_deviation']):.1f}% -- RNG or "
+            f"optimiser state did not survive the seam. This is the real "
+            f"failure this test exists to catch.")
+    else:
+        out["diagnosis"] = "resume is equivalent to an uninterrupted run"
+
     out["ok"] = bool(out.get("interrupt_fired")
+                     and int(out.get("epochs_ref", 0)) == epochs
                      and out.get("duplicate_epochs", 1) == 0
                      and out.get("epochs_cut", 0) == epochs
                      and out.get("post_seam_epochs_compared", 0) > 0
                      and out.get("max_post_seam_loss_deviation", 1.0) < tol)
 
     print(f"\n  {'='*66}")
+    print(f"  {out['diagnosis']}")
+    print(f"  {'-'*66}")
     print(f"  interrupt actually fired : {out.get('interrupt_fired')}")
     print(f"  epochs  reference={out.get('epochs_ref')}  resumed={out.get('epochs_cut')}"
           f"   (want {epochs})")
@@ -12428,6 +12514,31 @@ def _selftest() -> bool:
     check("the analytic fallback is documented as conv+linear only",
           "conv + linear only" in _insp.getsource(_analytic_flops),
           "that omission is the whole defect for a transformer")
+
+    print("the session watchdog understands 'no limit' (D-50)")
+    _g0 = LifecycleGuard(lambda r: None, session_limit_h=0.0, verbose=False)
+    check("session_limit_h = 0 means UNBOUNDED, not zero hours",
+          _g0.unlimited and not _g0.session_expiring(),
+          "read as zero it paused every run after epoch 1, which over a "
+          "ten-day programme is a manual restart every few minutes")
+    _gneg = LifecycleGuard(lambda r: None, session_limit_h=-1, verbose=False)
+    check("...and so does a negative", _gneg.unlimited)
+    _gnone = LifecycleGuard(lambda r: None, session_limit_h=None, verbose=False)
+    check("...and None", _gnone.unlimited)
+    _g8 = LifecycleGuard(lambda r: None, session_limit_h=8.5, verbose=False)
+    check("a real limit is still honoured", not _g8.unlimited
+          and not _g8.session_expiring(),
+          "8.5 h is Kaggle's deadline and the watchdog must still fire there")
+    _gtiny = LifecycleGuard(lambda r: None, session_limit_h=1e-9, verbose=False)
+    time.sleep(0.002)
+    check("...and a real limit that HAS elapsed fires",
+          _gtiny.session_expiring(),
+          "the check must be able to say yes, or it is decoration")
+    check("the ImageNet recipe asks for no limit",
+          float(base_config("resnet50", "imagenet100")["session_limit_h"]) <= 0,
+          "a local machine has no session deadline")
+    check("the CIFAR recipe keeps Kaggle's 8.5 h",
+          float(base_config("resnet20", "cifar100")["session_limit_h"]) > 0)
 
     print("sample_idx index space (D-49)")
     # The failure was IndexError at global index 121978 against an array sized
