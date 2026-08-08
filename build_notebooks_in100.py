@@ -153,23 +153,39 @@ else:
 def paths_cell(phase="p1", extra="") -> str:
     return f"""\
 # ============================================================================
-# CELL 2 -- WHERE EVERYTHING LIVES.  Edit these two lines and nothing else.
+# CELL 2 -- WHERE EVERYTHING LIVES
 # ============================================================================
-# MSC_IN100_DIR   the packed dataset  (~24 GiB, read-only after NB1)
-# MSC_ROOT        every result        (grows to ~60-90 GiB over the programme)
+# Leave both as None and they are CHOSEN FOR YOU: the roomiest drive that
+# actually exists on this machine gets `msc_data/in100` and `msc_results`.
 #
-# Put MSC_ROOT on a drive with room. Checkpoints dominate: 24 runs x 2
-# checkpoints x (25-350 MB) plus per-sample parquet and raw telemetry.
+# The previous version defaulted to r'D:\\msc_data\\in100'. There is no D:
+# drive here, and the failure was
 #
-# NOTHING under MSC_ROOT is ever deleted by this pipeline. There is no
-# confirm-then-delete path with HuggingFace off, and cleanup_local_after_complete
-# is False. The only thing that wipes a run is an explicit force_rerun.
+#     FileNotFoundError: [WinError 3] The system cannot find the path
+#     specified: 'D:\\'
+#
+# forty lines deep inside pathlib, naming neither the setting nor the file that
+# had to change. A default that names a drive letter is wrong on any machine
+# without that letter (D-44).
+#
+# Set them explicitly if you want somewhere specific. Both are checked below by
+# WRITING A PROBE FILE AND READING IT BACK -- os.access lies on Windows shares.
+#
+#   data     ~26 GB   the packed dataset, read-only after NB1
+#   results ~120 GB   every run. Nothing here is ever deleted.
 
-DATA_DIR = r'D:\\msc_data\\in100'         # <-- the pack from NB1 / pack_imagenet100.py
-MSC_ROOT = r'D:\\msc_results'             # <-- all output
+DATA_DIR = None      # e.g. r'E:\\msc_data\\in100'   -- None = choose for me
+MSC_ROOT = None      # e.g. r'E:\\msc_results'        -- None = choose for me
 
 # ---------------------------------------------------------------------------
 import os
+
+_paths = M.resolve_storage(DATA_DIR, MSC_ROOT)
+if not _paths['ok']:
+    raise SystemExit('storage is not usable -- see the problems listed above')
+
+DATA_DIR = _paths['data_dir']
+MSC_ROOT = _paths['results_root']
 os.environ['MSC_IN100_DIR'] = DATA_DIR
 os.environ['MSC_SCRATCH'] = MSC_ROOT
 
@@ -286,7 +302,7 @@ Converts {len(ARCHS)}… sorry — converts **129,395 loose JPEGs** into one
 processes and takes 20–40 minutes:
 
 ```
-python tools/pack_imagenet100.py --src "C:\\Users\\Administrator\\Desktop\\New folder" --out "D:\\msc_data\\in100"
+python tools/pack_imagenet100.py --src "C:\\Users\\Administrator\\Desktop\\New folder" --out "<DATA_DIR from the cell above>"
 ```
 
 It is resumable at chunk granularity, so an interruption continues rather than

@@ -502,6 +502,18 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                     f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
                     f"exist" + (f" -- did you mean {near}?" if near else ""))
 
+            # D-44: a literal drive letter is wrong on any machine without
+            # that drive, and the failure is a WinError deep inside pathlib
+            # that names neither the setting nor the file to change.
+            for nd in ast.walk(tree):
+                if isinstance(nd, ast.Constant) and isinstance(nd.value, str):
+                    if re.match(r"^[A-Za-z]:[\\/]", nd.value):
+                        problems.append(
+                            f"{nb.name} cell {ci} line "
+                            f"{getattr(nd, 'lineno', 0)}: hardcoded drive "
+                            f"'{nd.value[:40]}'. Use resolve_storage(None, None) "
+                            f"or an explicit setting the operator edits (D-44)")
+
             for p, ln in _path_literals(tree):
                 msg = (f"{nb.name} cell {ci} line {ln}: repo path '{p}' is "
                        f"spelled as a literal; use run_layout() or a named "

@@ -25,10 +25,10 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **324** offline, all passing, exit code verified |
+| **Self-checks** | **334** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **7** (D-37 … D-43) · 7 fixed · 0 open |
+| **Defects found this port** | **8** (D-37 … D-44) · 8 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,63 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-44 · A default path named a drive that does not exist
+
+**Severity:** NB1 could not run at all · **Status:** **fixed**
+**Found:** 2026-08-08 from the user's NB1 outputs
+
+```
+FileNotFoundError: [WinError 3] The system cannot find the path specified: 'D:\'
+```
+
+Twice — once in the **bootstrap cell**, once in the paths cell.
+
+**Cause.** I wrote `DATA_DIR = r'D:\msc_data\in100'` and
+`MSC_ROOT = r'D:\msc_results'` as placeholder defaults. **There is no D: drive
+on this machine.** A default that names a drive letter is wrong on any machine
+without that letter, which is most of them.
+
+**Two separate faults, and the second is worse.**
+
+1. **The default was unusable.** Fine on its own — the operator edits two lines.
+2. **The failure named neither the setting nor the file that had to change.**
+   Forty lines of `pathlib.mkdir` traceback ending in `WinError 3`. Nothing in
+   it says "edit `DATA_DIR` at the top of the notebook", which is the entire
+   remedy.
+3. **Import itself failed.** `enforce_offline` called
+   `ensure_dir(TORCH_HOME)` unconditionally at module import, and `TORCH_HOME`
+   derives from `MSC_SCRATCH`. So after the paths cell set `MSC_SCRATCH=D:\...`,
+   re-running the **bootstrap** cell crashed — before the operator ever reached
+   the cell that sets the path. An import that requires a writable directory
+   turns a one-line fix into a traceback with no visible cause.
+
+**Contamination analysis.** None. Nothing ran. The cost was one user round trip.
+
+**Fix — remove the guess, and make the failure legible.**
+
+| change | why |
+|---|---|
+| `DATA_DIR = None`, `MSC_ROOT = None` by default | there is no placeholder left to be wrong |
+| `resolve_storage()` picks the roomiest **existing** root | `storage_candidates()` probes drive letters for existence, so a machine without D: simply never reports one |
+| writability proved by **writing a probe file and reading it back** | `os.access` lies on Windows shares and on permission-inherited folders. Same discipline as `verify_run_artifacts`: presence is not usability |
+| free space checked against ~26 GB (pack) and ~120 GB (results) | running out at run 19 of 24 is the alternative |
+| `ensure_dir` names the **first missing level** and the remedy | `WinError 3` becomes "the first missing level is `D:\` — if that is a drive letter it does not exist on this machine; set DATA_DIR / MSC_ROOT, or leave them None" |
+| `enforce_offline` falls back to a temp dir | importing the library can no longer fail because a cache path is absent |
+
+**Replicated everywhere by construction.** All five notebooks share one
+`paths_cell()` in the generator, so the fix landed in five places from one
+edit. That is why the cell is generated rather than written per notebook.
+
+**Guards added.** Ten self-checks over `storage_candidates` / `resolve_storage`
+/ `ensure_dir` / `enforce_offline`, plus a **build-time** rule: any string
+literal matching `^[A-Za-z]:[\\/]` in any notebook **refuses generation**.
+Verified by feeding the checker a synthetic notebook containing exactly the old
+line — it fails, with the remedy named.
+
+Self-checks 324 → **334**.
+
+---
 
 ### D-43 · The benchmark measured a machine the pipeline never uses
 
@@ -635,6 +692,7 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-44 — a default path named a drive that does not exist.** NB1 died twice on `WinError 3` for `D:\`, once in the bootstrap cell because `enforce_offline` made *import* depend on a writable directory. Defaults are now `None` and `resolve_storage()` picks the roomiest existing root, proving it by writing and reading back a probe file. Build-time guard: no notebook may contain a drive-letter literal |
 | 2026-08-08 | **First real measurement.** 6 of 8 architectures benchmarked. The plan's 235 GPU-hours was optimistic by 66%: the atlas is **391 GPU-h** and `vgg16` alone is **45%** of it. Cost model re-anchored on measurement (D-10's lesson) |
 | 2026-08-08 | **D-43 — the benchmark measured a machine the pipeline never uses.** `cudnn.benchmark=False` while every real run has it True; ResNet-50 read 82 img/s where ~180 is expected. One `set_perf_flags` now serves both |
 | 2026-08-08 | **D-42 — `build_vit_small` did not accept `probe_res`**, so two of eight architectures raised TypeError — and they are the recipe-vs-architecture control pair. Guard: every builder's signature must accept what `build_model` injects |
