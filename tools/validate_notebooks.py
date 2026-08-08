@@ -232,7 +232,8 @@ def _library_defined() -> set:
     # notion of "everything this project defines" omits a source file will keep
     # producing false positives until someone switches it off.
     srcs = []
-    for f in ("src/msc_lib.py", "msc_core.py", "msc_torch.py"):
+    for f in ("src/msc_lib.py", "msc_core.py", "msc_torch.py",
+              "tools/pack_imagenet100.py"):
         fp = ROOT / f
         if fp.exists():
             srcs.append(fp.read_text(encoding="utf-8"))
@@ -268,6 +269,98 @@ def _known(name: str) -> bool:
     return (name in SCHEMA or name in SUMMARY_KEYS or name in LIB_DEFINED
             or bool(PER_SAMPLE_RE.match(name))
             or bool(ANALYSIS_RE.match(name)))
+
+
+# ---------------------------------------------------------------------------
+# Does every library call a notebook makes actually exist?
+# ---------------------------------------------------------------------------
+# Rule 3 is "column names are data -- validate them against the schema at BUILD
+# time". Function names are data in exactly the same way, and the failure is
+# worse: a wrong column name yields a KeyError with a suggestion, while a wrong
+# function name yields an AttributeError several cells into a run that may have
+# already spent GPU-hours.
+#
+# This project has now hit it twice. `MultiExit` instead of `MultiExitModel`
+# cost an offline-verification run. Writing these five notebooks produced SIX
+# invented names in one sitting -- `analyse_q1_all`, `analyse_q2_all`,
+# `analyse_q3_all`, `analyse_q3_shuffled_control_all`, `analyse_q4_all`,
+# `compare_routing_methods` -- every one of which would have surfaced only when
+# the user ran the cell.
+#
+# The schema was sitting right there both times.
+def _source_level_names(path: Path, cls: str | None = None) -> set:
+    """Names defined at module scope (or in one class) IN THE SOURCE.
+
+    `dir(M)` is the wrong universe. Half of msc_lib -- ExitHead,
+    MultiExitModel, MSCLoss, MSCStudent -- lives under `if _TORCH_OK:`, so on a
+    machine without torch those names are absent from the module object while
+    being perfectly real on the machine that runs the experiment. Using dir()
+    alone reported `MultiExitModel` as nonexistent, which is the checker
+    producing exactly the false negative it exists to prevent.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return set()
+    out: set = set()
+
+    def walk(body, want_cls=None, depth=0):
+        for nd in body:
+            if isinstance(nd, ast.ClassDef):
+                if want_cls and nd.name == want_cls:
+                    for sub in nd.body:
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            out.add(sub.name)
+                    # `self.data_dir = ...` is as much a member as a method,
+                    # and it is what a notebook actually reaches for. dir() on
+                    # the CLASS never sees instance attributes.
+                    for sub in ast.walk(nd):
+                        if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                            tg = (sub.targets if isinstance(sub, ast.Assign)
+                                  else [sub.target])
+                            for t in tg:
+                                if isinstance(t, ast.Attribute) \
+                                        and getattr(t.value, "id", None) == "self":
+                                    out.add(t.attr)
+                elif not want_cls:
+                    out.add(nd.name)
+                    walk(nd.body, want_cls, depth + 1)
+            elif isinstance(nd, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not want_cls:
+                    out.add(nd.name)
+            elif isinstance(nd, ast.Assign) and not want_cls:
+                out.update(t.id for t in nd.targets if isinstance(t, ast.Name))
+            elif isinstance(nd, ast.AnnAssign) and not want_cls \
+                    and isinstance(nd.target, ast.Name):
+                out.add(nd.target.id)
+            elif isinstance(nd, (ast.If, ast.Try)):
+                walk(nd.body, want_cls, depth)
+                walk(getattr(nd, "orelse", []) or [], want_cls, depth)
+                for h in getattr(nd, "handlers", []) or []:
+                    walk(h.body, want_cls, depth)
+    walk(tree.body, cls)
+    return out
+
+
+_LIBSRC = ROOT / "src" / "msc_lib.py"
+LIB_PUBLIC = ({n for n in dir(M) if not n.startswith("__")}
+              | _source_level_names(_LIBSRC))
+SESSION_PUBLIC = ({n for n in dir(M.Session) if not n.startswith("_")}
+                  | _source_level_names(_LIBSRC, cls="Session"))
+
+
+def _library_calls(tree: ast.AST):
+    """(`attribute`, `line`, `kind`) for every `M.x` and `sess.x` reference."""
+    out = []
+    for nd in ast.walk(tree):
+        if not isinstance(nd, ast.Attribute):
+            continue
+        base = getattr(nd.value, "id", None)
+        if base in ("M", "msc_lib"):
+            out.append((nd.attr, getattr(nd, "lineno", 0), "msc_lib"))
+        elif base in ("sess", "session"):
+            out.append((nd.attr, getattr(nd, "lineno", 0), "Session"))
+    return out
 
 
 def self_test() -> bool:
@@ -333,6 +426,18 @@ def self_test() -> bool:
             except Exception:
                 pass
 
+    # -- the library-name check must be able to fail ------------------------
+    for bad in ("analyse_q1_all_typo", "MultiExit", "confirm_on_hf_typo"):
+        if bad in LIB_PUBLIC:
+            print(f"  [SELFTEST FAIL] '{bad}' should not resolve")
+            ok = False
+    for good in ("analyse_q1_all", "MultiExitModel", "backbone_dry_run",
+                 "oracle_dry_run", "compare_routing_methods"):
+        if good not in LIB_PUBLIC:
+            print(f"  [SELFTEST FAIL] msc_lib.{good} is referenced by the "
+                  f"notebooks and does not exist")
+            ok = False
+
     print(f"  [SELFTEST {'PASS' if ok else 'FAIL'}] "
           f"this checker catches the {len(d36)} D-36 read-names; "
           f"append_history_row(strict) catches all {len(d22)} D-22 write-names; "
@@ -388,6 +493,15 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                     f"notebook"
                     + (f" -- did you mean {near}?" if near else ""))
 
+            for attr, ln, kind in _library_calls(tree):
+                pool = LIB_PUBLIC if kind == "msc_lib" else SESSION_PUBLIC
+                if attr in pool:
+                    continue
+                near = difflib.get_close_matches(attr, sorted(pool), n=3, cutoff=0.6)
+                problems.append(
+                    f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
+                    f"exist" + (f" -- did you mean {near}?" if near else ""))
+
             for p, ln in _path_literals(tree):
                 msg = (f"{nb.name} cell {ci} line {ln}: repo path '{p}' is "
                        f"spelled as a literal; use run_layout() or a named "
@@ -395,7 +509,9 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                 (problems if strict_paths else warnings_).append(msg)
 
     print(f"checked {len(nbs)} notebook(s) against {len(SCHEMA)} schema "
-          f"columns ({len(M.HISTORY_FIELDS)} history + {len(M.FINAL_FIELDS)} final)")
+          f"columns ({len(M.HISTORY_FIELDS)} history + {len(M.FINAL_FIELDS)} "
+          f"final), {len(LIB_PUBLIC)} library names and {len(SESSION_PUBLIC)} "
+          f"Session methods")
     for w in warnings_:
         print(f"  [WARN] {w}")
     for p in problems:

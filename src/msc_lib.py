@@ -8298,6 +8298,255 @@ def analyse_q4_irreducibility(data_dir, run_a: str, run_b: str, budgets_by_run,
     return out.drop(columns=["delta_r2_ci95"], errors="ignore")
 
 
+# =============================================================================
+# atlas-wide analysis wrappers
+# =============================================================================
+# The per-run and per-pair statistics above are the primitives. These assemble
+# them across the whole atlas.
+#
+# On CIFAR this assembly lived in NOTEBOOK CELLS, and that is where D-18 came
+# from: `pairs[:15]` over an alphabetically sorted list looked like cost
+# control and was actually a biased sample -- 12 convnext pairs and 3 mixer
+# pairs, the two most atypical architectures in the zoo, both of which depress
+# the statistic being reported. And `{m['arch']: r for r,m in runs.items() if
+# m['seed']==1}` silently dropped an architecture whose seed 1 was never
+# measured, so the analysis covered 13 architectures while calling itself the
+# atlas.
+#
+# Neither was catchable, because a dict comprehension in a notebook cell cannot
+# announce what it skipped and nothing tests a notebook cell. Rule 8: test the
+# thing you wrote. So the selection logic lives here, where the self-checks can
+# reach it, and every one of these functions REPORTS what it excluded.
+def _run_index(session, phase: str = "p1") -> Dict[str, Dict[str, Any]]:
+    """Measured runs, keyed by run_id, with identity parsed from the id."""
+    out = {}
+    for r in session.completed_runs(phase=phase):
+        rid = r["run_id"]
+        if session.measured(rid):
+            out[rid] = run_meta(rid, r)
+    return out
+
+
+def analyse_q1_all(session, phase: str = "p1", axis: str = "depth",
+                   taus=TAU_GRID) -> "Any":
+    """Seed ceiling for every architecture with >= 2 measured seeds.
+
+    Reports architectures it had to SKIP and why, rather than quietly
+    returning a shorter table (D-18). One row per architecture, with the
+    tau-curve pivoted into columns and mean top-1 alongside -- because the
+    accuracy confound has to be visible in the same table as the ceiling, not
+    argued around in prose afterwards.
+    """
+    runs = _run_index(session, phase)
+    by_arch: Dict[str, List[str]] = {}
+    for rid, m in runs.items():
+        by_arch.setdefault(m["arch"], []).append(rid)
+
+    rows, skipped = [], {}
+    for arch, rids in sorted(by_arch.items()):
+        rids = sorted(rids)
+        if len(rids) < 2:
+            skipped[arch] = f"{len(rids)} measured seed(s); a ceiling needs 2"
+            continue
+        b = session.budgets(arch)
+        # EVERY pair, then the mean -- not just (seed1, seed2). With three
+        # seeds there are three pairs, and reporting one of them throws away
+        # two thirds of the evidence for the project's most important number.
+        per_tau: Dict[float, List[float]] = {t: [] for t in taus}
+        j10: Dict[float, List[float]] = {t: [] for t in taus}
+        for i in range(len(rids)):
+            for j in range(i + 1, len(rids)):
+                df = analyse_q1_seed_ceiling(session.data_dir, rids[i], rids[j],
+                                             b, axis=axis, taus=taus)
+                for _, r in df.iterrows():
+                    if "rho_seed" in r and pd.notna(r.get("rho_seed")):
+                        per_tau[float(r["tau"])].append(float(r["rho_seed"]))
+                        j10[float(r["tau"])].append(float(r.get("jaccard_top10",
+                                                               float("nan"))))
+        accs = []
+        for rid in rids:
+            s = read_json(run_layout(session.work, rid)["base"] / "summary.json", {})
+            if s and s.get("best_accuracy") is not None:
+                accs.append(float(s["best_accuracy"]))
+        rec = {"arch": arch, "family": ZOO.get(arch, {}).get("family", "?"),
+               "n_seeds": len(rids), "n_pairs": len(rids) * (len(rids) - 1) // 2,
+               "top1_mean": float(np.mean(accs)) if accs else float("nan"),
+               "top1_spread": (float(np.max(accs) - np.min(accs)) if len(accs) > 1
+                               else float("nan"))}
+        for t in taus:
+            v = per_tau[float(t)]
+            rec[f"rho_seed_tau{t}"] = float(np.mean(v)) if v else float("nan")
+            rec[f"rho_seed_sd_tau{t}"] = (float(np.std(v)) if len(v) > 1
+                                          else float("nan"))
+            rec[f"j10_tau{t}"] = (float(np.nanmean(j10[float(t)]))
+                                  if j10[float(t)] else float("nan"))
+        rows.append(rec)
+
+    if skipped:
+        log(f"Q1 EXCLUDED {len(skipped)} architecture(s): {skipped}", "ALARM")
+        log("A ceiling needs two measured seeds. These contribute to NOTHING "
+            "-- not Q1, not Q3, not Q4 -- and any claim about the full zoo is "
+            "false until they are measured (the D-15 shape).", "ALARM")
+    return pd.DataFrame(rows)
+
+
+def analyse_q2_all(session, phase: str = "p1", tau: float = 0.1) -> "Any":
+    """Axis structure for one representative run per architecture."""
+    runs = _run_index(session, phase)
+    reps = representative_runs(runs)
+    rows = []
+    for arch, rid in sorted(reps.items()):
+        df = analyse_q2_axis_structure(session.data_dir, rid,
+                                       session.budgets(arch))
+        if df is None or not len(df):
+            continue
+        sub = df[df.get("tau").astype(float) == float(tau)] if "tau" in df else df
+        if not len(sub):
+            continue
+        r = sub.iloc[0].to_dict()
+        rows.append({"arch": arch, "family": ZOO.get(arch, {}).get("family", "?"),
+                     "run_id": rid, "tau": tau,
+                     "pc1": r.get("pc1_variance"), "n": r.get("n")})
+    return pd.DataFrame(rows)
+
+
+def _pair_kind(a: str, b: str) -> str:
+    fa = ZOO.get(a, {}).get("family", "?")
+    fb = ZOO.get(b, {}).get("family", "?")
+    att = {"vit", "swin", "mixer"}
+    if fa == fb:
+        return "within-family"
+    if fa in att and fb in att:
+        return "transformer-transformer"
+    if fa in att or fb in att:
+        return "CNN-transformer"
+    return "across-CNN-family"
+
+
+def _ceilings(session, q1=None, tau: float = 0.1) -> Dict[str, float]:
+    q1 = q1 if q1 is not None else analyse_q1_all(session)
+    col = f"rho_seed_tau{tau}"
+    return {r["arch"]: float(r[col]) for _, r in q1.iterrows()
+            if pd.notna(r.get(col))}
+
+
+def analyse_q3_all(session, phase: str = "p1", tau: float = 0.1,
+                   n_boot: int = 1000) -> "Any":
+    """Disattenuated transfer over EVERY architecture pair.
+
+    Every pair, not `pairs[:N]`. A truncation over a sorted list is only a
+    sample if the order is unrelated to the quantity being measured, and
+    `sorted()` guarantees it is not (D-18).
+    """
+    runs = _run_index(session, phase)
+    reps = representative_runs(runs, require=_ceilings(session, tau=tau))
+    ceil = _ceilings(session, tau=tau)
+    archs = sorted(a for a in reps if a in ceil)
+    pairs = [(reps[a], reps[b]) for i, a in enumerate(archs) for b in archs[i + 1:]]
+    if not pairs:
+        return pd.DataFrame([])
+    budgets = {reps[a]: session.budgets(a) for a in archs}
+    ceil_by_run = {reps[a]: ceil[a] for a in archs}
+    df = analyse_q3_transfer(session.data_dir, pairs, ceil_by_run, budgets,
+                             taus=(tau,), n_boot=n_boot)
+    if len(df):
+        df["arch_a"] = df["run_a"].map(lambda r: parse_run_id(r)["arch"])
+        df["arch_b"] = df["run_b"].map(lambda r: parse_run_id(r)["arch"])
+        df["pair_type"] = [_pair_kind(a, b)
+                           for a, b in zip(df["arch_a"], df["arch_b"])]
+    return df
+
+
+def analyse_q3_shuffled_control_all(session, phase: str = "p1",
+                                    tau: float = 0.1) -> "Any":
+    """The alignment control, on EVERY pair -- not the first 25 of them."""
+    runs = _run_index(session, phase)
+    ceil = _ceilings(session, tau=tau)
+    reps = representative_runs(runs, require=ceil)
+    archs = sorted(a for a in reps if a in ceil)
+    budgets = {reps[a]: session.budgets(a) for a in archs}
+    ceil_by_run = {reps[a]: ceil[a] for a in archs}
+    rows = []
+    for i, a in enumerate(archs):
+        for b in archs[i + 1:]:
+            r = analyse_q3_shuffled_control(session.data_dir, reps[a], reps[b],
+                                            ceil_by_run, budgets, tau=tau)
+            r.update({"arch_a": a, "arch_b": b})
+            rows.append(r)
+    df = pd.DataFrame(rows)
+    if len(df) and "passes" not in df.columns and "ok" in df.columns:
+        df["passes"] = df["ok"]
+    return df
+
+
+def analyse_q4_all(session, phase: str = "p1", tau: float = 0.1,
+                   split: str = "train_holdout", n_boot: int = 500) -> "Any":
+    """Irreducibility over every pair, on the split that carries all seven
+    battery scores.
+
+    `split` defaults to `train_holdout` and not to `test`, because EL2N and
+    forgetting-events are training-set quantities. Running the battery without
+    them is an EASIER test for MSC, which is the direction that flatters the
+    result -- it overstated CIFAR's irreducibility by 2.5x and the number had
+    to be withdrawn (D-11).
+    """
+    runs = _run_index(session, phase)
+    reps = representative_runs(runs, require=_ceilings(session, tau=tau))
+    archs = sorted(reps)
+    budgets = {reps[a]: session.budgets(a) for a in archs}
+    frames = []
+    for i, a in enumerate(archs):
+        for b in archs[i + 1:]:
+            try:
+                d = analyse_q4_irreducibility(session.data_dir, reps[a], reps[b],
+                                              budgets, taus=(tau,),
+                                              n_boot=n_boot, split=split)
+                if d is not None and len(d):
+                    d = d.copy()
+                    d["arch_a"], d["arch_b"] = a, b
+                    d["pair_type"] = _pair_kind(a, b)
+                    frames.append(d)
+            except Exception as e:                               # noqa: BLE001
+                log(f"Q4 {a}x{b}: {type(e).__name__}: {str(e)[:120]}", "WARN")
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame([])
+
+
+def compare_routing_methods(session, run_ids: Sequence[str],
+                            tau: float = 0.1) -> "Any":
+    """B1 / B2 / B10 / B11 per student, read from what NB5 wrote.
+
+    Reads rather than recomputes: `train_msc_kd` already evaluated each student
+    and wrote the result, and recomputing here would need the val loader, the
+    checkpoint and the teacher again for numbers that exist on disk.
+
+    `arm` is derived from the run_id, never from a flag. Two arms whose
+    identity depended on an operator remembering which value to run is exactly
+    what made four consecutive sessions train the control (D-27).
+    """
+    rows = []
+    for rid in run_ids:
+        s = read_json(run_layout(session.work, rid)["base"] / "summary.json", {})
+        if not s:
+            continue
+        m = parse_run_id(rid)
+        rows.append({
+            "run_id": rid, "student": m["arch"], "seed": m["seed"],
+            "arm": "scrambled" if "shuff" in str(m["method"]) else "real",
+            **{k: s.get(k) for k in
+               ("best_accuracy", "b1_static", "b2_confidence", "b10_msckd",
+                "b11_oracle", "avg_flops_ratio", "gamma", "ltt_epsilon")},
+        })
+    df = pd.DataFrame(rows)
+    if len(df) and {"b2_confidence", "b10_msckd", "b11_oracle"} <= set(df.columns):
+        gap = pd.to_numeric(df["b11_oracle"], errors="coerce") - \
+            pd.to_numeric(df["b2_confidence"], errors="coerce")
+        closed = pd.to_numeric(df["b10_msckd"], errors="coerce") - \
+            pd.to_numeric(df["b2_confidence"], errors="coerce")
+        # The paper's central number: the fraction of the B2->B11 gap closed.
+        df["frac_b2_b11_gap_closed"] = closed / gap.replace(0, np.nan)
+    return df
+
+
 def phase0_decision(seed_rho: float, transfer_T: float, delta_r2: float) -> Dict[str, Any]:
     """The 01_PHASE0_GO_NOGO.md 6 decision table, encoded.
 
