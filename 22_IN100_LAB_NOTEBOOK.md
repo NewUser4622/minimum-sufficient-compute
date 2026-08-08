@@ -28,7 +28,7 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Self-checks** | **310** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **4** (D-37 … D-40) · 4 fixed · 0 open |
+| **Defects found this port** | **5** (D-37 … D-41) · 5 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,73 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-41 · The benchmark crashed the workstation
+
+**Severity:** **took the machine down; ~2 hours of the user's time to recover**
+**Status:** **fixed** · **Found:** 2026-08-08 by the user running it
+**This is the worst defect of the port, and it is entirely mine.**
+
+The throughput benchmark swept batch sizes up to **256 at 224px on a 20 GB
+card**, in-process, with no cap on how much VRAM it could take and no timeout.
+The machine hung and required a second person with administrator access to
+recover.
+
+**Cause.** Three compounding mistakes, and the first is the one that matters:
+
+1. **No VRAM ceiling, on a GPU that is almost certainly also driving the
+   display.** Filling the card starves the Windows desktop compositor. When the
+   driver stops responding for more than ~2 seconds, Windows fires a TDR
+   (Timeout Detection & Recovery) reset. On a workstation that is a hang or a
+   `VIDEO_TDR_FAILURE` bugcheck. `resnet50` at batch 256 and 224px is well over
+   20 GB for activations alone; `vgg16` and `swin_tiny` worse.
+2. **No isolation.** Every configuration ran in the benchmark's own process, so
+   a CUDA error poisoned the context for everything after it, and dataloader
+   workers — each mapping the 24 GiB pack — accumulated across a sweep that
+   created up to 40 of them.
+3. **No timeout.** A kernel that stopped making progress stopped the sweep, and
+   there was no mechanism to notice or intervene.
+
+**What I got wrong in reasoning, not just in code.** I wrote a tool whose entire
+purpose is to *find the limits of the hardware* and did not treat approaching
+those limits as dangerous. Catching `torch.cuda.OutOfMemoryError` felt like
+sufficient handling — but an OOM you catch in Python is the *benign* case. The
+damaging case is the allocation that succeeds and leaves the display driver
+with nothing, and no exception handler sees that at all. **The safety mechanism
+had to prevent the condition, not react to it.**
+
+I also assumed a dedicated compute GPU without checking, on a machine described
+to me as a Windows 10 workstation with one GPU. That was the assumption to
+question first.
+
+**Contamination analysis.** No data lost — nothing had been trained and the
+benchmark writes no experimental artifacts. The cost was entirely the user's
+time, which is not a category this log has had to account for before and should
+have been.
+
+**Fix — prevent, isolate, bound.**
+
+| mechanism | why this one |
+|---|---|
+| `set_per_process_memory_fraction(0.70)` | caps the process at ~14 of 20 GiB, so an oversized batch raises a **catchable Python OOM** long before the driver is starved. Prevention, not reaction |
+| **every configuration in its own subprocess** | a child that OOMs, hangs or dies takes nothing with it; the OS reclaims its CUDA context and its workers on exit |
+| **hard timeout, killing the process *tree*** | a hung config is killed in seconds. The tree matters: an orphaned worker holding the 24 GiB memmap is how the *next* config runs out of RAM |
+| batch ceiling 256 → 192, workers 16 → 8 | the top of the old ladder existed to find the OOM point. It is not worth finding |
+| `torch.compile` **off by default** | Triton on Windows is unreliable and compilation can hang for minutes with no output |
+| results written **after every configuration** | an interruption costs one data point, not the run |
+| `--plan-only`, `--vram-frac` | the operator can see what it will do, and lower the ceiling further, before it does anything |
+
+**Verified, not asserted.** The three mechanisms were each exercised: a child
+that fails emits a structured result and the parent survives; a deliberately
+hung child is killed at the timeout with the parent alive; the results file
+exists and is valid after every append with no `.tmp` left behind.
+
+**The lesson.** The playbook's rule about dry runs is "never spend an hour
+discovering something findable in a second". This is its neighbour: **a tool
+that probes for a limit must be built so that reaching the limit is survivable**
+— because the whole point of it is to get there.
+
+---
 
 ### D-40 · GPU-side augmentation silently changed what `dataload_frac` means
 
@@ -451,6 +518,7 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-41 — the benchmark crashed the workstation.** No VRAM ceiling on a GPU that also drives the display, no isolation, no timeout. Rebuilt: memory fraction capped, every config in its own subprocess, process trees killed on timeout, results written after each one. The worst defect of the port |
 | 2026-08-08 | **Throughput benchmark written** (`benchmark/`). Staged coordinate descent over dtype x layout, batch size, workers, torch.compile, then a cold confirmation run. The plan's 235 GPU-hours is an estimate anchored on one guess; D-10 was that estimate being 40% low |
 | 2026-08-08 | **Paper artifacts wired.** Six tables, three figures, and `verify_paper_artifacts` — each of the protocol's six contributions now has a named artifact, and the notebook checks the list rather than trusting it |
 | 2026-08-08 | **D-40 — GPU-side augmentation changed what `dataload_frac` measures.** A recorded column that would have answered a different question than its name. Split into `dataload_time_sec` (CPU wait) and `augment_time_sec` (device work). Schema 158 → 160 |

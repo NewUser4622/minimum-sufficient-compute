@@ -1,63 +1,50 @@
 #!/usr/bin/env python3
 """
-bench_throughput.py -- find the fastest safe configuration for THIS machine,
-before committing ~400 GPU-hours to it.
+bench_throughput.py -- find the fastest SAFE configuration for this machine.
 
-Why this exists
----------------
-The run matrix is ~235 GPU-hours of backbone training. A 20% throughput win is
-47 hours; a 40% win is 94. That is worth an hour of measurement, and it is worth
-measuring rather than assuming, because every number in `20_IN100_PORT_PLAN.md`
-§6 is an *estimate* anchored on one guessed figure. The CIFAR programme's first
-cost table was 40% low (D-10), and it only found out by running.
+READ THIS FIRST -- the previous version crashed a workstation
+-------------------------------------------------------------
+It swept batch sizes up to 256 at 224px on a 20 GB card, with no cap on how
+much VRAM the process could take and no isolation between configurations. On a
+GPU that is *also driving the display* that is a recipe for a Windows TDR
+(Timeout Detection & Recovery) driver reset: the desktop compositor is starved,
+the driver stops responding for more than two seconds, Windows resets it, and
+the machine hangs.
 
-It is also the only way to answer a question the plan cannot: at 224px with a
-packed memmap, is this pipeline GPU-bound or loader-bound, and does that answer
-differ between `resnet18` and `swin_tiny`? If it is loader-bound for the small
-models, adding workers is free speed. If it is GPU-bound, adding workers is
-noise and the lever is batch size or dtype.
+Three things were wrong, and all three are now fixed:
 
-How it sweeps
--------------
-NOT a full grid. 8 architectures x 5 batch sizes x 5 worker counts x 2 dtypes x
-2 layouts x 3 compile modes is 2,400 configurations and would take longer than
-it saves. Instead a **staged coordinate descent**, each stage fixing the winner
-of the last:
+  1. **No VRAM ceiling.** PyTorch was allowed to allocate everything. Now
+     `set_per_process_memory_fraction` caps it (default 70%), so an oversized
+     configuration raises a clean, catchable Python OOM *long before* the
+     driver runs out of room for the desktop.
 
-    A  dtype x memory layout        4 configs   cheap, biggest per-config effect
-    B  batch size ladder            5 configs   with OOM detection
-    C  dataloader workers           5 configs   only meaningful once B is fixed
-    D  torch.compile                3 configs   expensive to compile; winner only
-    E  confirmation                 1 config    long steady-state run
+  2. **No isolation.** Every configuration ran in this process, so one bad
+     allocation poisoned the CUDA context for everything after it, and leaked
+     dataloader workers accumulated across the sweep. Now **every
+     configuration runs in its own subprocess** with a hard timeout. A child
+     that OOMs, hangs or dies takes nothing with it, and its CUDA context and
+     workers are released by the OS when it exits.
 
-Coordinate descent can miss an interaction that a grid would find. It is used
-anyway because the interactions here are weak (batch size and worker count are
-close to separable once neither is starving) and because a sweep that takes six
-hours will not be run. Stage E re-measures the chosen configuration from cold,
-so the reported number is a measurement and not a sum of stage bests.
+  3. **No timeout.** A hung kernel hung the sweep, and the machine with it.
+     Every child is killed (with its process tree) after `--timeout` seconds.
 
-What it measures
-----------------
-* **Steady-state training throughput** (img/s), forward + backward + optimiser
-  step, after warmup, with `torch.cuda.synchronize()` around the timed region.
-  Timing CUDA without synchronising measures queue-submission speed.
-* **Peak VRAM**, so the chosen batch size has headroom rather than sitting one
-  allocation away from an OOM at epoch 60.
-* **The loader ceiling, separately** -- how fast batches arrive with no model at
-  all. If model throughput is at that ceiling, the GPU is starving and no
-  amount of tuning the model will help.
-* **The cost of telemetry.** NVML power sampling runs at 10 Hz for every real
-  run. Measured here rather than assumed to be free.
+Also changed: `torch.compile` is OFF by default (Triton on Windows is
+unreliable and compilation can hang), workers are capped at 8 rather than 16,
+and results are written to disk **after every configuration** so a crash costs
+one data point rather than the whole run.
+
+If it still misbehaves, drop the ceiling further: `--vram-frac 0.5`.
 
 Usage
 -----
-    python benchmark/bench_throughput.py                     # full sweep, ~45 min
-    python benchmark/bench_throughput.py --quick             # ~10 min, fewer points
-    python benchmark/bench_throughput.py --archs resnet50 swin_tiny
-    python benchmark/bench_throughput.py --synthetic         # no packed data needed
+    python benchmark/bench_throughput.py --data-dir "D:\\msc_data\\in100"
+    python benchmark/bench_throughput.py --quick            # ~8 min
+    python benchmark/bench_throughput.py --no-loader        # model stages only
+    python benchmark/bench_throughput.py --plan-only        # print, run nothing
+    python benchmark/bench_throughput.py --vram-frac 0.5    # extra cautious
 
-Writes `benchmark/results/bench_<host>_<timestamp>.json` plus a printed table.
-**Send me the JSON** -- it contains everything needed to re-plan the run matrix.
+Writes `benchmark/results/bench_<host>_<stamp>.json` incrementally.
+Send me that file.
 """
 from __future__ import annotations
 
@@ -65,369 +52,467 @@ import argparse
 import json
 import os
 import platform
+import subprocess
 import sys
 import time
-import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-os.environ.setdefault("MSC_OFFLINE", "1")
-
-import numpy as np                                             # noqa: E402
-import torch                                                   # noqa: E402
-import msc_lib as M                                            # noqa: E402
-
-OUT = Path(__file__).resolve().parent / "results"
+BENCH = Path(__file__).resolve()
+OUT = BENCH.parent / "results"
 DATASET = "imagenet100"
-DEV = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Conservative by construction. Every one of these can be raised from the
+# command line; none of them is raised by default.
+DEFAULT_VRAM_FRAC = 0.70      # leave >=30% for the display and everything else
+DEFAULT_TIMEOUT = 240         # seconds per configuration, then the tree is killed
+MAX_WORKERS = 8               # not 16: each worker maps the 24 GiB pack
+STEPS, WARMUP = 20, 6         # short runs -> short kernels -> no TDR window
 
 
-# ---------------------------------------------------------------------------
-def _free_vram():
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+# ===========================================================================
+# CHILD -- runs exactly ONE configuration, prints one JSON line, exits.
+# ===========================================================================
+def child(spec: dict) -> int:
+    """Everything dangerous happens here, in a process that can be killed."""
+    os.environ.setdefault("MSC_OFFLINE", "1")
+    # One torch thread: the parent runs these serially, and oversubscribing
+    # 24 cores across a process that is meant to be GPU-bound adds nothing but
+    # scheduler noise.
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    sys.path.insert(0, str(ROOT / "src"))
 
-
-def _synth(batch, res, n_cls, n_batches=40):
-    """Batches resident on the GPU, so the model is measured with NO loader in
-    the way. Stage A/B/D want the model's ceiling, not the pipeline's."""
-    g = torch.Generator().manual_seed(0)
-    x = torch.randn(batch, 3, res, res, generator=g).to(DEV)
-    y = torch.randint(0, n_cls, (batch,), generator=g).to(DEV)
-    return [(x, y)] * n_batches
-
-
-def train_steps(arch, batch, res, n_cls, *, dtype=torch.float16,
-                channels_last=True, compile_mode=None, steps=30, warmup=8,
-                loader=None) -> dict:
-    """One configuration. Returns img/s, peak VRAM, and any failure."""
-    _free_vram()
-    rec = {"arch": arch, "batch": batch, "dtype": str(dtype).split(".")[-1],
-           "channels_last": channels_last, "compile": compile_mode or "off"}
+    out = dict(spec)
     try:
-        model = M.build_model(arch, n_cls, dataset=DATASET).to(DEV)
-        if channels_last:
+        # Imports are INSIDE the try so the child always emits a result line.
+        # A child that dies before printing gives the parent nothing to report
+        # except "no result", which is the least useful failure message
+        # available and hides an ImportError behind a spawn problem.
+        import torch
+        import msc_lib as M
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("no CUDA in child")
+
+        # THE SAFETY VALVE. Caps this process's share of VRAM so an oversized
+        # batch raises a Python OOM we catch, instead of starving the display
+        # driver until Windows resets it.
+        torch.cuda.set_per_process_memory_fraction(float(spec["vram_frac"]), 0)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        res, n_cls = spec["res"], spec["n_cls"]
+        dt = {"float16": torch.float16, "bfloat16": torch.bfloat16}[spec["dtype"]]
+
+        if spec["kind"] == "loader":
+            # No model at all -- this measures the loader's own ceiling.
+            cfg = M.base_config("resnet18", DATASET, seed=1)
+            cfg.update({"data_root": spec["data_dir"],
+                        "batch_size": spec["batch"],
+                        "num_workers": spec["workers"], "input_res": res})
+            tr, _, _, _, _ = M.build_loaders(cfg)
+            it = iter(tr)
+            for _ in range(4):
+                next(it)
+            torch.cuda.synchronize()
+            t0, n = time.time(), 0
+            for _ in range(spec["steps"]):
+                try:
+                    b = next(it)
+                except StopIteration:
+                    it = iter(tr)
+                    b = next(it)
+                n += b[0].shape[0]
+            torch.cuda.synchronize()
+            out["img_s"] = n / (time.time() - t0)
+            if hasattr(tr, "timing"):
+                t = tr.timing()
+                tot = max(1e-9, t["wait_s"] + t["augment_s"])
+                out["wait_frac"] = t["wait_s"] / tot
+                out["augment_frac"] = t["augment_s"] / tot
+            out["ok"] = True
+            del it, tr
+            return _emit(out)
+
+        # ---- model configuration --------------------------------------
+        model = M.build_model(spec["arch"], n_cls, dataset=DATASET).cuda()
+        if spec["channels_last"]:
             model = model.to(memory_format=torch.channels_last)
-        if compile_mode:
-            model = torch.compile(model, mode=compile_mode)
+        if spec.get("compile"):
+            model = torch.compile(model, mode=spec["compile"])
         opt = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-        scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+        scaler = torch.amp.GradScaler("cuda", enabled=(dt == torch.float16))
         crit = torch.nn.CrossEntropyLoss()
         model.train()
 
-        data = loader if loader is not None else _synth(batch, res, n_cls,
-                                                        steps + warmup)
-        it = iter(data)
+        b = spec["batch"]
+        x = torch.randn(b, 3, res, res, device="cuda")
+        y = torch.randint(0, n_cls, (b,), device="cuda")
+        if spec["channels_last"]:
+            x = x.contiguous(memory_format=torch.channels_last)
+
         n_seen, t0 = 0, None
-        for i in range(steps + warmup):
-            try:
-                b = next(it)
-            except StopIteration:
-                it = iter(data)
-                b = next(it)
-            x, y = b[0].to(DEV, non_blocking=True), b[1].to(DEV, non_blocking=True)
-            if channels_last and x.dim() == 4:
-                x = x.contiguous(memory_format=torch.channels_last)
-            with torch.amp.autocast("cuda", dtype=dtype):
+        for i in range(spec["steps"] + spec["warmup"]):
+            with torch.amp.autocast("cuda", dtype=dt):
                 loss = crit(model(x), y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             opt.zero_grad(set_to_none=True)
-            if i == warmup - 1:
-                # Warmup covers CUDA context creation, cuDNN autotuning and,
-                # for torch.compile, the entire graph capture -- which can be
-                # 30-90 s and would otherwise be charged to throughput.
+            if i == spec["warmup"] - 1:
                 torch.cuda.synchronize()
                 t0 = time.time()
-            elif i >= warmup:
-                n_seen += x.shape[0]
+            elif i >= spec["warmup"]:
+                n_seen += b
         torch.cuda.synchronize()
-        dt = time.time() - t0
-        rec.update({
-            "img_s": n_seen / dt,
-            "peak_vram_gb": torch.cuda.max_memory_allocated() / 2**30,
-            "ok": True,
-        })
-        del model, opt, scaler
-    except torch.cuda.OutOfMemoryError:
-        rec.update({"ok": False, "error": "OOM", "img_s": 0.0})
+        out.update({"img_s": n_seen / (time.time() - t0),
+                    "peak_vram_gb": torch.cuda.max_memory_allocated() / 2**30,
+                    "ok": True})
     except Exception as e:                                       # noqa: BLE001
-        rec.update({"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}",
-                    "img_s": 0.0})
-    _free_vram()
-    return rec
+        name = type(e).__name__
+        oom = ("OutOfMemory" in name or "out of memory" in str(e).lower())
+        out.update({"ok": False, "img_s": 0.0,
+                    "error": "OOM" if oom else f"{name}: {str(e)[:160]}"})
+    return _emit(out)
 
 
-def loader_ceiling(data_dir, batch, workers, res, steps=40) -> dict:
-    """How fast do batches arrive with NO model at all?
+def _emit(d: dict) -> int:
+    print("@@RESULT@@" + json.dumps(d, default=str))
+    sys.stdout.flush()
+    return 0
 
-    This is the number that says whether tuning the model is worth anything.
-    If a model's throughput equals this, the GPU is idle waiting and the fix is
-    the loader -- exactly what `dataload_frac` is for during the real run, and
-    the reason D-40 mattered.
-    """
-    rec = {"workers": workers, "batch": batch}
+
+# ===========================================================================
+# PARENT -- orchestrates, never touches CUDA itself.
+# ===========================================================================
+def _kill_tree(proc):
+    """Kill the child AND its dataloader workers. An orphaned worker holding a
+    24 GiB memmap is how the next configuration runs out of RAM."""
     try:
-        cfg = M.base_config("resnet18", DATASET, seed=1)
-        cfg.update({"data_root": str(data_dir), "batch_size": batch,
-                    "num_workers": workers, "input_res": res})
-        tr, _, _, _, _ = M.build_loaders(cfg)
-        it = iter(tr)
-        for _ in range(5):                                       # warmup
-            next(it)
-        torch.cuda.synchronize()
-        t0, n = time.time(), 0
-        for _ in range(steps):
+        import psutil
+        p = psutil.Process(proc.pid)
+        for c in p.children(recursive=True):
             try:
-                b = next(it)
-            except StopIteration:
-                it = iter(tr)
-                b = next(it)
-            n += b[0].shape[0]
-        torch.cuda.synchronize()
-        rec.update({"img_s": n / (time.time() - t0), "ok": True})
-        if hasattr(tr, "timing"):
-            t = tr.timing()
-            tot = max(1e-9, t["wait_s"] + t["augment_s"])
-            rec["wait_frac"] = t["wait_s"] / tot
-            rec["augment_frac"] = t["augment_s"] / tot
-        del tr, it
+                c.kill()
+            except Exception:                                    # noqa: BLE001
+                pass
+        p.kill()
+    except Exception:                                            # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def run_isolated(spec: dict, timeout: int) -> dict:
+    """One configuration, in its own process. Cannot take the parent down."""
+    cmd = [sys.executable, str(BENCH), "--child", json.dumps(spec)]
+    t0 = time.time()
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+        try:
+            so, se = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(p)
+            p.communicate()
+            return {**spec, "ok": False, "img_s": 0.0,
+                    "error": f"TIMEOUT after {timeout}s (killed)"}
     except Exception as e:                                       # noqa: BLE001
-        rec.update({"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}",
-                    "img_s": 0.0})
-    _free_vram()
-    return rec
+        return {**spec, "ok": False, "img_s": 0.0,
+                "error": f"spawn failed: {type(e).__name__}: {e}"}
+
+    for line in (so or "").splitlines():
+        if line.startswith("@@RESULT@@"):
+            r = json.loads(line[len("@@RESULT@@"):])
+            r["wall_s"] = time.time() - t0
+            return r
+    tail = (se or "").strip().splitlines()[-3:]
+    return {**spec, "ok": False, "img_s": 0.0,
+            "error": "child produced no result: " + " | ".join(tail)[:200]}
 
 
-# ---------------------------------------------------------------------------
-def sweep(archs, res, n_cls, quick=False, data_dir=None) -> dict:
-    out = {"stages": {}, "winner": {}}
-    BS = [64, 128] if quick else [32, 64, 128, 192, 256]
-    WK = [4, 12] if quick else [0, 4, 8, 12, 16]
-    bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+class Results:
+    """Written after every configuration. A crash costs one data point."""
 
-    # --- A: dtype x memory layout -----------------------------------------
-    print("\n=== Stage A: dtype x memory layout (batch 64) " + "=" * 26)
-    dtypes = [torch.float16] + ([torch.bfloat16] if bf16 else [])
-    rows = []
+    def __init__(self, path: Path, header: dict):
+        self.path = path
+        self.doc = {**header, "configs": [], "winner": {}}
+        self.flush()
+
+    def add(self, r: dict):
+        self.doc["configs"].append(r)
+        self.flush()
+
+    def flush(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.doc, indent=1, default=str),
+                       encoding="utf-8")
+        os.replace(tmp, self.path)
+
+
+def base(arch, res, n_cls, vram, **kw) -> dict:
+    return {"kind": "model", "arch": arch, "res": res, "n_cls": n_cls,
+            "batch": 64, "dtype": "float16", "channels_last": True,
+            "compile": None, "steps": STEPS, "warmup": WARMUP,
+            "vram_frac": vram, **kw}
+
+
+def sweep(args, archs, res, n_cls, R: Results) -> dict:
+    win, T, V = {}, args.timeout, args.vram_frac
+    BS = ([32, 64, 128] if args.quick else [32, 64, 96, 128, 192])
+    WK = ([2, 6] if args.quick else [0, 2, 4, 6, 8])
+    WK = [w for w in WK if w <= MAX_WORKERS]
+
+    print("\n=== A: dtype x memory layout (batch 64) " + "=" * 30)
+    dts = ["float16"] + (["bfloat16"] if args.bf16 else [])
     for a in archs:
-        best, brec = -1, None
-        for dt in dtypes:
+        best = None
+        for d in dts:
             for cl in (True, False):
-                r = train_steps(a, 64, res, n_cls, dtype=dt, channels_last=cl,
-                                steps=20, warmup=6)
-                rows.append(r)
-                print(f"  {a:16s} {r['dtype']:8s} cl={str(cl):5s} "
-                      f"{r['img_s']:8.1f} img/s"
-                      + ("" if r["ok"] else f"   {r.get('error')}"))
-                if r["ok"] and r["img_s"] > best:
-                    best, brec = r["img_s"], r
-        if brec:
-            out["winner"].setdefault(a, {}).update(
-                {"dtype": brec["dtype"], "channels_last": brec["channels_last"]})
-    out["stages"]["A_dtype_layout"] = rows
+                r = run_isolated(base(a, res, n_cls, V, dtype=d,
+                                      channels_last=cl), T)
+                R.add(r)
+                print(f"  {a:16s} {d:9s} cl={str(cl):5s} {r['img_s']:8.1f} img/s"
+                      + ("" if r.get("ok") else f"   {r.get('error','')[:44]}"))
+                if r.get("ok") and (best is None or r["img_s"] > best["img_s"]):
+                    best = r
+        if best:
+            win[a] = {"dtype": best["dtype"],
+                      "channels_last": best["channels_last"]}
 
-    # --- B: batch size ------------------------------------------------------
-    print("\n=== Stage B: batch size, with OOM detection " + "=" * 28)
-    rows = []
+    print("\n=== B: batch size ladder, stops at the first OOM " + "=" * 21)
     for a in archs:
-        w = out["winner"].get(a, {})
-        dt = torch.bfloat16 if w.get("dtype") == "bfloat16" else torch.float16
-        best, brec = -1, None
+        if a not in win:
+            continue
+        best = None
         for bs in BS:
-            r = train_steps(a, bs, res, n_cls, dtype=dt,
-                            channels_last=w.get("channels_last", True),
-                            steps=20, warmup=6)
-            rows.append(r)
-            v = f"{r.get('peak_vram_gb', 0):.1f} GB" if r["ok"] else r.get("error")
+            r = run_isolated(base(a, res, n_cls, V, batch=bs, **win[a]), T)
+            R.add(r)
+            v = (f"{r.get('peak_vram_gb',0):.1f} GB" if r.get("ok")
+                 else r.get("error", "")[:44])
             print(f"  {a:16s} bs={bs:4d} {r['img_s']:8.1f} img/s   {v}")
-            if r["ok"] and r["img_s"] > best:
-                best, brec = r["img_s"], r
-            if not r["ok"] and r.get("error") == "OOM":
-                break                                # larger will also OOM
-        if brec:
-            out["winner"][a].update({"batch": brec["batch"],
-                                     "peak_vram_gb": brec["peak_vram_gb"],
-                                     "img_s_synthetic": brec["img_s"]})
-    out["stages"]["B_batch"] = rows
+            if r.get("ok"):
+                if best is None or r["img_s"] > best["img_s"]:
+                    best = r
+            elif r.get("error") == "OOM":
+                print(f"  {'':16s} -> stopping the ladder; larger will also OOM")
+                break
+        if best:
+            win[a].update({"batch": best["batch"],
+                           "peak_vram_gb": best.get("peak_vram_gb", 0),
+                           "img_s": best["img_s"]})
 
-    # --- C: loader ----------------------------------------------------------
-    print("\n=== Stage C: dataloader workers (no model) " + "=" * 29)
-    rows = []
-    if data_dir:
+    if args.data_dir:
+        print("\n=== C: dataloader workers, NO model " + "=" * 34)
+        best = None
         for wk in WK:
-            r = loader_ceiling(data_dir, 128, wk, res)
-            rows.append(r)
+            spec = {"kind": "loader", "res": res, "n_cls": n_cls, "batch": 128,
+                    "workers": wk, "data_dir": str(args.data_dir),
+                    "dtype": "float16", "channels_last": True,
+                    "steps": 30, "warmup": 0, "vram_frac": V}
+            r = run_isolated(spec, T)
+            R.add(r)
             extra = (f"  wait {r['wait_frac']*100:.0f}% / aug "
                      f"{r['augment_frac']*100:.0f}%" if "wait_frac" in r else "")
             print(f"  workers={wk:3d}  {r['img_s']:8.1f} img/s{extra}"
-                  + ("" if r["ok"] else f"   {r.get('error')}"))
-        ok = [r for r in rows if r["ok"]]
-        if ok:
-            b = max(ok, key=lambda r: r["img_s"])
-            out["winner"]["_loader"] = {"workers": b["workers"],
-                                        "ceiling_img_s": b["img_s"]}
+                  + ("" if r.get("ok") else f"   {r.get('error','')[:40]}"))
+            if r.get("ok") and (best is None or r["img_s"] > best["img_s"]):
+                best = r
+        if best:
+            win["_loader"] = {"workers": best["workers"],
+                              "ceiling_img_s": best["img_s"]}
     else:
-        print("  skipped -- no packed dataset (pass --data-dir or use the pack)")
-    out["stages"]["C_workers"] = rows
+        print("\n=== C: skipped (no --data-dir) " + "=" * 39)
 
-    # --- D: torch.compile ---------------------------------------------------
-    print("\n=== Stage D: torch.compile at each winner " + "=" * 30)
-    print("  (first call compiles; that cost is in warmup, not throughput)")
-    rows = []
-    for a in archs:
-        w = out["winner"].get(a, {})
-        if "batch" not in w:
-            continue
-        dt = torch.bfloat16 if w.get("dtype") == "bfloat16" else torch.float16
-        base = w.get("img_s_synthetic", 0)
-        for mode in (None, "default"):
-            if mode is None:
+    if args.compile:
+        print("\n=== D: torch.compile " + "=" * 49)
+        print("  off by default; Triton on Windows is unreliable and compile "
+              "can hang")
+        for a in archs:
+            if "batch" not in win.get(a, {}):
                 continue
-            r = train_steps(a, w["batch"], res, n_cls, dtype=dt,
-                            channels_last=w.get("channels_last", True),
-                            compile_mode=mode, steps=25, warmup=12)
-            rows.append(r)
-            gain = (r["img_s"] / base - 1) * 100 if base and r["ok"] else 0
-            print(f"  {a:16s} compile={mode:8s} {r['img_s']:8.1f} img/s  "
-                  f"{gain:+5.1f}%" + ("" if r["ok"] else f"   {r.get('error')}"))
-            if r["ok"] and r["img_s"] > base * 1.03:
-                out["winner"][a]["compile"] = mode
-                out["winner"][a]["img_s_synthetic"] = r["img_s"]
-    out["stages"]["D_compile"] = rows
+            w = {k: win[a][k] for k in ("dtype", "channels_last", "batch")}
+            r = run_isolated(base(a, res, n_cls, V, compile="default",
+                                  warmup=12, **w), max(T, 600))
+            R.add(r)
+            gain = ((r["img_s"] / win[a]["img_s"] - 1) * 100
+                    if win[a].get("img_s") and r.get("ok") else 0.0)
+            print(f"  {a:16s} {r['img_s']:8.1f} img/s  {gain:+5.1f}%"
+                  + ("" if r.get("ok") else f"   {r.get('error','')[:40]}"))
+            if r.get("ok") and r["img_s"] > win[a]["img_s"] * 1.03:
+                win[a].update({"compile": "default", "img_s": r["img_s"]})
 
-    # --- E: confirmation ----------------------------------------------------
-    # Re-measure from cold. The stage bests are each a local maximum found under
-    # slightly different conditions; a plan built by adding them up would be a
-    # sum of measurements rather than a measurement.
-    print("\n=== Stage E: confirmation, longer run at the chosen config " + "=" * 13)
-    rows = []
+    print("\n=== E: confirmation from cold, longer run " + "=" * 28)
     for a in archs:
-        w = out["winner"].get(a, {})
-        if "batch" not in w:
+        if "batch" not in win.get(a, {}):
             continue
-        dt = torch.bfloat16 if w.get("dtype") == "bfloat16" else torch.float16
-        r = train_steps(a, w["batch"], res, n_cls, dtype=dt,
-                        channels_last=w.get("channels_last", True),
-                        compile_mode=w.get("compile"), steps=60, warmup=15)
-        rows.append(r)
-        out["winner"][a]["img_s_confirmed"] = r["img_s"]
+        w = {k: win[a][k] for k in ("dtype", "channels_last", "batch")}
+        r = run_isolated(base(a, res, n_cls, V, steps=50, warmup=12,
+                              compile=win[a].get("compile"), **w), T)
+        R.add(r)
+        if r.get("ok"):
+            win[a]["img_s_confirmed"] = r["img_s"]
         print(f"  {a:16s} {r['img_s']:8.1f} img/s   "
-              f"{r.get('peak_vram_gb', 0):.1f} GB peak")
-    out["stages"]["E_confirm"] = rows
-    return out
+              f"{r.get('peak_vram_gb',0):.1f} GB peak"
+              + ("" if r.get("ok") else f"   {r.get('error','')[:40]}"))
+    return win
 
 
-def plan(winner, n_train=119_395, epochs=100) -> dict:
-    """Turn measured throughput into the number that actually matters."""
+def plan(win, n_train=119_395, epochs=100) -> dict:
     rows, total = [], 0.0
-    for a, w in sorted(winner.items()):
-        if a.startswith("_") or not w.get("img_s_confirmed"):
+    for a, w in sorted(win.items()):
+        s = w.get("img_s_confirmed") or w.get("img_s")
+        if a.startswith("_") or not s:
             continue
-        sec_ep = n_train / w["img_s_confirmed"]
-        h = sec_ep * epochs / 3600.0
-        rows.append({"arch": a, "img_s": w["img_s_confirmed"],
-                     "sec_per_epoch": sec_ep, "hours_per_run": h,
-                     "hours_3_seeds": h * 3})
+        sec = n_train / s
+        h = sec * epochs / 3600.0
+        rows.append({"arch": a, "img_s": s, "sec_per_epoch": sec,
+                     "hours_per_run": h, "hours_3_seeds": h * 3})
         total += h * 3
     return {"per_arch": rows, "atlas_gpu_hours": total,
-            "atlas_days_continuous": total / 24.0, "epochs": epochs,
-            "train_images": n_train}
+            "atlas_days": total / 24.0, "epochs": epochs}
 
 
 # ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--child", help=argparse.SUPPRESS)
     ap.add_argument("--archs", nargs="*", default=None)
     ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--synthetic", action="store_true",
-                    help="skip the loader stage; no packed dataset needed")
     ap.add_argument("--data-dir", default=os.environ.get("MSC_IN100_DIR"))
+    ap.add_argument("--no-loader", action="store_true",
+                    help="skip stage C even if --data-dir is given")
+    ap.add_argument("--synthetic", action="store_true",
+                    help="alias for --no-loader")
+    ap.add_argument("--compile", action="store_true",
+                    help="also try torch.compile (off by default: unreliable "
+                         "on Windows and can hang)")
+    ap.add_argument("--vram-frac", type=float, default=DEFAULT_VRAM_FRAC,
+                    help="cap on this process's VRAM. Lower it if the display "
+                         "stutters. 0.5 is very safe.")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--plan-only", action="store_true",
+                    help="print what would run, execute nothing")
     a = ap.parse_args()
 
+    if a.child:
+        return child(json.loads(a.child))
+
+    sys.path.insert(0, str(ROOT / "src"))
+    os.environ.setdefault("MSC_OFFLINE", "1")
+    import torch
+    import msc_lib as M
+
     if not torch.cuda.is_available():
-        print("no CUDA. This benchmark measures a GPU; there is nothing to say.")
+        print("no CUDA -- nothing to measure.")
         return 1
-
     p = torch.cuda.get_device_properties(0)
+    a.bf16 = torch.cuda.is_bf16_supported()
     archs = a.archs or M.zoo_for_dataset(DATASET)
-    res = M.native_res(DATASET)
-    n_cls = M.num_classes_for(DATASET)
+    res, n_cls = M.native_res(DATASET), M.num_classes_for(DATASET)
 
-    data_dir = None if a.synthetic else a.data_dir
-    if data_dir and not M.data_present(DATASET, data_dir)[0]:
-        print(f"no pack at {data_dir}; loader stage will be skipped")
-        data_dir = None
+    if a.synthetic or a.no_loader:
+        if a.data_dir:
+            print("note: --synthetic/--no-loader given, so stage C (the loader\n"
+                  "      ceiling) is skipped even though --data-dir was passed.\n"
+                  "      Drop --synthetic to measure it -- it is the stage that\n"
+                  "      says whether the small models are data-bound.\n")
+        a.data_dir = None
+    if a.data_dir and not M.data_present(DATASET, a.data_dir)[0]:
+        print(f"note: no pack at {a.data_dir}; stage C skipped")
+        a.data_dir = None
+
+    cap = p.total_memory * a.vram_frac / 2**30
+    n_model = len(archs) * ((2 if a.quick else 2) * (1 + a.bf16)
+                            + (3 if a.quick else 5) + 1) + \
+        (len(archs) if a.compile else 0)
+    n_loader = (2 if a.quick else 5) if a.data_dir else 0
 
     print("=" * 72)
     print(f"  {p.name}   {p.total_memory/2**30:.1f} GiB   sm_{p.major}{p.minor}")
-    print(f"  torch {torch.__version__}   bf16 "
-          f"{'yes' if torch.cuda.is_bf16_supported() else 'no'}   "
+    print(f"  torch {torch.__version__}   bf16 {'yes' if a.bf16 else 'no'}   "
           f"cpus {os.cpu_count()}")
-    print(f"  {len(archs)} architecture(s) at {res}px, {n_cls} classes")
-    print(f"  loader stage: {'yes' if data_dir else 'SKIPPED (synthetic only)'}")
+    print()
+    print("  SAFETY")
+    print(f"    VRAM cap        {a.vram_frac:.0%}  ->  {cap:.1f} GiB of "
+          f"{p.total_memory/2**30:.1f} GiB")
+    print(f"                    the rest stays free for the display driver.")
+    print(f"                    An oversized batch now raises a catchable OOM")
+    print(f"                    instead of starving the compositor into a TDR.")
+    print(f"    isolation       every configuration runs in its OWN process")
+    print(f"    timeout         {a.timeout}s per config, then the process TREE "
+          f"is killed")
+    print(f"    batch ceiling   {192 if not a.quick else 128} (was 256)")
+    print(f"    workers ceiling {MAX_WORKERS} (was 16)")
+    print(f"    torch.compile   {'ON (you asked)' if a.compile else 'OFF'}")
+    print(f"    results         written after EVERY config")
+    print()
+    print(f"  {len(archs)} architectures at {res}px  ->  ~{n_model + n_loader} "
+          f"configurations")
+    print(f"  worst case ~{(n_model + n_loader) * a.timeout / 60:.0f} min if "
+          f"everything times out; typically far less")
     print("=" * 72)
-
-    t0 = time.time()
-    try:
-        res_ = sweep(archs, res, n_cls, quick=a.quick, data_dir=data_dir)
-    except Exception:                                            # noqa: BLE001
-        traceback.print_exc()
-        return 1
-
-    pl = plan(res_["winner"], epochs=a.epochs)
-    print("\n" + "=" * 72)
-    print("  CHOSEN CONFIGURATION, AND WHAT IT COSTS")
-    print("=" * 72)
-    print(f"  {'arch':16s} {'bs':>4s} {'dtype':>9s} {'cl':>3s} {'cmp':>4s} "
-          f"{'img/s':>8s} {'VRAM':>6s} {'s/ep':>7s} {'h x3':>7s}")
-    for r in pl["per_arch"]:
-        w = res_["winner"][r["arch"]]
-        print(f"  {r['arch']:16s} {w.get('batch',0):4d} "
-              f"{w.get('dtype','?'):>9s} {str(w.get('channels_last'))[0]:>3s} "
-              f"{str(w.get('compile','off'))[:4]:>4s} "
-              f"{r['img_s']:8.1f} {w.get('peak_vram_gb',0):5.1f}G "
-              f"{r['sec_per_epoch']:7.0f} {r['hours_3_seeds']:7.1f}")
-    print(f"\n  atlas total: {pl['atlas_gpu_hours']:.0f} GPU-hours "
-          f"({pl['atlas_days_continuous']:.1f} days) at {a.epochs} epochs")
-    print(f"  the PLAN estimated 235 GPU-hours -- "
-          f"{'optimistic' if pl['atlas_gpu_hours'] > 235 else 'conservative'} "
-          f"by {abs(pl['atlas_gpu_hours'] - 235)/235*100:.0f}%")
-
-    lo = res_["winner"].get("_loader")
-    if lo:
-        print(f"\n  loader ceiling: {lo['ceiling_img_s']:.0f} img/s at "
-              f"{lo['workers']} workers")
-        starved = [r["arch"] for r in pl["per_arch"]
-                   if r["img_s"] > lo["ceiling_img_s"] * 0.9]
-        if starved:
-            print(f"  *** {starved} are at or near the LOADER ceiling. Those are")
-            print(f"  *** data-bound, not GPU-bound: tuning the model buys nothing")
-            print(f"  *** and the lever is workers, prefetch or the pack format.")
-        else:
-            print("  every architecture is GPU-bound. The loader is not the "
-                  "limit and worker count barely matters.")
+    if a.plan_only:
+        print("\n--plan-only: nothing executed.")
+        return 0
 
     OUT.mkdir(parents=True, exist_ok=True)
     fp = OUT / f"bench_{platform.node()}_{time.strftime('%Y%m%d_%H%M%S')}.json"
-    fp.write_text(json.dumps({
+    R = Results(fp, {
         "host": platform.node(), "platform": platform.platform(),
         "gpu": p.name, "vram_gb": p.total_memory / 2**30,
         "sm": f"{p.major}{p.minor}", "cpus": os.cpu_count(),
-        "torch": torch.__version__,
-        "bf16": torch.cuda.is_bf16_supported(),
+        "torch": torch.__version__, "bf16": a.bf16,
+        "vram_frac": a.vram_frac, "timeout_s": a.timeout,
         "dataset": DATASET, "res": res, "epochs": a.epochs,
-        "quick": a.quick, "loader_measured": bool(data_dir),
-        "elapsed_min": (time.time() - t0) / 60,
-        "winner": res_["winner"], "plan": pl, "stages": res_["stages"],
-    }, indent=1, default=str), encoding="utf-8")
-    print(f"\n  wrote {fp}")
-    print("  *** Send me this file. It contains everything needed to re-plan")
-    print("  *** the run matrix against measured throughput instead of an")
-    print("  *** estimate -- which is what D-10 was about.")
+        "quick": a.quick, "loader_measured": bool(a.data_dir),
+        "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    print(f"\n  writing to {fp}\n")
+
+    t0 = time.time()
+    win = sweep(a, archs, res, n_cls, R)
+    pl = plan(win, epochs=a.epochs)
+    R.doc.update({"winner": win, "plan": pl,
+                  "elapsed_min": (time.time() - t0) / 60})
+    R.flush()
+
+    print("\n" + "=" * 72)
+    print("  CHOSEN CONFIGURATION")
+    print("=" * 72)
+    print(f"  {'arch':16s} {'bs':>4s} {'dtype':>9s} {'cl':>3s} {'img/s':>8s} "
+          f"{'VRAM':>6s} {'s/ep':>7s} {'h x3':>7s}")
+    for r in pl["per_arch"]:
+        w = win[r["arch"]]
+        print(f"  {r['arch']:16s} {w.get('batch',0):4d} {w.get('dtype','?'):>9s} "
+              f"{str(w.get('channels_last'))[0]:>3s} {r['img_s']:8.1f} "
+              f"{w.get('peak_vram_gb',0):5.1f}G {r['sec_per_epoch']:7.0f} "
+              f"{r['hours_3_seeds']:7.1f}")
+    print(f"\n  atlas: {pl['atlas_gpu_hours']:.0f} GPU-hours "
+          f"({pl['atlas_days']:.1f} days) at {a.epochs} epochs")
+    if pl["per_arch"]:
+        d = (pl["atlas_gpu_hours"] - 235) / 235 * 100
+        print(f"  the plan estimated 235 -- it was "
+              f"{'optimistic' if d > 0 else 'conservative'} by {abs(d):.0f}%")
+
+    lo = win.get("_loader")
+    if lo:
+        print(f"\n  loader ceiling {lo['ceiling_img_s']:.0f} img/s at "
+              f"{lo['workers']} workers")
+        st = [r["arch"] for r in pl["per_arch"]
+              if r["img_s"] > lo["ceiling_img_s"] * 0.9]
+        print(f"  {'DATA-BOUND: ' + str(st) if st else 'all GPU-bound'}")
+
+    failed = [c for c in R.doc["configs"] if not c.get("ok")]
+    if failed:
+        print(f"\n  {len(failed)} configuration(s) failed "
+              f"({sum(1 for c in failed if c.get('error') == 'OOM')} OOM, "
+              f"{sum(1 for c in failed if 'TIMEOUT' in str(c.get('error')))} "
+              f"timeout). All contained; none touched this process.")
+    print(f"\n  wrote {fp}   --  send me this file")
     return 0
 
 

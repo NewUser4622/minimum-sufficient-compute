@@ -1,20 +1,60 @@
 # Throughput benchmark — run this before the atlas
 
-**One command. ~45 minutes. Send me the JSON it writes.**
+## ⚠ The first version of this crashed a workstation. Read this section.
+
+It swept batch sizes to 256 at 224px on a 20 GB card with **no VRAM ceiling and
+no isolation between configurations**. On a GPU that is also driving the
+display, that starves the desktop compositor, the driver stops responding for
+more than two seconds, and Windows fires a TDR (Timeout Detection & Recovery)
+reset — which hangs the machine.
+
+Three things were wrong. All three are fixed, and each is verified rather than
+asserted:
+
+| was | now |
+|---|---|
+| PyTorch could allocate all 20 GB | **`set_per_process_memory_fraction(0.70)`** — an oversized batch raises a clean, catchable Python OOM well before the driver runs short. ~6 GB always stays free for the display |
+| every config in one process; one bad allocation poisoned the CUDA context for everything after, and dataloader workers leaked across the sweep | **every configuration runs in its own subprocess.** A child that OOMs, hangs or dies takes nothing with it, and the OS reclaims its CUDA context and workers on exit |
+| a hung kernel hung the sweep, and the machine | **hard timeout per config, then the whole process *tree* is killed** — orphaned workers holding a 24 GiB memmap are how the next config runs out of RAM |
+
+Also: batch ceiling 256 → **192**, workers 16 → **8**, `torch.compile` now **off
+by default** (Triton on Windows is unreliable and compilation can hang), and
+results are written to disk **after every configuration**, so an interruption
+costs one data point rather than the run.
+
+**If the display still stutters, drop the ceiling further:** `--vram-frac 0.5`.
+
+**To see exactly what it will do without running anything:** `--plan-only`.
+
+---
+
+## Run it
+
+Your command works as-is:
+
+```
+python benchmark/bench_throughput.py --synthetic --data-dir "D:\msc_data\in100"
+```
+
+though note `--synthetic` *skips* the loader stage, so `--data-dir` does nothing
+alongside it — the script says so and continues. To measure the loader too
+(recommended, it is the stage that tells you whether the small models are
+data-bound), drop `--synthetic`:
 
 ```
 python benchmark/bench_throughput.py --data-dir "D:\msc_data\in100"
 ```
 
-No packed dataset yet? Run it anyway — everything except the loader stage works
-on synthetic data:
+| flag | effect |
+|---|---|
+| `--quick` | ~8 min instead of ~30 |
+| `--plan-only` | print the plan, execute nothing |
+| `--vram-frac 0.5` | more headroom for the display |
+| `--timeout 120` | kill a config sooner |
+| `--archs swin_tiny` | one architecture |
+| `--compile` | opt in to `torch.compile` |
 
-```
-python benchmark/bench_throughput.py --synthetic
-```
-
-Faster, coarser (~10 min): add `--quick`.
-Single architecture: `--archs swin_tiny`.
+Start with `--plan-only`, then `--quick`, then the full run once you trust it.
 
 ---
 
