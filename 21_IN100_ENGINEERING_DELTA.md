@@ -226,7 +226,7 @@ produces a sample whose minimum sufficient compute is undefined.
 
 Self-checks **232 → 381**, all passing, **exit code verified against a canary**.
 
-### Build-time name checking, in five layers
+### Build-time name checking, in six layers
 
 Every one was added after a real failure, and each catches what the previous
 one structurally cannot. The through-line: **a name that exists is not the same
@@ -239,6 +239,7 @@ as a name used correctly.**
 | library **names** must exist | D-39 | `M.analyse_q1_all` when it was never written |
 | call **signatures** must match | D-47, D-48 | `resume_acceptance_test(interrupt_after=2)` — the parameter is `kill_at` |
 | result **keys** must be declared | D-51, D-52 | `res.get('passed')` when the key is `ok` |
+| argument **kind** must match parameter **role** | D-53 | `run_all(M.fn, cfgs)` — right count, right names, wrong order |
 | drive letters are forbidden | D-44 | `r'D:\...'` on a machine with no D: |
 
 Plus, inside the library rather than at build time: an AST arity check on

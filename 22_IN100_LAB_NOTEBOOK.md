@@ -25,10 +25,10 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered · all 8 build, price and dry-run on the GPU |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **381** offline, all passing, exit code verified |
+| **Self-checks** | **381** offline + 6 build-time name layers, all passing |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`) · columns, library names, call signatures, result keys and drive letters all validated at build time |
-| **Defects found this port** | **16** (D-37 … D-52) · 16 fixed · 0 open |
+| **Defects found this port** | **17** (D-37 … D-53) · 17 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,86 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-53 · Swapped arguments — right count, right names, wrong order
+
+**Severity:** **NB2, NB3 and NB5 all failed on their training cell**
+**Status:** **fixed** · **Found:** 2026-08-08 by the user running NB2
+
+```
+TypeError: 'function' object is not iterable
+  by_id = {c["run_id"]: c for c in cfgs}
+```
+
+```python
+results = sess.run_all(M.train_backbone, cfgs)   # signature: run_all(cfgs, fn)
+```
+
+Arguments reversed. `cfgs` received a function, so the dict comprehension tried
+to iterate it. **The same line appeared in all three training notebooks** — NB2
+(`train_backbone`), NB3 (`run_oracle`), NB5 (`train_msc_kd`) — because they were
+written from the same template.
+
+**Why the arity check missed it, and this is the point.** D-47/D-48 count
+positional arguments and name keywords. Both were **correct**: two positional
+arguments, `run_all` takes two, no keywords involved. Only the *order* was
+wrong, and a count cannot see order.
+
+Sixth defect in this family, and each one has needed a different lens:
+
+| | what was wrong | what could see it |
+|---|---|---|
+| D-39 | function did not exist | name existence |
+| D-47 | 6 args where 8 required | positional count |
+| D-48 | keyword `interrupt_after` | keyword names |
+| D-51 | key `passed` where `ok` | declared result keys |
+| D-52 | column `passes` where `passed` | declared result keys |
+| **D-53** | **right count, wrong order** | **argument *kind*** |
+
+**Contamination analysis.** None. `TypeError` on the first line of the training
+cell, before the plan was built and before anything was claimed. Loud and
+immediate — the benign shape again.
+
+**Fix.** All three call sites corrected, and a guard that compares argument
+*kind* against parameter *role*:
+
+> `M.train_backbone` used as a **value** is unambiguous evidence of a function
+> reference. A parameter named `fn` / `done_fn` / `criterion` unambiguously
+> wants one. Comparing those two facts costs nothing.
+
+The check needed one addition to the signature extractor — positional **order**,
+which it had not been recording because nothing until now needed it.
+
+Verified against the exact line and three valid calls:
+
+```
+D-53 sess.run_all(M.train_backbone, cfgs)
+  -> argument 1 is the function `M.train_backbone` but parameter 1 is `cfgs`.
+     Arguments look swapped -- the signature is (cfgs, fn, steal_stale, ...)
+VALID sess.run_all(cfgs, M.train_backbone)   -> clean
+VALID sess.run_all(cfgs, M.run_oracle)       -> clean
+VALID M.build_model('resnet50', 100, ...)    -> clean
+```
+
+---
+
+### Note · Phase 0 is 98 GPU-h, not the 33 the plan claimed
+
+Visible in NB2's estimate cell and worth stating plainly. The plan's §7 figure
+of ~33 GPU-h for Phase 0 was built on the pre-measurement estimates. Against
+your measured numbers it is **98 GPU-h ≈ 4.1 days**, and the full atlas is
+**457 GPU-h ≈ 19 days** — the plan was optimistic by 94%, not 66%.
+
+Two of those numbers are still provisional: `resnet50` at 82 img/s and `vgg16`
+at 56 are the **D-43** measurements taken with `cudnn.benchmark = False`.
+`resnet50` alone is 27% of the atlas at that figure and should roughly halve on
+re-measurement. Until then the honest reading is *"457 GPU-h, of which ~65% rests
+on two numbers known to be understated."*
+
+`vgg16` is 39% of the budget for one across-CNN data point. Dropping it →
+**280 GPU-h ≈ 11.7 days**. That trade is in NB2 as a commented line.
+
+---
 
 ### D-52 · A gate column that could never exist — found by auditing the other four notebooks
 
@@ -1249,6 +1329,7 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-53 — swapped arguments in all three training notebooks.** `sess.run_all(M.train_backbone, cfgs)`; the signature is `(cfgs, fn)`. Right count, right names, wrong order — the arity check counts and names, and neither sees order. Sixth defect in the family, sixth lens |
 | 2026-08-08 | **D-52 — a gate column that could never exist.** `analyse_q3_shuffled_control` returns `passed`; the wrapper synthesised `passes` from a nonexistent `ok`, and NB4 read `passes`. KeyError in ANALYSIS, after ten days of training. Found by auditing NB2-NB5 for the D-51 pattern |
 | 2026-08-08 | **`RESULT_KEYS` — result keys are now declared and checked at build time.** The fifth name-checking guard, and the first that can see a key read off a returned dict or frame |
 | 2026-08-08 | **RESUME VERIFIED ON REAL HARDWARE.** `resnet18`, 4 epochs, real interrupt at 2, resumed in a fresh call: post-seam loss drift **0.31%** against a 5% tolerance, 0 duplicate rows, 4/4 epochs both legs. Five CIFAR defects were about resume; it works here |

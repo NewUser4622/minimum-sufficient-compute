@@ -374,7 +374,8 @@ def _signatures(path: Path, cls: str | None = None) -> dict:
             pos = pos[1:]
         return {"min": len(pos) - len(aa.defaults), "max": len(pos),
                 "star": aa.vararg is not None, "kwargs": aa.kwarg is not None,
-                "names": {x.arg for x in pos + list(aa.kwonlyargs)}}
+                "names": {x.arg for x in pos + list(aa.kwonlyargs)},
+                "order": [x.arg for x in pos]}
 
     def walk(body, want=None):
         for nd in body:
@@ -434,6 +435,62 @@ def _call_problems(tree: ast.AST):
                 bad.append((f"{label}.{nd.func.attr}() has no parameter "
                             f"'{k}'" + (f" -- did you mean {near}?" if near
                                         else ""), getattr(nd, "lineno", 0)))
+    return bad
+
+
+# Parameters that take a CALLABLE. Passing a function reference to anything
+# else -- or a non-function to one of these -- is D-53: the argument count is
+# right, the keyword names are right, and the order is wrong.
+CALLABLE_PARAMS = {"fn", "func", "callable", "done_fn", "kind_fn", "on_flush",
+                   "feature_dim_fn", "criterion"}
+
+
+def _arg_order_problems(tree: ast.AST):
+    """A function reference passed where a value belongs, or vice versa.
+
+    D-53. `sess.run_all(M.train_backbone, cfgs)` -- the signature is
+    `run_all(cfgs, fn)`. Two positional arguments, both present, so the arity
+    check (D-47/D-48) passes: it counts arguments and names keywords, and both
+    were correct. Only the ORDER was wrong.
+
+    `M.something` used as a value is unambiguous evidence of a function
+    reference, and a parameter named `fn`/`done_fn`/`criterion` unambiguously
+    wants one. Comparing those two facts costs nothing and catches the whole
+    class.
+    """
+    bad = []
+    for nd in ast.walk(tree):
+        if not isinstance(nd, ast.Call) or not isinstance(nd.func, ast.Attribute):
+            continue
+        base = getattr(nd.func.value, "id", None)
+        if base in ("M", "msc_lib"):
+            sigs = LIB_SIGS
+        elif base in ("sess", "session"):
+            sigs = SESSION_SIGS
+        else:
+            continue
+        sg = sigs.get(nd.func.attr)
+        if not sg or not sg.get("order"):
+            continue
+        for i, arg in enumerate(nd.args):
+            if i >= len(sg["order"]):
+                break
+            param = sg["order"][i]
+            # `M.train_backbone` as a value == a function reference.
+            is_ref = (isinstance(arg, ast.Attribute)
+                      and getattr(arg.value, "id", None) in ("M", "msc_lib")
+                      and arg.attr in LIB_SIGS)
+            wants = param in CALLABLE_PARAMS
+            if is_ref and not wants:
+                bad.append((f"{base}.{nd.func.attr}(): argument {i + 1} is the "
+                            f"function `M.{arg.attr}` but parameter {i + 1} is "
+                            f"`{param}`. Arguments look swapped -- the "
+                            f"signature is ({', '.join(sg['order'][:3])}, ...)",
+                            getattr(nd, "lineno", 0)))
+            elif wants and isinstance(arg, (ast.List, ast.Dict, ast.Constant)):
+                bad.append((f"{base}.{nd.func.attr}(): parameter {i + 1} is "
+                            f"`{param}` and wants a callable, got a literal",
+                            getattr(nd, "lineno", 0)))
     return bad
 
 
@@ -576,6 +633,19 @@ def self_test() -> bool:
                   f"notebooks and does not exist")
             ok = False
 
+    # -- the argument-order check must be able to fail (D-53) ---------------
+    if not _arg_order_problems(ast.parse("sess.run_all(M.train_backbone, cfgs)")):
+        print("  [SELFTEST FAIL] the arg-order check does not catch the exact "
+              "D-53 line, sess.run_all(M.train_backbone, cfgs)")
+        ok = False
+    for good in ("sess.run_all(cfgs, M.train_backbone)",
+                 "sess.run_all(cfgs, M.run_oracle)",
+                 "M.build_model('resnet50', 100, dataset='imagenet100')"):
+        if _arg_order_problems(ast.parse(good)):
+            print(f"  [SELFTEST FAIL] the arg-order check rejects a VALID "
+                  f"call: {good} -> {_arg_order_problems(ast.parse(good))}")
+            ok = False
+
     # -- the result-key check must be able to fail (D-51, D-52) -------------
     for bad_src, why in (
             ("res = M.resume_acceptance_test(sess)\nprint(res.get('passed'))",
@@ -673,6 +743,9 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                 problems.append(
                     f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
                     f"exist" + (f" -- did you mean {near}?" if near else ""))
+
+            for msg, ln in _arg_order_problems(tree):
+                problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")
 
             for msg, ln in _result_key_problems(tree):
                 problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")

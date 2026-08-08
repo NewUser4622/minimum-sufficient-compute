@@ -321,6 +321,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 
 | # | symptom | cause | now |
 |---|---|---|---|
+| **D-53** | `TypeError: 'function' object is not iterable` in the training cell | `sess.run_all(M.fn, cfgs)`; the signature is `(cfgs, fn)` | all three call sites fixed; validator compares argument *kind* against parameter *role* |
 | **D-52** | `KeyError: 'passes'` in NB4's shuffled control | the primitive returns `passed`; a wrapper synthesised `passes` from a key that does not exist | one name from the primitive; `RESULT_KEYS` checks every notebook read at build time |
 | **D-51** | `RESUME TEST: PASS` followed by `RESUME FAILED -- do not train` | the notebook read `res.get('passed')`; the key is `ok` | reads `res['ok']` so a typo raises; key set pinned by `RESUME_TEST_KEYS` |
 | **D-50** | `[LIFE] session limit reached at 0.1 h -- pausing cleanly at epoch 1`, every epoch | `session_limit_h = 0.0` meant "no limit" and was read as "zero hours" | `<= 0`, `None` and negative are all unbounded; the armed line says `NONE -- runs to completion` |

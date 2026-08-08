@@ -738,7 +738,7 @@ runs are skipped, partial runs continue from their last completed epoch with
 optimiser, scheduler, AMP scaler and all four RNG streams restored.
 """),
         code("""
-results = sess.run_all(M.train_backbone, cfgs)
+results = sess.run_all(cfgs, M.train_backbone)
 
 print()
 for r in results:
@@ -846,7 +846,7 @@ if not todo and trained:
         code("""
 cfgs = [sess.config(M.parse_run_id(r)['arch'], seed=M.parse_run_id(r)['seed'])
         for r in todo]
-results = sess.run_all(M.run_oracle, cfgs)
+results = sess.run_all(cfgs, M.run_oracle)
 
 for r in results:
     print(f"  {r.get('status','?'):9s} {r['run_id']}")
@@ -1321,7 +1321,7 @@ for shuffled in ARMS:
 print(f'{{len(cfgs)}} student run(s): {{len(STUDENTS)}} arch x {{len(SEEDS)}} seeds x 2 arms')
 """),
         code("""
-results = sess.run_all(M.train_msc_kd, cfgs)
+results = sess.run_all(cfgs, M.train_msc_kd)
 real = [r for r in results if 'shuff' not in r['run_id']]
 print(f"\\n{len([r for r in real if r.get('status') != 'skipped'])}/"
       f"{len(real)} REAL-method students trained -- the comparison needs all of them")
