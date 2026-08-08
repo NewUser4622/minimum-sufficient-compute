@@ -25,8 +25,9 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **292** offline, all passing, exit code verified |
-| **Defects found this port** | **1** (D-37) · 1 fixed · 0 open |
+| **Self-checks** | **310** offline, all passing, exit code verified |
+| **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
+| **Defects found this port** | **3** (D-37, D-38, D-39) · 3 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-imagenet100` — not yet created |
 
@@ -50,6 +51,104 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-38 · Five offline-verify failures, three of which needed no hardware
+
+**Severity:** blocked the first real run · **Status:** **fixed** · **Found:** 2026-08-07 by the user running `--verify-offline`
+
+```
+5 offline failure(s). The pipeline is NOT self-contained:
+  - shufflenetv2_in: AttributeError: 'BatchNorm2d' object has no attribute 'out_channels'
+  - backbone dry run resnet50: ValueError: too many values to unpack (expected 2)
+  - oracle dry run resnet50: NameError: name 'MultiExit' is not defined
+```
+
+All five were mine. **Three needed no GPU, no dataset and no device to find** —
+they needed somebody to compare a name against what exists.
+
+| symptom | cause |
+|---|---|
+| `NameError: MultiExit` | the class is `MultiExitModel` |
+| `too many values to unpack` | `optimisation_health` returns **4** values, unpacked as 2 |
+| `BatchNorm2d has no out_channels` | guessed at another package's module internals |
+
+**The third is the one worth recording.** `build_shufflenetv2_imagenet` read
+`b.branch2[-2].out_channels`; in torchvision's ShuffleNetV2 that index is a
+`BatchNorm2d`. Correcting the index would have been the *wrong fix* — three
+sibling builders made the same kind of guess (`b.conv3.out_channels`,
+`m.reduction.out_features`, `b.norm1.normalized_shape[0]`) and happened to be
+right. **A guess that is right for three of four is precisely what rule 2 is
+about**, and D-33 is the precedent: a literal `5` that was correct for most of
+the CIFAR zoo, which is exactly why it survived.
+
+**Fix — stop guessing.** `StagedBackbone` now derives `feature_dims` from a real
+forward pass. Ask the model. All four introspection sites are gone, and the
+answer is definitive by construction rather than dependent on torchvision's
+internal layout. `build_model` passes the dataset's resolution to the probe,
+because probing a 224px model at 32px gives the wrong spatial size and Swin
+would not run at all.
+
+**Contamination analysis.** None. No run had started; `--verify-offline` is the
+gate that exists to catch this, and it did. The cost was one user round trip.
+
+**Guards added, all torch-free so they run in the offline self-test:**
+
+- every free name in the dry runs, `_imagenet_config`, `build_budget_table` and
+  `verify_run_artifacts` must **resolve**. This would have caught `MultiExit`.
+- every tuple-unpack of `optimisation_health` must be 4 wide, checked by AST.
+- no ImageNet builder may reference `out_channels`, `normalized_shape`,
+  `out_features`, `num_features`, `branch2`, `conv3` or `reduction`.
+
+Building the first of those needed the lesson twice more. Resolving against
+`globals()` reported five real names as missing, because half the file lives
+under `if _TORCH_OK:` and torch was absent on the checking machine. **A checker
+producing exactly the false negative it exists to prevent** is worse than no
+checker (D-17). It now parses the source for module-level names.
+
+Self-checks 292 → 310.
+
+---
+
+### D-39 · Six invented library names, in one sitting
+
+**Severity:** would have failed mid-notebook after GPU time was spent
+**Status:** **fixed** · **Found:** 2026-08-07 while writing NB4 and NB5
+
+`analyse_q1_all`, `analyse_q2_all`, `analyse_q3_all`,
+`analyse_q3_shuffled_control_all`, `analyse_q4_all`, `compare_routing_methods`.
+**None of them existed.** Every one would have surfaced only when the user ran
+the cell — the same defect as `MultiExit` (D-38), in a new place, an hour later.
+
+**Why it happened.** On CIFAR this assembly lived in *notebook cells*, so there
+were no library functions to call and nothing established what they should be
+named. Writing five new notebooks against a half-remembered API produced six
+plausible names in one sitting.
+
+**Two fixes, and the second is the one that lasts.**
+
+1. **The functions now exist, in the library.** Not in cells. That placement is
+   itself a defect fix: **D-18 came from this assembly living in a cell.**
+   `pairs[:15]` over a sorted list looked like cost control and was a biased
+   sample of the two most atypical architectures in the zoo; a dict
+   comprehension silently dropped an architecture whose seed 1 was unmeasured,
+   so the analysis covered 13 architectures while calling itself the atlas.
+   Neither was catchable, because nothing tests a notebook cell (rule 8). The
+   new functions **report what they excluded**, use **every** seed pair rather
+   than just (s1, s2), and run **every** pair rather than the first N.
+
+2. **The validator now checks library names as well as column names.** Rule 3
+   says column names are data and must be validated at build time. Function
+   names are data in exactly the same way, and the failure is *worse*: a wrong
+   column yields a `KeyError` with a suggestion, a wrong function name yields an
+   `AttributeError` several cells into a run that may already have spent
+   GPU-hours. Generation is now refused on either.
+
+Building *that* check needed the D-38 lesson twice more: `dir(M)` omits
+everything under `if _TORCH_OK:`, and `dir(Session)` omits instance attributes
+set in `__init__`. Both made the checker report real names as missing. It now
+parses the source for module-level names and for `self.X = ...`.
+
+---
 
 ### D-37 · The self-test harness could not fail
 
@@ -276,7 +375,7 @@ would have been theatre.
 | | Item | Blocks | Cost | Priority |
 |---|---|---|---|---|
 | **O-22** | **Run the packing tool and verify.** Nothing downstream exists until the fingerprint is real | everything | ~30 min CPU | **highest** |
-| **O-23** | **Regenerate NB00–NB16 for the ImageNet path.** The library is ported; the notebooks are not | all runs | ~1 session | **highest** |
+| ~~O-23~~ | ~~Regenerate the notebooks~~ — **DONE.** Five, in `notebooks_in100/`, validated clean | — | — | shipped |
 | ~~O-24~~ | ~~Build-time schema and path validation~~ — **DONE.** `tools/validate_notebooks.py`, gating `build_notebooks.py`. Self-tested against the real D-22 and D-36 names. 0 false positives on the 17 CIFAR notebooks; 2 genuine rule-4 path warnings | — | — | shipped |
 | **O-25** | **Run NB00 preflight on the real GPU.** Every architecture, every resolution, kill-and-resume. This is where a Swin-T that cannot do 96px, or a torchvision decomposition that mis-orders blocks, will surface | Phase 0 | ~30 min GPU | **highest** |
 | **O-26** | Re-anchor `ARCH_COST_HINT` on measured epochs. Current values are estimates and D-10 showed the first guess was 40% low. Per DC-11 they refine the *display* only | honest ETAs | ~1 h | medium |
@@ -290,6 +389,9 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-07 | **Five notebooks generated** (`notebooks_in100/`), down from seventeen. The CIFAR split followed Kaggle's failure modes; this one follows the stages of the experiment |
+| 2026-08-07 | **D-39 — six invented library names in one sitting.** The validator now checks library names as well as column names: a wrong column yields a KeyError with a suggestion, a wrong function name yields an AttributeError several cells into a run that has already spent GPU-hours. The six functions moved into the library, which also fixes D-18's root cause |
+| 2026-08-07 | **D-38 — five offline-verify failures, three findable without hardware.** The zoo stops guessing at other packages' module internals and derives feature dims from a forward pass. Guards: every free name must resolve, every unpack arity is checked, no builder may name a foreign attribute |
 | 2026-08-07 | **Local-only and offline.** HuggingFace removed; `verify_run_artifacts` opens every required artifact rather than stat-ing it, so a zero-byte or truncated file is caught where a presence check called the run healthy. `no_network()` proves offline operation by blocking the socket layer. `requirements.txt` + `tools/fetch_assets.py`. Self-checks 278 → 292 |
 | 2026-08-07 | **D-37 — the self-test harness could not fail.** A tuple unpack 960 lines below the definition rebound the verdict scalar; ~80% of checks could not affect the exit code. Fixed structurally with lists, a canary and a floor |
 | 2026-08-07 | Rule 1: `backbone_dry_run` and `oracle_dry_run` written **and wired in**, with build-time checks asserting the call *and its position*. The oracle dry run covers every axis at every resolution and reads its parquet back |
