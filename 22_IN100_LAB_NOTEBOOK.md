@@ -23,12 +23,12 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Design** | frozen — [`20_IN100_PORT_PLAN.md`](20_IN100_PORT_PLAN.md) |
 | **Data** | **packed** — [`25_IN100_DATA_CARD.md`](25_IN100_DATA_CARD.md) |
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
-| **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
+| **Zoo** | 8 architectures registered · all 8 build, price and dry-run on the GPU |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **366** offline, all passing, exit code verified |
+| **Self-checks** | **373** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **14** (D-37 … D-50) · 14 fixed · 0 open |
+| **Defects found this port** | **15** (D-37 … D-51) · 15 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,69 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-51 · A passing test reported as failed, because of one wrong key
+
+**Severity:** **NO-GO on a green result; ~40 minutes of the user's GPU time**
+**Status:** **fixed** · **Found:** 2026-08-08 by the user
+
+The test said:
+
+```
+resume is equivalent to an uninterrupted run
+interrupt actually fired : True
+epochs  reference=4  resumed=4   (want 4)
+duplicated epoch rows    : 0
+max post-seam loss drift : 0.3077%   (want < 5%)
+RESUME TEST: PASS
+ok: True
+```
+
+The notebook then printed **`RESUME FAILED -- do not train`** and the gate said
+**NO-GO**.
+
+`resume_acceptance_test` returns `ok`. The notebook read **`res.get('passed')`**.
+`.get()` returned `None`, `None` is falsy, and a passing test was reported as a
+failure — twice, in two different cells.
+
+**`.get()` on a key you require turns a typo into a wrong answer. A subscript
+turns it into an error.** That is the whole lesson, and it is the same family as
+D-39, D-47 and D-48: a name that does not exist, in a place nothing compared it
+against anything. Fourth time. The previous three guards check that *functions*
+exist and that *calls* match signatures; none of them can see a **key** read
+from a returned dict.
+
+**Contamination analysis.** None to the science — **resume works, and this
+result proves it**: post-seam loss drift 0.31% against a 5% tolerance, four
+epochs both legs, zero duplicate rows, final accuracy 0.5072 vs 0.5027. The
+cost was 40 minutes of GPU time and a NO-GO that should have been a GO.
+
+**Fix.**
+
+- The notebook reads `res['ok']`, so a wrong key raises rather than evaluating
+  to `None`.
+- `RESUME_TEST_KEYS` pins the returned key set, with a self-check that `passed`
+  is **not** among them — pinning the set is what makes a guess detectable —
+  and that every declared key is actually written by the function.
+
+---
+
+### The resume test now runs on 5% of the data
+
+Asked for, and correct: three legs × 4 epochs × 119,395 images is ~40 minutes
+for a **smoke test of the resume machinery**. It exercises checkpoint,
+interrupt, resume and the post-seam comparison — none of which cares how much
+data there is.
+
+`subset_frac=0.05` by default, so it takes about two minutes and tests exactly
+the same code. `_subset_train` applies to the **train split only**: `val` and
+`train_holdout` are what results are measured on, and a test that shrinks them
+is testing something else. Self-checked.
+
+The subset preserves `index_space` and leaves `sample_idx` global — renumbering
+alongside the data would quietly reintroduce **D-49**.
+
+---
 
 ### D-50 · "No session limit" was read as "a limit of zero"
 
@@ -1113,6 +1176,8 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **RESUME VERIFIED ON REAL HARDWARE.** `resnet18`, 4 epochs, real interrupt at 2, resumed in a fresh call: post-seam loss drift **0.31%** against a 5% tolerance, 0 duplicate rows, 4/4 epochs both legs. Five CIFAR defects were about resume; it works here |
+| 2026-08-08 | **D-51 — a passing test reported as failed.** `res.get('passed')`; the key is `ok`. `.get()` on a required key turns a typo into a wrong answer, a subscript turns it into an error. Key set now pinned. Resume test cut to 5% of the data: two minutes, not forty |
 | 2026-08-08 | **D-50 — "no session limit" read as "a limit of zero".** Every run paused after epoch 1; over a ten-day atlas that is a manual restart every few minutes. It also broke the resume test in a way that pointed at resume rather than at the watchdog — the D-06 shape. The test now names the failure MODE, not just the verdict |
 | 2026-08-08 | **D-49 — `sample_idx` became global; the dynamics arrays did not.** `IndexError: index 121978 out of bounds for size 119395`. Both halves were deliberate; the index's MEANING moved while its name did not — D-40's shape on a different quantity. Datasets now declare `index_space`. Found by the kill-and-resume test, which is what it is for |
 | 2026-08-08 | **Dataset packed.** The pipeline is now reading real data |

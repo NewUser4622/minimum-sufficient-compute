@@ -526,9 +526,13 @@ that is a clean completion followed by an extension, a completely different code
 path, and it validated nothing while looking like it did.
 """),
         code("""
-res = M.resume_acceptance_test(sess, arch='resnet18', epochs=4, kill_at=2)
+# 5% of the training split: this is a SMOKE TEST of the resume machinery,
+# not a training run. On the full 119,395 images it took ~40 minutes for
+# three legs; on 1/20 it takes about two, and tests exactly the same code.
+res = M.resume_acceptance_test(sess, arch='resnet18', epochs=4, kill_at=2,
+                               subset_frac=0.05)
 print()
-print('RESUME OK' if res.get('passed') else 'RESUME FAILED -- do not train')
+print('RESUME OK' if res['ok'] else 'RESUME FAILED -- do not train')
 for k, v in res.items():
     if k != 'passed':
         print(f'  {k}: {v}')
@@ -543,7 +547,7 @@ checks = {{
     'dataset packed and fingerprint matches':     ok,
     'preflight (every arch, every resolution)':   not failed,
     'dry runs (train + measure paths)':           not bad,
-    'kill-and-resume equivalence':                bool(res.get('passed')),
+    'kill-and-resume equivalence':                bool(res['ok']),
 }}
 print()
 for k, v in checks.items():
