@@ -1,0 +1,333 @@
+{
+ "host": "CB-410-122",
+ "platform": "Windows-10-10.0.26100-SP0",
+ "gpu": "NVIDIA RTX 4000 Ada Generation",
+ "vram_gb": 19.99462890625,
+ "sm": "89",
+ "cpus": 24,
+ "torch": "2.5.1+cu121",
+ "bf16": true,
+ "vram_frac": 0.4,
+ "timeout_s": 120,
+ "batch": 64,
+ "dataset": "imagenet100",
+ "res": 224,
+ "epochs": 100,
+ "quick": true,
+ "loader_measured": false,
+ "started_utc": "2026-08-08T04:46:35Z",
+ "configs": [
+  {
+   "kind": "model",
+   "arch": "resnet50",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "img_s": 82.28601872303771,
+   "peak_vram_gb": 2.929145336151123,
+   "params_m": 23.712932,
+   "ok": true,
+   "wall_s": 27.17742133140564
+  },
+  {
+   "kind": "model",
+   "arch": "resnet18",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "img_s": 412.9658974427842,
+   "peak_vram_gb": 0.8804349899291992,
+   "params_m": 11.227812,
+   "ok": true,
+   "wall_s": 7.183893203735352
+  },
+  {
+   "kind": "model",
+   "arch": "vgg16",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "img_s": 56.281109092498404,
+   "peak_vram_gb": 4.386650085449219,
+   "params_m": 14.774436,
+   "ok": true,
+   "wall_s": 37.542845487594604
+  },
+  {
+   "kind": "model",
+   "arch": "shufflenetv2_in",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "img_s": 640.3945301689998,
+   "peak_vram_gb": 0.7181572914123535,
+   "params_m": 1.356104,
+   "ok": true,
+   "wall_s": 5.651516675949097
+  },
+  {
+   "kind": "model",
+   "arch": "vit_small_p16",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "ok": false,
+   "img_s": 0.0,
+   "error": "TypeError: build_vit_small() got an unexpected keyword argument 'probe_res'",
+   "wall_s": 1.4183928966522217
+  },
+  {
+   "kind": "model",
+   "arch": "deit_small",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "ok": false,
+   "img_s": 0.0,
+   "error": "TypeError: build_vit_small() got an unexpected keyword argument 'probe_res'",
+   "wall_s": 1.3941633701324463
+  },
+  {
+   "kind": "model",
+   "arch": "swin_tiny",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "img_s": 327.1348584306456,
+   "peak_vram_gb": 4.528511047363281,
+   "params_m": 27.596254,
+   "ok": true,
+   "wall_s": 8.954676151275635
+  },
+  {
+   "kind": "model",
+   "arch": "convnext_tiny",
+   "res": 224,
+   "n_cls": 100,
+   "batch": 64,
+   "dtype": "float16",
+   "channels_last": true,
+   "steps": 24,
+   "warmup": 6,
+   "vram_frac": 0.4,
+   "img_s": 272.2384340886611,
+   "peak_vram_gb": 5.130411624908447,
+   "params_m": 27.897028,
+   "ok": true,
+   "wall_s": 9.661646127700806
+  }
+ ],
+ "winner": {
+  "resnet50": {
+   "dtype": "float16",
+   "channels_last": true,
+   "batch": 64,
+   "img_s": 82.28601872303771,
+   "peak_vram_gb": 2.929145336151123,
+   "params_m": 23.712932,
+   "headroom": {
+    "peak_gb_at_batch": 2.929145336151123,
+    "gb_per_image": 0.0457678958773613,
+    "budget_gb": 11.996777343749999,
+    "largest_estimated_batch": 262,
+    "safe_batches": [
+     32,
+     64,
+     96,
+     128,
+     192,
+     256
+    ]
+   }
+  },
+  "resnet18": {
+   "dtype": "float16",
+   "channels_last": true,
+   "batch": 64,
+   "img_s": 412.9658974427842,
+   "peak_vram_gb": 0.8804349899291992,
+   "params_m": 11.227812,
+   "headroom": {
+    "peak_gb_at_batch": 0.8804349899291992,
+    "gb_per_image": 0.013756796717643738,
+    "budget_gb": 11.996777343749999,
+    "largest_estimated_batch": 872,
+    "safe_batches": [
+     32,
+     64,
+     96,
+     128,
+     192,
+     256
+    ]
+   }
+  },
+  "vgg16": {
+   "dtype": "float16",
+   "channels_last": true,
+   "batch": 64,
+   "img_s": 56.281109092498404,
+   "peak_vram_gb": 4.386650085449219,
+   "params_m": 14.774436,
+   "headroom": {
+    "peak_gb_at_batch": 4.386650085449219,
+    "gb_per_image": 0.06854140758514404,
+    "budget_gb": 11.996777343749999,
+    "largest_estimated_batch": 175,
+    "safe_batches": [
+     32,
+     64,
+     96,
+     128
+    ]
+   }
+  },
+  "shufflenetv2_in": {
+   "dtype": "float16",
+   "channels_last": true,
+   "batch": 64,
+   "img_s": 640.3945301689998,
+   "peak_vram_gb": 0.7181572914123535,
+   "params_m": 1.356104,
+   "headroom": {
+    "peak_gb_at_batch": 0.7181572914123535,
+    "gb_per_image": 0.011221207678318024,
+    "budget_gb": 11.996777343749999,
+    "largest_estimated_batch": 1069,
+    "safe_batches": [
+     32,
+     64,
+     96,
+     128,
+     192,
+     256
+    ]
+   }
+  },
+  "swin_tiny": {
+   "dtype": "float16",
+   "channels_last": true,
+   "batch": 64,
+   "img_s": 327.1348584306456,
+   "peak_vram_gb": 4.528511047363281,
+   "params_m": 27.596254,
+   "headroom": {
+    "peak_gb_at_batch": 4.528511047363281,
+    "gb_per_image": 0.07075798511505127,
+    "budget_gb": 11.996777343749999,
+    "largest_estimated_batch": 169,
+    "safe_batches": [
+     32,
+     64,
+     96,
+     128
+    ]
+   }
+  },
+  "convnext_tiny": {
+   "dtype": "float16",
+   "channels_last": true,
+   "batch": 64,
+   "img_s": 272.2384340886611,
+   "peak_vram_gb": 5.130411624908447,
+   "params_m": 27.897028,
+   "headroom": {
+    "peak_gb_at_batch": 5.130411624908447,
+    "gb_per_image": 0.08016268163919449,
+    "budget_gb": 11.996777343749999,
+    "largest_estimated_batch": 149,
+    "safe_batches": [
+     32,
+     64,
+     96,
+     128
+    ]
+   }
+  }
+ },
+ "plan": {
+  "per_arch": [
+   {
+    "arch": "convnext_tiny",
+    "img_s": 272.2384340886611,
+    "sec_per_epoch": 438.567759176561,
+    "hours_per_run": 12.182437754904473,
+    "hours_3_seeds": 36.547313264713424
+   },
+   {
+    "arch": "resnet18",
+    "img_s": 412.9658974427842,
+    "sec_per_epoch": 289.1158827867669,
+    "hours_per_run": 8.030996744076859,
+    "hours_3_seeds": 24.092990232230576
+   },
+   {
+    "arch": "resnet50",
+    "img_s": 82.28601872303771,
+    "sec_per_epoch": 1450.9755345177837,
+    "hours_per_run": 40.304875958827324,
+    "hours_3_seeds": 120.91462787648197
+   },
+   {
+    "arch": "shufflenetv2_in",
+    "img_s": 640.3945301689998,
+    "sec_per_epoch": 186.43975608050823,
+    "hours_per_run": 5.178882113347451,
+    "hours_3_seeds": 15.536646340042353
+   },
+   {
+    "arch": "swin_tiny",
+    "img_s": 327.1348584306456,
+    "sec_per_epoch": 364.97180573409423,
+    "hours_per_run": 10.138105714835952,
+    "hours_3_seeds": 30.414317144507855
+   },
+   {
+    "arch": "vgg16",
+    "img_s": 56.281109092498404,
+    "sec_per_epoch": 2121.404533868966,
+    "hours_per_run": 58.92790371858239,
+    "hours_3_seeds": 176.78371115574717
+   }
+  ],
+  "atlas_gpu_hours": 404.28960601372336,
+  "atlas_days": 16.845400250571807,
+  "epochs": 100
+ },
+ "elapsed_min": 1.6500077327092488
+}

@@ -99,6 +99,12 @@ def child(spec: dict) -> int:
         torch.cuda.set_per_process_memory_fraction(float(spec["vram_frac"]), 0)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        # D-43. THE SAME backend configuration the training path uses. Without
+        # this the benchmark ran with cudnn.benchmark=False while every real
+        # run has it True, and reported 82 img/s for a ResNet-50 that should
+        # sit near 180. A benchmark configured differently from the thing it
+        # predicts is precise and about nothing.
+        out["backend"] = M.set_perf_flags(deterministic=False)
 
         res, n_cls = spec["res"], spec["n_cls"]
 

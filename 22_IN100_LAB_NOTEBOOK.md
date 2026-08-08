@@ -25,10 +25,10 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **310** offline, all passing, exit code verified |
+| **Self-checks** | **324** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **5** (D-37 … D-41) · 5 fixed · 0 open |
+| **Defects found this port** | **7** (D-37 … D-43) · 7 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,95 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-43 · The benchmark measured a machine the pipeline never uses
+
+**Severity:** every throughput number was wrong, one badly · **Status:** **fixed**
+**Found:** 2026-08-08 reading the user's benchmark results
+
+```
+resnet18   413.0 img/s   (11.2M params, 1.8 GFLOPs)
+resnet50    82.3 img/s   (23.7M params, 4.1 GFLOPs)
+```
+
+A **5× gap for 2.3× the FLOPs.** `vgg16` at 56.3 img/s is, by contrast,
+*consistent* with its 8.6× FLOPs ratio against `resnet18` — so only ResNet-50
+was anomalous, which is what made it diagnosable.
+
+**Cause.** `set_seed(deterministic=False)` sets `cudnn.benchmark = True`, so
+every real training run has cuDNN autotuning on. **The benchmark never called
+`set_seed`**, so it ran with torch's default of `False`. With autotuning off
+cuDNN selects convolution algorithms by heuristic, and for ResNet-50's many
+distinct 1×1 and 3×3 shapes in `channels_last` that heuristic is poor.
+ResNet-18 has four 3×3 shapes and heuristics handle it fine — which is exactly
+why the two diverged.
+
+**A benchmark whose entire purpose is to predict the real run, configured
+differently from the real run, produces a number that is precise and about
+nothing.** It would have driven the run matrix, the epoch budget and the
+decision about which architectures to drop.
+
+**Contamination analysis.** No training affected — none has happened. But the
+re-plan built on these numbers is wrong in a specific direction: convolutional
+throughput is **understated**, so the atlas is cheaper than the 391 GPU-hours
+currently recorded. `resnet50` and `vgg16` are marked `pending` in
+`IN100_MEASURED_IMG_S` and must be re-measured.
+
+**Fix.** `set_perf_flags(deterministic)` — **one** function, called by
+`set_seed` and by the benchmark child, so the two cannot configure different
+machines. This is the D-16 lesson: the writer and the reader must not be two
+independent spellings of the same setting. TF32 is enabled there too.
+
+Recorded rather than glossed: `cudnn.benchmark = True` makes algorithm
+selection non-deterministic, which changes floating-point summation order. This
+project measures seed-to-seed reliability, so anything adding within-seed
+variance is relevant. The effect is far below the seed variation being measured
+— AMP alone already forfeits bitwise reproducibility — and `deterministic: True`
+turns it off. **Guard:** a self-check asserts the benchmark goes through
+`set_perf_flags` and sets no cuDNN flag of its own.
+
+---
+
+### D-42 · Two of eight architectures could not be built at all
+
+**Severity:** `vit_small_p16` and `deit_small` raised `TypeError`
+**Status:** **fixed** · **Found:** 2026-08-08 by the user running the benchmark
+
+```
+vit_small_p16: TypeError: build_vit_small() got an unexpected keyword argument
+deit_small:    TypeError: build_vit_small() got an unexpected keyword argument
+```
+
+`build_model` **injects** `probe_res` into every ImageNet builder, because the
+D-38 fix has them derive `feature_dims` from a forward pass and the probe needs
+a resolution. Five of the six builders were given the parameter.
+`build_vit_small` was not.
+
+**The pair it broke is the one that matters most.** `vit_small_p16` and
+`deit_small` are the recipe-versus-architecture control — identical geometry,
+one builder, one argument set, differing only in augmentation. Without them the
+2×2 loses a corner and the strongest answer to the accuracy confound goes with
+it.
+
+**Why the existing guard missed it.** D-38 added a check that no builder
+introspects foreign module internals. It never checked that builders **accept
+what the caller passes**. Signatures are a contract, and contracts are
+checkable.
+
+**Contamination analysis.** None — the failure is a hard `TypeError` at build
+time, so nothing was trained on a wrong model. This is the benign shape of a
+defect: loud, immediate, impossible to mistake for a result.
+
+**Guard added.** For every ImageNet architecture, the registry's declared
+kwargs *and* `probe_res` must appear in the builder's signature — read from the
+**source**, not from `globals()`, because every builder lives under
+`if _TORCH_OK:` and a torch-free checking machine would otherwise report all
+eight as missing. That is the **third** time this session a checker's notion of
+"what exists" omitted the torch-gated half of the file.
+
+Self-checks 310 → **324**.
+
+---
 
 ### D-41 · The benchmark crashed the workstation
 
@@ -546,6 +635,10 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **First real measurement.** 6 of 8 architectures benchmarked. The plan's 235 GPU-hours was optimistic by 66%: the atlas is **391 GPU-h** and `vgg16` alone is **45%** of it. Cost model re-anchored on measurement (D-10's lesson) |
+| 2026-08-08 | **D-43 — the benchmark measured a machine the pipeline never uses.** `cudnn.benchmark=False` while every real run has it True; ResNet-50 read 82 img/s where ~180 is expected. One `set_perf_flags` now serves both |
+| 2026-08-08 | **D-42 — `build_vit_small` did not accept `probe_res`**, so two of eight architectures raised TypeError — and they are the recipe-vs-architecture control pair. Guard: every builder's signature must accept what `build_model` injects |
+| 2026-08-08 | **Live training display.** Per-epoch bar with loss/acc/img-s/lr/VRAM updating beside it, and an epoch line carrying the silent-by-default columns as inline warnings |
 | 2026-08-08 | **D-41 — the benchmark crashed the workstation.** No VRAM ceiling on a GPU that also drives the display, no isolation, no timeout. Rebuilt: memory fraction capped, every config in its own subprocess, process trees killed on timeout, results written after each one. The worst defect of the port |
 | 2026-08-08 | **Throughput benchmark written** (`benchmark/`). Staged coordinate descent over dtype x layout, batch size, workers, torch.compile, then a cold confirmation run. The plan's 235 GPU-hours is an estimate anchored on one guess; D-10 was that estimate being 40% low |
 | 2026-08-08 | **Paper artifacts wired.** Six tables, three figures, and `verify_paper_artifacts` — each of the protocol's six contributions now has a named artifact, and the notebook checks the list rather than trusting it |

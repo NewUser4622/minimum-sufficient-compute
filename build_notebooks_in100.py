@@ -467,91 +467,169 @@ def nb2():
         md("""
 # NB2 · Train the backbones
 
-One notebook for Phase 0 and the atlas — they differ only in which
-architectures and seeds are listed.
+**Safe to stop at any moment.** Runs checkpoint every epoch and resume at the
+epoch they reached. Completed runs are skipped. Nothing is ever deleted. Close
+the notebook whenever you like — but run the last cell first, because it is the
+only thing that confirms the work is on disk and readable.
 
-## Run Phase 0 first, then stop and read the gate
+---
 
-**Phase 0:** `resnet50` and `vit_small_p16`, 2 seeds each. 4 runs, ~33 GPU-h.
+## What you will see while it runs
+
+A live bar per epoch, with the numbers that matter updating **beside** it about
+once a second:
+
+```
+ep 7/100  63%|███████████▌      | 738/1178 [04:12<02:31, loss=3.412, acc=0.221, img/s=402, lr=8.7e-02, vram=2.9G]
+```
+
+An epoch here is 3–35 minutes. A bar showing only position tells you the run is
+alive but not whether it is *learning*, and during a multi-day programme those
+are the two separate questions you actually have.
+
+Then one line per epoch, carrying what you would otherwise have to open
+`epochs.csv` to see:
+
+```
+  ep   7/100  train 22.14%  val 19.83%  top5 45.12%  loss 3.412  lr 8.66e-02  402 img/s  289s  ETA 9.3h  0.041kWh  *BEST*
+```
+
+### Warnings that appear inline, and what each one means
+
+These are the columns that are **silent by default and unrecoverable
+afterwards**, so they are surfaced while they are happening rather than left in
+a CSV nobody reads by eye:
+
+| tag | meaning | what to do |
+|---|---|---|
+| `[N NaN/Inf BATCHES]` | under AMP a non-finite loss is **discarded silently**. The run continues and learns nothing from those batches | a handful is normal early; hundreds means the LR is too high |
+| `[N AMP OVERFLOWS]` | gradient overflows whose steps were **thrown away** | >5% of steps is a problem |
+| `[LR HIGH?]` | ‖Δw‖/‖w‖ above 1e-2 | healthy is ~1e-3. Stop and check |
+| `[NOT MOVING?]` | ‖Δw‖/‖w‖ below 1e-5 | nothing is learning |
+| `[DATA-BOUND N%]` | the loader is the bottleneck, not the model | raise `num_workers` |
+
+`[DATA-BOUND]` is trustworthy now: device-side augmentation is measured
+separately and subtracted, so this counts genuine CPU starvation only.
+
+---
+
+## Run Phase 0 first. Then stop and read the gate.
+
+**Phase 0:** `resnet50` and `vit_small_p16`, 2 seeds each. **4 runs, ~1.5 days.**
 
 That gives one noise ceiling per family, which is the entire question:
 
-| ρ_seed outcome | what it means | what to do |
+| ρ_seed outcome | meaning | action |
 |---|---|---|
-| ViT below CNN by **> 0.05** | the CIFAR finding is reproducing | build the full atlas |
+| ViT below CNN by **> 0.05** | the CIFAR finding reproduces | build the atlas |
 | within **±0.05** | **it was a small-data artifact** | retract the CIFAR headline; the paper becomes about scale-dependence |
-| ViT **above** CNN by > 0.05 | inversion | stop and audit the measurement |
-| either below **0.40** | noise-dominated at this scale | coarsen the budget grid, re-gate |
+| ViT **above** CNN by > 0.05 | inversion | stop, audit the measurement |
+| either below **0.40** | noise-dominated at this scale | coarsen the grid, re-gate |
 
-All four are publishable. Row 1 is the one that flatters the existing paper, so
-**scrutinise it harder than the others** — check both architectures cleared the
-acceptance thresholds, that seed spread is under 2 points, that
-`nan_or_inf_batches` is 0, and that both ceilings used a comparable number of
-surviving samples after the τ mask.
-
-## This notebook is safe to stop at any moment
-
-Runs checkpoint every epoch and resume at the epoch they reached. Completed runs
-are skipped. Nothing is deleted. Close it whenever you like — but call the last
-cell first, because it is the only thing that tells you whether the work is
-actually on disk and readable.
-
-## Cost
-
-At 100 epochs on one RTX 4000 Ada, ~235 GPU-h for the 24-run atlas (~10 days
-continuous). `IN100_EPOCHS` is one constant. If the budget binds:
-
-- **Lowering epochs costs accuracy, not validity.** ρ_seed is a rank
-  correlation between two seeds of the same recipe and stays well-defined.
-- **Dropping `vgg16` saves 28% of the training budget** for one across-CNN
-  data point. That is usually the better cut — it weakens Q3's family ordering
-  and leaves the Q1 headline untouched.
+All four are publishable. **Row 1 flatters the existing paper, so scrutinise it
+harder than the others**: check both architectures cleared the acceptance
+thresholds, seed spread is under 2 points, `nan_or_inf_batches` is 0, and both
+ceilings used a comparable sample count after the τ mask.
 """),
         code(bootstrap()),
         code(paths_cell(phase="p0")),
         md("""
 ---
+## Cost, from measurement rather than estimate
+
+The plan estimated 235 GPU-hours. **Your benchmark says otherwise**, and the
+shape of the answer changes what is worth running.
+
+`vgg16` is now **45% of the entire atlas budget** for one across-CNN-family data
+point. It strengthens Q3's family ordering; the Q1 headline — the reason this
+replication exists — does not need it.
+
+**You do not have to decide yet.** Phase 0 contains no `vgg16` and costs ~1.5
+days. If the gap fails to reproduce, the atlas shrinks to the 2×2 anyway and
+the question is moot.
+
+Two caveats on the numbers below, both flagged in the table:
+
+- `resnet50` and `vgg16` were measured with `cudnn.benchmark = False` — torch's
+  default, and **not** what training uses (D-43). `resnet50` at 82 img/s against
+  `resnet18`'s 413 is a 5× gap for 2.3× the FLOPs; expect ~180 once re-measured.
+- `vit_small_p16` and `deit_small` **failed to build** in that run (D-42, fixed)
+  and have never been measured. Their figures are inferred from `swin_tiny`.
+"""),
+        code("""
+ALL = M.zoo_for_dataset('imagenet100')
+est = M.in100_estimate(ALL, seeds=3, epochs=M.IN100_EPOCHS)
+
+print(f"{'arch':18s} {'img/s':>7s} {'s/epoch':>8s} {'h x3':>7s} {'share':>6s}  basis")
+for r in est['rows']:
+    print(f"{r['arch']:18s} {r['img_s']:7.0f} {r['sec_per_epoch']:8.0f} "
+          f"{r['hours_all_seeds']:7.1f} {100*est['share'][r['arch']]:5.1f}%  {r['basis']}")
+print()
+print(f"  atlas, all 8, {M.IN100_EPOCHS} epochs: "
+      f"{est['total_gpu_hours']:.0f} GPU-h = {est['days']:.1f} days")
+print(f"  the plan estimated 235 -- it was optimistic by "
+      f"{(est['total_gpu_hours']-235)/235*100:.0f}%")
+print()
+for drop in (['vgg16'], ['vgg16', 'deit_small']):
+    e = M.in100_estimate([a for a in ALL if a not in drop], 3, M.IN100_EPOCHS)
+    print(f"  without {drop}: {e['total_gpu_hours']:.0f} GPU-h = {e['days']:.1f} days")
+for ep in (60, 80):
+    e = M.in100_estimate(ALL, 3, ep)
+    print(f"  all 8 at {ep} epochs: {e['total_gpu_hours']:.0f} GPU-h = {e['days']:.1f} days")
+print()
+print('  Dropping ONE architecture is a more honest cut than under-training')
+print('  all eight: there is no published reference for this subset, so the')
+print('  "these models converged" claim rests entirely on the acceptance')
+print('  thresholds and has nothing to fall back on.')
+"""),
+        md("""
+---
 ## What to run
 
-Set `PHASE` to `'p0'` for Phase 0 or `'p1'` for the atlas. Nothing else changes.
+`PHASE = 'p0'` for the pilot, `'p1'` for the atlas. Nothing else changes.
+
+`ARCHS` is an ordinary list — remove `vgg16` here if you take that cut.
 """),
-        code(f"""
-PHASE  = 'p0'                     # 'p0' = pilot (4 runs) · 'p1' = atlas (24 runs)
-EPOCHS = M.IN100_EPOCHS           # 100. Lower this if the GPU budget binds.
+        code("""
+PHASE  = 'p0'                     # 'p0' = pilot (4 runs) · 'p1' = atlas
+EPOCHS = M.IN100_EPOCHS           # 100
 
-ARCHS = {P0_ARCHS!r} if PHASE == 'p0' else {ARCHS!r}
-SEEDS = (1, 2) if PHASE == 'p0' else (1, 2, 3)
+if PHASE == 'p0':
+    ARCHS, SEEDS = ['resnet50', 'vit_small_p16'], (1, 2)
+else:
+    ARCHS, SEEDS = M.zoo_for_dataset('imagenet100'), (1, 2, 3)
+    # ARCHS = [a for a in ARCHS if a != 'vgg16']    # <- the 45% cut
 
-sess = M.Session(account='local', phase=PHASE, dataset='{DATASET}',
+sess = M.Session(account='local', phase=PHASE, dataset='imagenet100',
                  work_root=MSC_ROOT, session_limit_h=0.0)
 cfgs = [sess.config(a, seed=s, num_epochs=EPOCHS) for a in ARCHS for s in SEEDS]
 run_ids = [c['run_id'] for c in cfgs]
 
-print(f'{{len(cfgs)}} run(s), {{EPOCHS}} epochs each\\n')
+print(f'{len(cfgs)} run(s), {EPOCHS} epochs each\n')
+print(f"{'run_id':46s} {'opt':>6s} {'lr':>9s} {'bs':>4s} {'mixup':>6s} {'aug':>12s}")
 for c in cfgs:
-    print(f"  {{c['run_id']:48s}} {{c['optimizer']:6s}} lr={{c['learning_rate']:.5f}} "
-          f"bs={{c['batch_size']}} mixup={{c['mixup_alpha']}}")
-print()
-print(f'estimated: ~{{M.estimate_phase(run_ids, num_workers=1)["wall_clock_hours"]:.0f}} GPU-hours')
-print('(an ESTIMATE. The first guessed cost table on CIFAR was 40% low.)')
+    print(f"{c['run_id']:46s} {c['optimizer']:>6s} {c['learning_rate']:9.5f} "
+          f"{c['batch_size']:4d} {c['mixup_alpha']:6.1f} {str(c['rrc_scale']):>12s}")
+e = M.in100_estimate(ARCHS, len(SEEDS), EPOCHS)
+print(f"\nestimated {e['total_gpu_hours']:.0f} GPU-hours = {e['days']:.1f} days")
+print('(an estimate; the first cell above lists which entries are measured)')
 """),
         md("""
 ---
 ## Train
 
-Each run: claim → dry run → resume-or-start → train → evaluate → write
+Per run: claim → **dry run** → resume-or-start → train → evaluate → write
 artifacts. Everything lands under `MSC_ROOT/runs/{run_id}/`.
 
-Watch three columns in the live output; all three are impossible to recover
-after the fact and all three are silent by default:
+The dry run pushes one synthetic batch through the entire path — forward, loss,
+backward, optimiser step, `evaluate()`, the history row, **and a checkpoint save
+and reload** — before the dataset is touched. It takes under a second and runs
+*before* the run is claimed, so a broken config costs nothing and leaves no
+trace in the ledger.
 
-- **`nan_or_inf_batches`** — under AMP a non-finite loss is discarded silently.
-  The run continues and learns nothing from those batches.
-- **`amp_scale_decreases`** — each one is a step whose gradients overflowed and
-  were thrown away.
-- **`update_to_weight_ratio`** — ‖Δw‖/‖w‖. Healthy ≈ 1e-3. 1e-1 means the
-  learning rate is far too high; 1e-6 means nothing is moving. It tells you
-  before the loss curve does.
+**Resuming is automatic.** Re-run this cell after any interruption: finished
+runs are skipped, partial runs continue from their last completed epoch with
+optimiser, scheduler, AMP scaler and all four RNG streams restored.
 """),
         code("""
 results = sess.run_all(M.train_backbone, cfgs)
@@ -569,12 +647,9 @@ for r in results:
 ---
 ## Before you stop — confirm the work is on disk
 
-`confirm_on_disk` **opens every required artifact**. This is stronger than a
-presence check, and stronger than what HuggingFace was ever asked: a run whose
-`summary.json` exists but whose `epochs.csv` is zero bytes looks healthy to a
-presence check and fails during analysis, weeks later.
-
-Three states, three meanings:
+`confirm_on_disk` **opens every required artifact**. Stronger than a presence
+check: a run whose `summary.json` exists but whose `epochs.csv` is zero bytes
+looks healthy to a presence check and fails during analysis weeks later.
 
 - **complete** — every required artifact present, non-empty, parseable
 - **resumable** — `ckpt_last.pt` is there. **Safe to stop.** Being unfinished is
@@ -586,21 +661,21 @@ status = sess.confirm_on_disk(run_ids)
 
 print()
 if status['at_risk']:
-    print('  *** Do not treat the AT RISK runs as done. Re-run this notebook;')
-    print('  *** finished work is skipped and unfinished work resumes.')
+    print('  *** Do not treat the AT RISK runs as done. Re-run the training')
+    print('  *** cell; finished work is skipped and unfinished work resumes.')
 else:
     print('  Nothing is at risk.')
+    print('  Next: NB3_Measure, then NB4_Analysis.')
     if PHASE == 'p0':
-        print('  Next: NB3_Measure, then NB4_Analysis -- then READ THE GATE')
-        print('  in this notebook before starting the atlas.')
-    else:
-        print('  Next: NB3_Measure.')
+        print()
+        print('  THEN COME BACK AND READ THE GATE at the top of this notebook')
+        print('  before starting the atlas. Phase 0 is 8% of the programme and')
+        print('  it decides whether the other 92% is worth spending.')
 """),
     ]
     return notebook(c)
 
 
-# ===========================================================================
 def nb3():
     c = [
         md("""

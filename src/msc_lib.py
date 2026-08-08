@@ -259,6 +259,54 @@ def sha256_of_array(a: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()
 
 
+def set_perf_flags(deterministic: bool = False) -> Dict[str, Any]:
+    """Configure the compute backend. ONE function, used by training and by the
+    benchmark, so the two cannot measure different machines.
+
+    **D-43.** The throughput benchmark never called this, so it ran with
+    `cudnn.benchmark = False` -- torch's default -- while every real training
+    run has it True via `set_seed`. cuDNN with autotuning off picks convolution
+    algorithms by heuristic, and for ResNet-50's many distinct 1x1 and 3x3
+    shapes in `channels_last` that heuristic is poor. The benchmark measured
+    82 img/s for a network that should sit near 180.
+
+    A benchmark whose entire purpose is to predict the real run, configured
+    differently from the real run, produces a number that is precise and about
+    nothing. Extracting it here is the D-16 lesson: the writer and the reader
+    must not be two independent spellings of the same setting.
+
+    `cudnn.benchmark = True` costs a few seconds of autotuning per distinct
+    input shape and typically buys 1.3-2x on ResNet-50. It also makes algorithm
+    selection non-deterministic, which changes floating-point summation order.
+    That is recorded rather than ignored: this project measures seed-to-seed
+    reliability, and anything adding within-seed variance is relevant. The
+    effect is far below the seed-to-seed variation being measured -- AMP alone
+    already forfeits bitwise reproducibility -- and `deterministic: True` in
+    the config turns it off.
+    """
+    out: Dict[str, Any] = {"deterministic": bool(deterministic)}
+    if not _TORCH_OK:
+        return out
+    try:
+        if deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        else:
+            # Fixed batch and fixed resolution -> autotuning pays for itself.
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+        # TF32 on Ada: free accuracy-for-speed on fp32 ops that autocast leaves
+        # alone. Irrelevant under fp16/bf16 matmuls, harmless elsewhere.
+        torch.backends.cuda.matmul.allow_tf32 = not deterministic
+        torch.backends.cudnn.allow_tf32 = not deterministic
+        out.update({"cudnn_benchmark": torch.backends.cudnn.benchmark,
+                    "cudnn_deterministic": torch.backends.cudnn.deterministic,
+                    "tf32_matmul": torch.backends.cuda.matmul.allow_tf32})
+    except Exception as e:                                       # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def set_seed(seed: int, deterministic: bool = False) -> None:
     """Seed every stream that affects the run.
 
@@ -273,9 +321,8 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    set_perf_flags(deterministic)
     if deterministic:
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         try:
             torch.use_deterministic_algorithms(True, warn_only=True)
@@ -3462,8 +3509,9 @@ if _TORCH_OK:
                               probe_res=probe_res)
 
     def build_vit_small(num_classes: int = 100, dim: int = 384, depth: int = 12,
-                        heads: int = 6, patch: int = 16, img: int = 224,
-                        drop_path: float = 0.05) -> TokenBackbone:
+                        heads: int = 6, patch: int = 16, img: Optional[int] = None,
+                        drop_path: float = 0.05,
+                        probe_res: int = 224) -> TokenBackbone:
         """ViT-S/16. `deit_small` is THIS FUNCTION with THESE ARGUMENTS.
 
         The two entries in the zoo are deliberately built by one builder with
@@ -3477,11 +3525,17 @@ if _TORCH_OK:
         property of how they were trained and not of attention. Making them the
         same function is what guarantees the comparison means that.
         """
+        # `probe_res` is what `build_model` injects for every ImageNet builder.
+        # This one lacked the parameter, so vit_small_p16 and deit_small raised
+        # TypeError and TWO OF EIGHT architectures could not be built at all
+        # (D-42). The positional-embedding grid is sized from it.
+        img = int(img if img is not None else probe_res)
         stem = _PatchEmbed(img, patch, 3, dim)
         dp = [drop_path * i / max(1, depth - 1) for i in range(depth)]
         blocks = [_TransformerBlock(dim, heads, 4.0, dp[i]) for i in range(depth)]
         return TokenBackbone(stem, blocks, nn.Linear(dim, num_classes),
-                             lambda i: dim, final_norm=nn.LayerNorm(dim))
+                             lambda i: dim, final_norm=nn.LayerNorm(dim),
+                             probe_res=img)
 
     class SwinBackbone(StagedBackbone):
         """torchvision Swin-T. Its blocks speak NHWC; everything else here
@@ -4494,8 +4548,77 @@ def run_meta(run_id: str, ledger_entry: Optional[Dict[str, Any]] = None
 # lands at CNN-level reliability while sitting at ViT-level accuracy, the
 # accuracy explanation is dead regardless of the marginal means.
 IN100_EPOCHS = 100          # the single lever if the GPU budget binds
-IN100_BATCH = 128           # fits 20 GB VRAM for every architecture in the zoo
+IN100_BATCH = 64            # measured; see IN100_MEASURED_IMG_S below
 IN100_REF_BATCH = 256       # LR is scaled linearly from this reference
+
+# =============================================================================
+# Measured throughput -- RTX 4000 Ada, 224px, batch 64, fp16 + channels_last
+# =============================================================================
+# From `benchmark/bench_throughput.py` on host CB-410-122, 2026-08-08.
+# These REPLACE the estimates in 20_IN100_PORT_PLAN.md 6, which were anchored on
+# one guessed figure for resnet50 and were 66% low in aggregate. D-10 is the
+# precedent: the CIFAR cost table was 40% low and only found out by running.
+#
+# ⚠ Measured with `cudnn.benchmark = False`, which is torch's default and NOT
+# what training uses -- that is D-43. The convolutional numbers are therefore
+# understated, `resnet50` badly so: 82 img/s against `resnet18`'s 413 is a 5x
+# gap for 2.3x the FLOPs, and 1x1-heavy bottleneck blocks in channels_last are
+# exactly where cuDNN's heuristic algorithm choice is poor. Every entry marked
+# `pending` needs re-measuring now that the benchmark shares the training
+# path's backend configuration.
+#
+# Per DC-11 these refine DISPLAYED estimates only. They must never reach
+# `assign_workers`, or ownership stops being deterministic (D-12).
+IN100_MEASURED_IMG_S: Dict[str, float] = {
+    "resnet18":        413.0,
+    "shufflenetv2_in": 640.4,
+    "swin_tiny":       327.1,
+    "convnext_tiny":   272.2,
+    "vgg16":            56.3,
+    "resnet50":         82.3,        # pending: expect ~180 with cudnn.benchmark
+    # vit_small_p16 and deit_small failed to BUILD in that run (D-42) and have
+    # never been measured. The figure below is inferred from `swin_tiny`, whose
+    # FLOPs are within 2%, and is a placeholder carrying no measurement.
+    "vit_small_p16":   380.0,        # ESTIMATE, not measured
+    "deit_small":      380.0,        # ESTIMATE, not measured
+}
+IN100_MEASURED_PEAK_GB: Dict[str, float] = {
+    "resnet18": 0.88, "shufflenetv2_in": 0.72, "resnet50": 2.93,
+    "vgg16": 4.39, "swin_tiny": 4.53, "convnext_tiny": 5.13,
+}
+IN100_UNMEASURED = ("vit_small_p16", "deit_small")
+IN100_PENDING_REMEASURE = ("resnet50", "vgg16")
+
+
+def in100_estimate(archs: Sequence[str], seeds: int = 3,
+                   epochs: int = IN100_EPOCHS,
+                   n_train: int = 119_395) -> Dict[str, Any]:
+    """Hours per architecture and in total, from measured throughput.
+
+    Flags which entries are measurements and which are not, because a table
+    that mixes the two without saying so is how an estimate becomes a fact.
+    """
+    rows, total = [], 0.0
+    for a in sorted(archs):
+        ips = IN100_MEASURED_IMG_S.get(a)
+        if not ips:
+            continue
+        sec = n_train / ips
+        h = sec * epochs / 3600.0
+        rows.append({
+            "arch": a, "img_s": ips, "sec_per_epoch": sec,
+            "hours_per_run": h, "hours_all_seeds": h * seeds,
+            "basis": ("ESTIMATE -- never measured" if a in IN100_UNMEASURED
+                      else "measured, RE-MEASURE pending (D-43)"
+                      if a in IN100_PENDING_REMEASURE else "measured"),
+            "peak_vram_gb": IN100_MEASURED_PEAK_GB.get(a),
+        })
+        total += h * seeds
+    rows.sort(key=lambda r: -r["hours_all_seeds"])
+    return {"rows": rows, "total_gpu_hours": total, "days": total / 24.0,
+            "epochs": epochs, "seeds": seeds,
+            "share": {r["arch"]: r["hours_all_seeds"] / total for r in rows}
+            if total else {}}
 
 
 def _imagenet_config(arch: str, dataset: str, seed: int, phase: str,
@@ -6613,14 +6736,18 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
             optimizer.zero_grad(set_to_none=True)
             it = train_loader
             if tqdm is not None and show_progress:
-                it = tqdm(train_loader, desc=f"{run_id} ep {epoch+1}/{num_epochs}",
-                          leave=False, dynamic_ncols=True, mininterval=2.0)
+                it = tqdm(train_loader, desc=f"ep {epoch+1}/{num_epochs}",
+                          leave=False, dynamic_ncols=True, mininterval=1.0,
+                          unit="b", smoothing=0.1)
 
             # D-40: a loader that augments on the device knows how much of the
             # inter-batch gap was its own GPU work, and the loop cannot. Ask it.
             _timed_loader = hasattr(train_loader, "timing")
             if _timed_loader:
                 tel.augment_sec = 0.0
+            _bar = it if (tqdm is not None and show_progress and it is not train_loader) else None
+            _n_steps = len(train_loader)
+            _t_epoch0 = time.time()
             _t_batch = time.time()
             for step, batch in enumerate(it):
                 # Time spent waiting for data vs. time spent computing. If
@@ -6669,6 +6796,27 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                 run_loss += loss_v * y.size(0)
                 correct += int((logits.argmax(1) == y).sum().item())
                 total += int(y.size(0))
+
+                # Live metrics BESIDE the bar, refreshed roughly once a
+                # second. An epoch here is 3-35 minutes: a bar that shows only
+                # position tells you the run is alive but not whether it is
+                # learning, and the two questions you actually have during a
+                # 10-day programme are "is the loss moving" and "is the GPU
+                # busy". Both are answerable now instead of at the epoch line.
+                if _bar is not None and (step % 20 == 0 or step + 1 == _n_steps):
+                    _el = max(1e-9, time.time() - _t_epoch0)
+                    _post = {"loss": f"{run_loss / max(1, total):.3f}",
+                             "acc": f"{correct / max(1, total):.3f}",
+                             "img/s": f"{total / _el:.0f}",
+                             "lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
+                    if tel.bad_batches:
+                        # Non-finite losses are silent under AMP; the run keeps
+                        # going and learns nothing from those batches. If it is
+                        # happening, it should be visible while it happens.
+                        _post["nan"] = str(tel.bad_batches)
+                    if device.type == "cuda":
+                        _post["vram"] = (f"{torch.cuda.max_memory_allocated()/2**30:.1f}G")
+                    _bar.set_postfix(_post, refresh=False)
 
                 _t_end = time.time()
                 tel.add_batch(loss_v, _t_end - _t_batch, load_t,
@@ -6902,10 +7050,35 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                             epoch, best_metric, dynamics, cumulative_time,
                             cumulative_energy)
 
-            print(f"  ep {epoch+1}/{num_epochs}  train={row['train_accuracy']:.4f}  "
-                  f"val={val_acc:.4f}  top5={row['val_accuracy_top5']:.4f}  "
-                  f"lr={row['learning_rate']:.5f}  E={epoch_energy:.0f}J  "
-                  f"t={epoch_time:.1f}s" + ("  [BEST]" if is_best else ""))
+            # The epoch line carries what you would otherwise have to open
+            # epochs.csv to see -- including the three columns that are silent
+            # by default and unrecoverable afterwards: non-finite batches, AMP
+            # scale decreases, and the update-to-weight ratio.
+            _done, _left = epoch + 1, num_epochs - (epoch + 1)
+            _eta_h = (cumulative_time / max(1, _done)) * _left / 3600.0
+            _thr = row.get("throughput_train_img_s", NA)
+            _dl = row.get("dataload_frac", NA)
+            _u2w = row.get("update_to_weight_ratio", NA)
+            _warn = ""
+            if isinstance(_u2w, float) and _u2w == _u2w:
+                if _u2w > 1e-2:
+                    _warn += "  [LR HIGH?]"      # healthy is ~1e-3
+                elif _u2w < 1e-5:
+                    _warn += "  [NOT MOVING?]"
+            if tel.bad_batches:
+                _warn += f"  [{tel.bad_batches} NaN/Inf BATCHES]"
+            if tel.amp_decreases > 0.05 * max(1, tel.opt_steps):
+                _warn += f"  [{tel.amp_decreases} AMP OVERFLOWS]"
+            if isinstance(_dl, float) and _dl == _dl and _dl > 0.30:
+                _warn += f"  [DATA-BOUND {100*_dl:.0f}%]"
+            print(f"  ep {_done:>3d}/{num_epochs}  "
+                  f"train {row['train_accuracy']*100:5.2f}%  "
+                  f"val {val_acc*100:5.2f}%  top5 {row['val_accuracy_top5']*100:5.2f}%  "
+                  f"loss {row['train_loss']:.3f}  lr {row['learning_rate']:.2e}  "
+                  f"{_thr if not isinstance(_thr, float) else f'{_thr:.0f}'} img/s  "
+                  f"{epoch_time:.0f}s  ETA {_eta_h:.1f}h  "
+                  f"{epoch_energy/3.6e6:.3f}kWh"
+                  + ("  *BEST*" if is_best else "") + _warn)
 
             # --- push decision -------------------------------------------
             since = epoch - last_push_epoch
@@ -11621,6 +11794,70 @@ def _selftest() -> bool:
         check(f"{_bfn} does not introspect foreign module internals",
               not _bad, f"found {_bad}" if _bad else
               "feature dims come from a forward probe")
+    # D-42. `build_model` INJECTS `probe_res` into every ImageNet builder, so
+    # every ImageNet builder must accept it. `build_vit_small` did not, and
+    # vit_small_p16 and deit_small -- two of the eight, and the pair carrying
+    # the recipe-versus-architecture control -- raised TypeError and could not
+    # be built at all. The user found it by running the benchmark.
+    #
+    # The existing guard checked that builders do not introspect foreign
+    # internals. It never checked that they accept what the caller passes.
+    # Signatures are a contract and contracts are checkable.
+    # Signatures are read from the SOURCE, not from globals(). Every builder
+    # lives under `if _TORCH_OK:`, so on a torch-free machine globals() has
+    # none of them and the check would report all eight as missing -- the third
+    # time this session that a checker's notion of "what exists" omitted the
+    # torch-gated half of the file.
+    def _params_of(fn_name: str):
+        try:
+            t = _a2.parse(Path(globals().get("__file__", "msc_lib.py"))
+                          .read_text(encoding="utf-8"))
+        except Exception:                                        # noqa: BLE001
+            return None
+        for nd in _a2.walk(t):
+            if isinstance(nd, (_a2.FunctionDef, _a2.AsyncFunctionDef)) \
+                    and nd.name == fn_name:
+                aa = nd.args
+                names = {x.arg for x in list(aa.posonlyargs) + list(aa.args)
+                         + list(aa.kwonlyargs)}
+                return names, bool(aa.kwarg)
+        return None
+
+    _BUILDERS = {"resnet_in": "build_resnet_imagenet", "vgg_in": "build_vgg_imagenet",
+                 "shufflenetv2_in": "build_shufflenetv2_imagenet",
+                 "convnext_tiny": "build_convnext_tiny",
+                 "vit_small": "build_vit_small", "swin_tiny": "build_swin_tiny"}
+    for _name in zoo_for_dataset("imagenet100"):
+        _bfn = _BUILDERS[ZOO[_name]["builder"][0]]
+        _got = _params_of(_bfn)
+        if _got is None:
+            check(f"{_bfn} is defined", False)
+            continue
+        _names, _kw = _got
+        check(f"{_bfn} accepts probe_res, which build_model injects",
+              ("probe_res" in _names) or _kw,
+              "" if ("probe_res" in _names or _kw)
+              else "TypeError at build time -- exactly the D-42 failure")
+        for _k in ZOO[_name]["builder"][1]:
+            check(f"{_bfn} accepts registry kwarg '{_k}'",
+                  (_k in _names) or _kw)
+
+    print("the benchmark measures the machine training will use (D-43)")
+    _bench = Path(globals().get("__file__", ".")).resolve().parent.parent / \
+        "benchmark" / "bench_throughput.py"
+    if _bench.exists():
+        _bsrc = _bench.read_text(encoding="utf-8")
+        check("the benchmark configures the backend through set_perf_flags",
+              "set_perf_flags" in _bsrc,
+              "it ran with cudnn.benchmark=False while every real run has it "
+              "True, and measured 82 img/s for a ResNet-50 that should sit "
+              "near 180 -- a number that is precise and about nothing")
+        check("...and does not set cudnn flags itself",
+              "backends.cudnn" not in _bsrc,
+              "two spellings of one setting is how they drift (D-16)")
+    else:
+        check("benchmark script present", False, str(_bench))
+
     check("StagedBackbone can derive feature dims by probing",
           "_probe_feature_dims" in _insp.getsource(StagedBackbone)
           if _TORCH_OK else True)
