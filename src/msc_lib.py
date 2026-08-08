@@ -1020,7 +1020,12 @@ def get_hf_token(secret_name: str = "HF_TOKEN") -> Optional[str]:
     except Exception:
         pass
     tok = os.environ.get(secret_name)
-    if not tok:
+    if not tok and os.environ.get("MSC_OFFLINE", "") in ("", "0", "false"):
+        # Silent when MSC_OFFLINE is set: this programme is local-only by
+        # design, and telling the operator to add a HuggingFace token is
+        # advice for a configuration they deliberately are not in. A message
+        # that fires on the intended setup is noise, and noise is what makes
+        # a real line get skimmed past (D-46, and D-17 before it).
         print(f"[HF] no token: add '{secret_name}' to Kaggle Secrets "
               f"(Add-ons -> Secrets) or export it as an env var")
     return tok
@@ -1061,8 +1066,9 @@ class MSCHub:
         self.hub: Optional[BackgroundUploader] = None
         self.enabled = False
         if not enable or not self.token:
-            print("[HF] disabled (no token or explicitly off) -- "
-                  "runs will be LOCAL ONLY and lost when the session ends")
+            if os.environ.get("MSC_OFFLINE", "") in ("", "0", "false"):
+                print("[HF] disabled (no token or explicitly off) -- "
+                      "runs will be LOCAL ONLY and lost when the session ends")
             self.models = self.data = None
             return
         u = BackgroundUploader(repo, self.token, repo_type=repo_type,
@@ -2382,6 +2388,10 @@ class CIFARTensor(Dataset):
         self.labels = torch.from_numpy(labels)
         self.mean = torch.tensor(mean).view(3, 1, 1)
         self.std = torch.tensor(std).view(3, 1, 1)
+        # CIFAR emits positions within the split, so the index space IS the
+        # split length. Declared explicitly so every backend answers the same
+        # question rather than one of them being assumed (D-49).
+        self.index_space = int(self.labels.numel())
         # Fingerprint the label order once. Every per-sample table carries it,
         # and the analysis refuses to correlate tables whose fingerprints differ.
         self.order_hash = sha256_of_array(labels)
@@ -2669,6 +2679,11 @@ class PackedImageDataset(Dataset):
         self.labels_all = np.load(root / "labels.npy")
         self.labels = self.labels_all[self.indices].astype(np.int64)
         self._mm = None
+        # The size of the space `sample_idx` values live in. NOT len(self):
+        # this backend emits GLOBAL pack indices so that val and holdout
+        # tables coexist unambiguously, which means anything indexing by
+        # sample_idx must be sized for the whole pack (D-49).
+        self.index_space = int(self.count)
         # Same role as CIFARTensor.order_hash: fingerprints the label order of
         # THIS split so the analysis refuses to correlate misaligned tables.
         self.order_hash = sha256_of_array(self.labels)
@@ -2737,6 +2752,11 @@ if _TORCH_OK:
         @property
         def dataset(self):
             return self.loader.dataset
+
+        @property
+        def index_space(self):
+            return getattr(self.loader.dataset, "index_space",
+                           len(self.loader.dataset))
 
         @property
         def batch_size(self):
@@ -4591,6 +4611,27 @@ class TrainingDynamics:
     """
 
     def __init__(self, n_train: int, el2n_epoch: int = 10):
+        """`n_train` is the size of the INDEX SPACE, not the split length.
+
+        **D-49.** These arrays are indexed by `sample_idx`, and on the packed
+        backend `sample_idx` is the GLOBAL pack index (0..129,394) rather than a
+        position within the training split (0..119,394). Sizing them by
+        `len(train_set)` therefore overflowed on the first training image whose
+        global index exceeded the split length:
+
+            IndexError: index 121978 is out of bounds for axis 0 with size 119395
+
+        Making `sample_idx` global was deliberate -- it is what lets the `val`
+        and `train_holdout` tables coexist unambiguously and makes every
+        per-sample table self-describing. But it changed what an index MEANS,
+        and this class was written against the old meaning. Same shape as D-40,
+        where device-side augmentation changed what `dataload_frac` measured:
+        a quantity whose definition moved while its name did not.
+
+        Callers must pass `dataset.index_space`. The extra ~10k entries per
+        array are a few hundred KB and are never read: `to_frame()` emits only
+        indices actually seen.
+        """
         self.n = int(n_train)
         self.el2n_epoch = int(el2n_epoch)
         self.correct_prev = np.zeros(self.n, dtype=np.int8)
@@ -4601,10 +4642,21 @@ class TrainingDynamics:
         self._epoch_seen = np.zeros(self.n, dtype=bool)
         self.epochs_recorded = 0
 
+    def _check_space(self, idx) -> None:
+        mx = int(np.max(idx)) if len(idx) else -1
+        if mx >= self.n:
+            raise IndexError(
+                f"sample_idx {mx} exceeds the dynamics index space ({self.n}).\n"
+                f"  TrainingDynamics is indexed by sample_idx, and on the packed\n"
+                f"  backend that is the GLOBAL pack index, not a position within\n"
+                f"  the training split. Size it with `dataset.index_space`,\n"
+                f"  not `len(dataset)` (D-49).")
+
     def observe_batch(self, idx, logits, labels, epoch: int) -> None:
         """Called once per training batch with what the loop already has."""
         with torch.no_grad():
             i = idx.detach().cpu().numpy().astype(np.int64)
+            self._check_space(i)
             pred = logits.detach().argmax(dim=1)
             corr = (pred == labels).detach().cpu().numpy().astype(np.int8)
             self._epoch_correct[i] = corr
@@ -4643,14 +4695,25 @@ class TrainingDynamics:
         self.epochs_recorded = int(st.get("epochs_recorded", 0))
 
     def to_frame(self):
+        # Only indices actually seen. With a GLOBAL index space the array
+        # spans val and holdout positions too, and emitting rows for images
+        # this run never trained on would put NaN forgetting counts into the
+        # difficulty battery as if they were measurements (D-49).
+        keep = (np.asarray(self.ever_correct) | (np.asarray(self.forget_events) > 0)
+                | np.isfinite(np.asarray(self.el2n)))
+        if not keep.any():
+            keep = np.ones(self.n, dtype=bool)
+        idx = np.flatnonzero(keep)
+        fe = np.asarray(self.forget_events)[idx]
+        ec = np.asarray(self.ever_correct)[idx]
         return pd.DataFrame({
-            "sample_idx": np.arange(self.n),
-            "forget_events": self.forget_events,
-            "ever_correct": self.ever_correct,
-            "el2n": self.el2n,
+            "sample_idx": idx,
+            "forget_events": fe,
+            "ever_correct": ec,
+            "el2n": np.asarray(self.el2n)[idx],
             # Toneva's "unforgettable" set: learned and never lost. A useful
             # sanity check -- it should be a large, easy majority.
-            "unforgettable": (self.ever_correct & (self.forget_events == 0)),
+            "unforgettable": (ec & (fe == 0)),
         })
 
 
@@ -6917,7 +6980,10 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     except (TypeError, AttributeError):
         scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss(label_smoothing=float(cfg.get("label_smoothing", 0.0)))
-    dynamics = TrainingDynamics(n_train, el2n_epoch=int(cfg.get("el2n_epoch", 10)))
+    # D-49: the index SPACE, which is not the split length on a backend whose
+    # sample_idx is global. Ask the dataset rather than assuming.
+    _space = int(getattr(train_loader.dataset, "index_space", n_train))
+    dynamics = TrainingDynamics(_space, el2n_epoch=int(cfg.get("el2n_epoch", 10)))
 
     # --- resume ----------------------------------------------------------
     # D-19: pull this run's own artifacts first. Without it, resume silently
@@ -10711,7 +10777,8 @@ def resume_acceptance_test(session: "Session", arch: str = "resnet20",
     ref_id = cfg["run_id"] + "-ref"
     cut_id = cfg["run_id"] + "-cut"
 
-    print(f"\n  [1/3] reference: {epochs} epochs, uninterrupted")
+    print(f"\n  [1/3] reference: {epochs} epochs, uninterrupted  "
+          f"(local scratch, nothing uploaded)")
     ref = train_backbone(dict(cfg, run_id=ref_id), hub_off, reg,
                          work_root=tmp / "ref", data_root_out=tmp / "ref" / "data",
                          show_progress=False)
@@ -12361,6 +12428,42 @@ def _selftest() -> bool:
     check("the analytic fallback is documented as conv+linear only",
           "conv + linear only" in _insp.getsource(_analytic_flops),
           "that omission is the whole defect for a transformer")
+
+    print("sample_idx index space (D-49)")
+    # The failure was IndexError at global index 121978 against an array sized
+    # 119395 -- the training split length. Reproduce it directly.
+    _dyn = TrainingDynamics(6, el2n_epoch=0)
+    check("an out-of-space index RAISES with the cause named",
+          _raises(lambda: _dyn._check_space(np.array([0, 9])), IndexError))
+    try:
+        _dyn._check_space(np.array([0, 9]))
+        _why = ""
+    except IndexError as _e:
+        _why = str(_e)
+    check("...and the message names index_space and D-49",
+          "index_space" in _why and "D-49" in _why,
+          "an IndexError four frames deep names neither the setting nor the fix")
+    check("an in-space index passes",
+          _dyn._check_space(np.array([0, 5])) is None)
+    check("TrainingDynamics is sized from the dataset, not len(dataset)",
+          "index_space" in _insp.getsource(train_backbone),
+          "sample_idx is GLOBAL on the packed backend: 0..129,394 against a "
+          "119,395-row split")
+    check("both backends declare an index space",
+          "self.index_space" in _insp.getsource(PackedImageDataset)
+          and "self.index_space" in _insp.getsource(CIFARTensor)
+          if _TORCH_OK else True,
+          "one of them being assumed is how the meanings diverged")
+    # to_frame must not emit rows for images this run never trained on
+    _d2 = TrainingDynamics(10, el2n_epoch=0)
+    _d2.ever_correct[np.array([2, 5, 7])] = True
+    _f = _d2.to_frame()
+    check("to_frame emits only indices actually seen",
+          len(_f) == 3 and list(_f["sample_idx"]) == [2, 5, 7],
+          f"{len(_f)} rows -- emitting the whole index space would put NaN "
+          f"forgetting counts into the difficulty battery as measurements")
+    check("...and its columns are aligned to those indices",
+          bool(_f["ever_correct"].all()))
 
     print("storage resolution (D-44)")
     _cands = storage_candidates()

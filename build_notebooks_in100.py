@@ -330,6 +330,11 @@ restarting.
 # Set this to the folder that CONTAINS train/. Leave None to auto-detect.
 SRC_DIR    = None
 RUN_PACKER = False        # <-- flip to True to actually pack
+#
+# ONE TIME. Leaving it True afterwards is harmless: the cell checks whether the
+# pack already exists and prints 'already packed -- nothing to do' without
+# touching it. The packer itself is also idempotent and resumable, so nothing
+# is redone and nothing is overwritten.
 
 import subprocess, sys
 from pathlib import Path

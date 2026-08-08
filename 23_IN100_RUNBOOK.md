@@ -58,13 +58,13 @@ After this, unplug it.
 
 | | |
 |---|---|
-| ✅ | Library ported. **352** offline self-checks pass, exit code verified. |
+| ✅ | Library ported. **359** offline self-checks pass, exit code verified. |
 | ✅ | Local-only + offline. Nothing uploaded, nothing fetched, nothing deleted. |
 | ✅ | Packing tool, verified against the real data (dry run only — not yet packed). |
 | ✅ | Zoo registered, dry runs written and wired in. |
 | ✅ | **Five notebooks generated** in `notebooks_in100/`, validated clean. |
 | ✅ | Throughput measured for 6 of 8 architectures (`benchmark/results/`). |
-| ⬜ | **Dataset not packed yet** — NB1 step 3 does it (`RUN_PACKER = True`). |
+| ✅ | **Dataset packed.** `RUN_PACKER` is one-time; re-running the cell is a no-op. |
 | ⬜ | **Nothing has trained.** No architecture in this zoo has completed a run. |
 | ⬜ | `resnet50` and `vgg16` need re-measuring after D-43; `vit`/`deit` after D-42. |
 
@@ -82,7 +82,7 @@ echo $?          # must be 0
 Expect the last three lines to read:
 
 ```
-  352 checks run, 0 failed
+  359 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```
@@ -320,6 +320,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 
 | # | symptom | cause | now |
 |---|---|---|---|
+| **D-49** | `IndexError: index 121978 is out of bounds for axis 0 with size 119395` | `sample_idx` is the GLOBAL pack index; dynamics arrays were sized by the split length | datasets declare `index_space`; `train_backbone` asks rather than assumes |
 | **D-48** | `TypeError: resume_acceptance_test() got an unexpected keyword argument` | a notebook call named a parameter that does not exist; the existence check could not see it | validator now checks notebook call signatures, suggesting the closest real parameter |
 | **D-47** | `TypeError: load_checkpoint() missing 2 required positional arguments` / `MSCResult has no len()` | calls named real functions but passed the wrong things; existence guards cannot see arity | AST arity check over every internal call |
 | **D-46** | preflight reports `FAILED: HF token` / `imagenet100 present` | HF checks ran in a local-only session; "not packed yet" counted as a failure | HF checks skipped when local; three states (pass/fail/todo); dry runs no longer need the pack |
@@ -342,7 +343,7 @@ python src/msc_lib.py --selftest
 Look at the **counts**, not the last line:
 
 ```
-  352 checks run, 0 failed
+  359 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```

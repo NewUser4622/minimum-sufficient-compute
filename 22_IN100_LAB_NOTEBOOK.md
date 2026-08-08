@@ -21,14 +21,14 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Phase** | infrastructure port — **no GPU-hour spent yet, by design** |
 | **Question** | does the ViT/Mixer ρ_seed gap (0.547 vs 0.62–0.73) survive at ImageNet scale? |
 | **Design** | frozen — [`20_IN100_PORT_PLAN.md`](20_IN100_PORT_PLAN.md) |
-| **Data** | verified, not yet packed — [`25_IN100_DATA_CARD.md`](25_IN100_DATA_CARD.md) |
+| **Data** | **packed** — [`25_IN100_DATA_CARD.md`](25_IN100_DATA_CARD.md) |
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **352** offline, all passing, exit code verified |
+| **Self-checks** | **359** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **12** (D-37 … D-48) · 12 fixed · 0 open |
+| **Defects found this port** | **13** (D-37 … D-49) · 13 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,92 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-49 · `sample_idx` became global; the dynamics arrays did not
+
+**Severity:** **every training run would crash in epoch 0** · **Status:** **fixed**
+**Found:** 2026-08-08 by the user, in the kill-and-resume test
+
+```
+IndexError: index 121978 is out of bounds for axis 0 with size 119395
+  TrainingDynamics.observe_batch -> self._epoch_correct[i] = corr
+```
+
+`TrainingDynamics` allocates its arrays with `len(train_set)` = **119,395** and
+indexes them by `sample_idx`. On the packed backend `sample_idx` is the
+**global pack index**, 0…129,394. The first training image whose global index
+exceeded the split length blew up.
+
+**Both halves of this were deliberate, and that is the problem.**
+`PackedImageDataset` says so in its own docstring:
+
+> *"`sample_idx` is the global pack index, not the position in this split…
+> That makes every per-sample table self-describing, lets val and
+> train_holdout tables coexist without ambiguity, and means an accidental
+> split mismatch shows up as non-overlapping indices rather than as a
+> plausible correlation."*
+
+All true, and worth keeping. But it **changed what an index means**, and
+`TrainingDynamics` was written against the old meaning — where `sample_idx` was
+a dense position within one split.
+
+**This is D-40 again, on a different quantity.** There, GPU-side augmentation
+changed what `dataload_frac` measured while its name stayed the same. Here a
+backend change moved the definition of an index while its name stayed the same.
+Twice now: **when a quantity's meaning moves, every consumer written against
+the old meaning is silently wrong** — and the only reason this one was loud is
+that arrays have bounds. `dataload_frac` had none, which is why it needed an
+audit to find rather than a crash.
+
+**Contamination analysis.** None. `IndexError` in epoch 0 of a 4-epoch test
+run, before anything was written. The benign shape again: loud and immediate.
+The kill-and-resume test found it, which is what that test is for — five CIFAR
+defects were about resume, and this is the first thing it caught here.
+
+**Fix.** Both datasets now declare `index_space` — the size of the space
+`sample_idx` values live in — and `train_backbone` asks the dataset instead of
+assuming:
+
+| backend | `len(dataset)` | `index_space` |
+|---|---|---|
+| `CIFARTensor` | 50,000 | 50,000 (positions within the split) |
+| `PackedImageDataset` (train) | 119,395 | **129,395** (the whole pack) |
+
+`GPUBatchLoader` forwards it, since callers see the wrapper. `_check_space()`
+raises with the cause and the remedy named, rather than an `IndexError` four
+frames deep that mentions neither.
+
+**And a second bug the fix exposed.** `to_frame()` emitted one row per index in
+the space. With a global space that is 129,395 rows including **val and holdout
+positions this run never trained on**, whose `forget_events` would be 0 and
+`el2n` NaN — entering the Q4 difficulty battery as if they were measurements.
+It now emits only indices actually seen.
+
+**Guards added:** 7 self-checks, including the exact out-of-bounds case and an
+assertion that `to_frame` returns 3 rows when 3 indices were seen.
+
+Self-checks 352 → **359**.
+
+---
+
+### Note · `RUN_PACKER` is one-time
+
+Asked directly, so recorded. **Once.** The cell checks `data_present` first and
+prints `already packed -- nothing to do` without touching anything. The packer
+itself is idempotent and resumable, so leaving the flag `True` costs a
+directory listing.
+
+---
+
+### Note · HuggingFace notices silenced in an offline run
+
+`[HF] no token: add 'HF_TOKEN'...` was still printing inside the resume test.
+This programme is local-only **by design**, so that is advice for a
+configuration the operator deliberately is not in. Both notices are now gated on
+`MSC_OFFLINE`. Same reasoning as D-46: a message that fires on the intended
+setup is noise, and noise is what makes a real line get skimmed past.
+
+---
 
 ### D-48 · The same defect, one layer out — a notebook call with a wrong keyword
 
@@ -940,6 +1026,8 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-49 — `sample_idx` became global; the dynamics arrays did not.** `IndexError: index 121978 out of bounds for size 119395`. Both halves were deliberate; the index's MEANING moved while its name did not — D-40's shape on a different quantity. Datasets now declare `index_space`. Found by the kill-and-resume test, which is what it is for |
+| 2026-08-08 | **Dataset packed.** The pipeline is now reading real data |
 | 2026-08-08 | **D-48 — the same defect one layer out.** `M.resume_acceptance_test(..., interrupt_after=2)`; the parameter is `kill_at`. D-47's arity check covered library-internal calls only, so the class survived in the notebooks. D-32's lesson verbatim: fixing one of N skip points relocates the symptom. The validator now checks notebook call signatures too |
 | 2026-08-08 | **NB1 packs the dataset itself** — subprocess with live output, `RUN_PACKER=False` by default. The TODO was correct; the terminal round-trip was friction |
 | 2026-08-08 | **D-47 — names that exist, calls that don't.** `load_checkpoint` called with 6 of 8 positional args; `msc_for_run`'s `MSCResult` treated as an array. Two existence guards passed both. Arity is now checked by AST, verified against the real bug |
