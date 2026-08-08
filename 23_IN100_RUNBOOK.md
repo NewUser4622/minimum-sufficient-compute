@@ -58,14 +58,16 @@ After this, unplug it.
 
 | | |
 |---|---|
-| ✅ | Library ported. **292** offline self-checks pass, exit code verified. |
+| ✅ | Library ported. **334** offline self-checks pass, exit code verified. |
 | ✅ | Local-only + offline. Nothing uploaded, nothing fetched, nothing deleted. |
 | ✅ | Packing tool, verified against the real data (dry run only — not yet packed). |
 | ✅ | Zoo registered, dry runs written and wired in. |
-| ⬜ | **Notebooks not yet regenerated** (O-23). `build_notebooks.py` still emits the CIFAR set. |
-| ⬜ | **Nothing has run on a GPU.** No architecture in this zoo has been built on hardware. |
+| ✅ | **Five notebooks generated** in `notebooks_in100/`, validated clean. |
+| ✅ | Throughput measured for 6 of 8 architectures (`benchmark/results/`). |
+| ⬜ | **Nothing has trained.** No architecture in this zoo has completed a run. |
+| ⬜ | `resnet50` and `vgg16` need re-measuring after D-43; `vit`/`deit` after D-42. |
 
-Steps −1 to 1 below are runnable now. Step 3 onward waits on O-23.
+Every step below is runnable now.
 
 ---
 
@@ -79,7 +81,7 @@ echo $?          # must be 0
 Expect the last three lines to read:
 
 ```
-  292 checks run, 0 failed
+  334 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```
@@ -105,15 +107,20 @@ This takes about 20 seconds and needs no GPU, no network and no dataset.
 
 Once. ~20–40 minutes on 24 cores. Needs **25 GB** free.
 
+Run **cell 2 of NB1 first** — it picks the storage roots and prints `DATA_DIR`.
+Then paste that into `--out`:
+
 ```
 python tools/pack_imagenet100.py ^
     --src "C:\Users\Administrator\Desktop\New folder" ^
-    --out "D:\msc_data\in100"
+    --out "<the DATA_DIR that cell 2 printed>"
 ```
 
-Then tell the library where it is, either by setting `MSC_IN100_DIR` or by
-placing it at the default scratch path. The error message names both if it
-cannot find it.
+**Do not hardcode a drive letter.** That was D-44: a default naming `D:\` on a
+machine with no D: drive, failing forty lines deep in `pathlib` with a message
+that named neither the setting nor the file to change. Cell 2 now chooses the
+roomiest existing root and proves it writable by writing and reading back a
+probe file.
 
 **What to check.** The tool ends by verifying itself and exits non-zero on any
 problem, so a zero exit is meaningful. Read these lines anyway:
@@ -142,7 +149,7 @@ python tools/pack_imagenet100.py --src ... --out ... --verify
 
 ---
 
-## Step 2 — Preflight on the real GPU  *(needs O-23)*
+## Step 2 — Preflight on the real GPU
 
 **This is the step that earns its keep.** On CIFAR the preflight caught D-01a,
 D-01b and D-02 before a single GPU-hour was spent — an architecture that could
@@ -171,7 +178,7 @@ architectures anyway**. What would be a bug is that failure going unrecorded.
 
 ---
 
-## Step 3 — Phase 0  *(needs O-23)*
+## Step 3 — Phase 0
 
 **4 runs, ~33 GPU-h.** `resnet50` × 2 seeds, `vit_small_p16` × 2 seeds.
 
@@ -196,7 +203,7 @@ ceilings were computed on the same number of surviving samples after the τ mask
 
 ---
 
-## Step 4 — The atlas  *(needs O-23, and a Phase 0 verdict)*
+## Step 4 — The atlas  *(after a Phase 0 verdict)*
 
 24 runs, ~235 GPU-h at 100 epochs, ~10 days continuous.
 
