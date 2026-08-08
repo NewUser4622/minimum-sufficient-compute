@@ -293,3 +293,50 @@ sufficient budget" is undefined when two budgets cost the same.
 by itself. The rebuilt `.ipynb` has to be re-uploaded. "I fixed it" and "the fix
 is running" are different claims and only the second one matters — this cost a
 session on CIFAR (D-26, operational note).
+
+---
+
+## Defect index — where to look when something fails
+
+Every defect found during this port, with the symptom you would actually see.
+Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
+
+| # | symptom | cause | now |
+|---|---|---|---|
+| **D-44** | `FileNotFoundError: [WinError 3] ... 'D:\'` in NB1, in the **bootstrap** cell | a default path named a drive that does not exist; `enforce_offline` made *import* depend on a writable dir | `DATA_DIR`/`MSC_ROOT` default to `None`; `resolve_storage()` picks the roomiest existing root and proves it writable |
+| **D-43** | `resnet50` 82 img/s vs `resnet18` 413 — a 5× gap for 2.3× the FLOPs | the benchmark ran with `cudnn.benchmark=False`; every real run has it True | one `set_perf_flags()` serves both |
+| **D-42** | `TypeError: build_vit_small() got an unexpected keyword argument` | `build_model` injects `probe_res`; that one builder lacked it | signature guard over every ImageNet builder |
+| **D-41** | machine hangs / display freezes during the benchmark | no VRAM cap on a GPU that drives the display → Windows TDR reset | batch ladder deleted, 50% VRAM cap, per-config subprocess, timeout |
+| **D-40** | `dataload_frac` high while the loader is idle | GPU-side augmentation counted as data wait | `augment_time_sec` split out and subtracted |
+| **D-39** | `AttributeError: module 'msc_lib' has no attribute 'analyse_q1_all'` | six invented function names | the validator checks library names at build time |
+| **D-38** | `AttributeError: 'BatchNorm2d' object has no attribute 'out_channels'` | builders guessed at torchvision internals | `feature_dims` derived from a forward probe |
+| **D-37** | self-test prints `[FAIL]` then `ALL CHECKS PASSED`, exits 0 | a tuple unpack rebound the verdict scalar | lists + canary + floor |
+
+### Reading the self-test after any change
+
+```
+python src/msc_lib.py --selftest
+```
+
+Look at the **counts**, not the last line:
+
+```
+  334 checks run, 0 failed
+
+ALL CHECKS PASSED
+```
+
+- below **250** checks run → a section exited early; the verdict is void
+- `*** THE HARNESS ITSELF IS BROKEN` → everything above it is meaningless
+- one `[FAIL] D-37: the harness registers a failure  canary` is **required**
+
+### Rebuilding the notebooks after any library change
+
+```
+python build_notebooks_in100.py
+```
+
+Refuses to write if any notebook names a column, a library function, or a drive
+letter that does not exist. All five share one bootstrap cell and one paths
+cell, so a fix to either lands in five places from one edit — which is why they
+are generated rather than hand-written.
