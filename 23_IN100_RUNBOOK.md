@@ -58,7 +58,7 @@ After this, unplug it.
 
 | | |
 |---|---|
-| ✅ | Library ported. **334** offline self-checks pass, exit code verified. |
+| ✅ | Library ported. **339** offline self-checks pass, exit code verified. |
 | ✅ | Local-only + offline. Nothing uploaded, nothing fetched, nothing deleted. |
 | ✅ | Packing tool, verified against the real data (dry run only — not yet packed). |
 | ✅ | Zoo registered, dry runs written and wired in. |
@@ -81,7 +81,7 @@ echo $?          # must be 0
 Expect the last three lines to read:
 
 ```
-  334 checks run, 0 failed
+  339 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```
@@ -310,6 +310,8 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 
 | # | symptom | cause | now |
 |---|---|---|---|
+| **D-46** | preflight reports `FAILED: HF token` / `imagenet100 present` | HF checks ran in a local-only session; "not packed yet" counted as a failure | HF checks skipped when local; three states (pass/fail/todo); dry runs no longer need the pack |
+| **D-45** | `[FLOP] profiler fvcore failed ... using analytic fallback` | fvcore priced the CNNs, the analytic counter priced the transformers — and it cannot see attention | torch's flop_counter preferred; a fallback now RAISES. **Delete `budgets/` and rebuild if you saw this** |
 | **D-44** | `FileNotFoundError: [WinError 3] ... 'D:\'` in NB1, in the **bootstrap** cell | a default path named a drive that does not exist; `enforce_offline` made *import* depend on a writable dir | `DATA_DIR`/`MSC_ROOT` default to `None`; `resolve_storage()` picks the roomiest existing root and proves it writable |
 | **D-43** | `resnet50` 82 img/s vs `resnet18` 413 — a 5× gap for 2.3× the FLOPs | the benchmark ran with `cudnn.benchmark=False`; every real run has it True | one `set_perf_flags()` serves both |
 | **D-42** | `TypeError: build_vit_small() got an unexpected keyword argument` | `build_model` injects `probe_res`; that one builder lacked it | signature guard over every ImageNet builder |
@@ -328,7 +330,7 @@ python src/msc_lib.py --selftest
 Look at the **counts**, not the last line:
 
 ```
-  334 checks run, 0 failed
+  339 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```

@@ -25,10 +25,10 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **334** offline, all passing, exit code verified |
+| **Self-checks** | **339** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **8** (D-37 … D-44) · 8 fixed · 0 open |
+| **Defects found this port** | **10** (D-37 … D-46) · 10 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,132 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-45 · One atlas, two FLOPs profilers — and a transformer with no attention counted
+
+**Severity:** **would have invalidated every cross-architecture number**
+**Status:** **fixed** · **Found:** 2026-08-08 in the user's NB1 preflight output
+
+```
+  [PASS] budgets resnet50   -- K=5 depth rho=[0.194, 0.392, 0.643, 0.803, 1.0]
+[FLOP] profiler fvcore failed (type Tensor doesn't define __round__ method); using analytic fallback
+  [PASS] budgets vit_small_p16 -- K=5 depth rho=[0.178, 0.425, 0.589, 0.836, 1.0]
+```
+
+Every convolutional backbone was priced with **fvcore**. `vit_small_p16`,
+`deit_small` and `swin_tiny` fell back to the **analytic** counter. Both lines
+say `PASS`.
+
+**This module's own comment forbids exactly this:**
+
+> *"The SAME profiler and the SAME accounting convention must be used for every
+> architecture and every axis. A budget table built with fvcore for one model
+> and thop for another silently corrupts every transfer number."*
+
+The rule was written down and then not enforced, which is rule 7 in miniature —
+an invariant living in a comment rather than a mechanism.
+
+**Why the fallback is worse than a different-but-valid profiler.** The analytic
+counter hooks `Conv2d` and `Linear` only. For a transformer that **omits the
+attention matmuls entirely** — QK^T and AV. Those scale with tokens² while the
+linear parts scale with tokens, so the omission is *not* a constant factor that
+cancels in a ratio:
+
+- **depth axis:** ViT blocks are identical, so the undercount is roughly
+  proportional across prefixes and ρ_depth survives. Swin's stages change
+  resolution, so it does not.
+- **resolution axis:** attention is quadratic in tokens, linear parts are
+  linear. ρ_res is distorted for precisely the architectures the study is
+  about. The measured ViT ρ_res was `[0.126, 0.221, 0.343, 0.493, 1.0]` against
+  the CNNs' clean `[0.184, 0.327, 0.510, 0.735, 1.0]` = (r/224)².
+
+**ρ is DEFINED in FLOPs** (protocol §2.1). It is the normalisation that makes
+"did MSC transfer from ResNet to ViT?" a well-posed question at all. Pricing
+half the zoo with a counter that cannot see attention makes that question
+ill-posed while every individual table still looks reasonable.
+
+**Cause of the fvcore failure.** fvcore traces with `torch.jit`. Tracing a
+positional-embedding resample applies Python `round()` to what has become a
+tensor → `type Tensor doesn't define __round__ method`.
+
+**Contamination analysis.** No measurement affected — nothing has trained, and
+`budgets/*.json` from this preflight must be deleted before Phase 0 because the
+transformer tables were built by the wrong counter. **Every budget table
+produced before this fix is void.**
+
+**Fix, in two parts.**
+
+1. **`torch.utils.flop_counter.FlopCounterMode` is now the preferred
+   profiler.** It works by `__torch_dispatch__` rather than tracing, so there
+   is nothing to trip over, and it counts matmul and scaled-dot-product
+   attention natively. It reports true FLOPs, so no MAC doubling is applied.
+2. **A fallback now RAISES.** Silently switching profilers mid-zoo is the
+   defect; the escape hatch is `MSC_ALLOW_MIXED_PROFILER=1`, which has to be
+   asked for and which logs an ALARM naming the consequence.
+
+**Guards added:** 5 self-checks, plus NB1 now prints `M.profilers_used()` and
+**fails the GO gate** if more than one profiler priced the zoo. The first
+version of one check compared `.index()` over the whole source and matched the
+docstring explaining why fvcore is no longer first — the same
+prose-instead-of-code mistake the notebook validator already made twice. It now
+compares import statements.
+
+Self-checks 334 → **339**.
+
+---
+
+### D-46 · A preflight that fails on the intended configuration
+
+**Severity:** two red lines beside a real one · **Status:** **fixed**
+**Found:** 2026-08-08 from the user's NB1 output
+
+```
+39/42 checks passed
+  FAILED: HF token  -- from Kaggle Secrets or env
+  FAILED: HF repo reachable  -- Shanmuk4622/msc-cifar100
+  FAILED: imagenet100 present  -- packed ImageNet-100 not found...
+```
+
+Three failures, and **none of them is a defect**:
+
+| reported | actually |
+|---|---|
+| `HF token` | this programme is **deliberately local-only and offline**. There is no token by design |
+| `HF repo reachable` | ...and it names the **CIFAR** repo, a stale default |
+| `imagenet100 present` | the pack has not been built yet. That is the **next step**, not a fault |
+
+**Why this matters beyond tidiness.** A preflight that fails on the intended
+configuration teaches the operator to skim past red lines — which is the D-17
+and D-20 cost, arriving for the third time. Here it did real damage: two false
+failures sat beside a genuine one (**D-45**, the mixed profiler, which printed
+`PASS`), so the summary line pointed at the wrong things entirely.
+
+**And a fourth problem the same output revealed.** The dry-run cell raised:
+
+```
+RuntimeError: packed ImageNet-100 not found
+```
+
+The dry runs are **synthetic** — they push noise through the whole path and
+never open the dataset. But `Session.config()` called `prepare_data()`, which
+raised. So the cheapest and earliest check in the notebook could not run until
+after the most expensive prerequisite was complete. Exactly backwards: a
+config-level bug should surface *before* a 40-minute packing job, not after it.
+
+**Fix.**
+
+- HF checks are **skipped** when the session is local-only, and replaced by the
+  equivalents that matter here: results root writable (probe written and read
+  back) and enough free space for the atlas.
+- `HF_REPO` default corrected to `msc-imagenet100`, and it reads
+  `MSC_HF_REPO` from the environment.
+- **Three states, not two.** `preflight_summary()` separates `passed`,
+  `failed` and `todo`; a prerequisite that has not been done prints `[TODO]`
+  with the exact command, and does not count against the gate.
+- `Session.config(require_data=False)` and `prepare_data(required=False)`, so
+  the synthetic dry runs run before the pack exists.
+
+---
 
 ### D-44 · A default path named a drive that does not exist
 
@@ -692,6 +818,8 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-45 — one atlas, two FLOPs profilers.** fvcore priced the CNNs and failed on ViT/DeiT/Swin, whose tables were then built by a counter that cannot see attention. rho is DEFINED in FLOPs. torch's flop_counter is now preferred and a fallback RAISES. **Every budget table built before this fix is void** |
+| 2026-08-08 | **D-46 — the preflight failed on the intended configuration.** HF checks in a local-only run, plus "not packed yet" reported as a failure — two false reds beside the genuine D-45, which printed PASS. Three states now, and the synthetic dry runs no longer require the pack |
 | 2026-08-08 | **D-44 — a default path named a drive that does not exist.** NB1 died twice on `WinError 3` for `D:\`, once in the bootstrap cell because `enforce_offline` made *import* depend on a writable directory. Defaults are now `None` and `resolve_storage()` picks the roomiest existing root, proving it by writing and reading back a probe file. Build-time guard: no notebook may contain a drive-letter literal |
 | 2026-08-08 | **First real measurement.** 6 of 8 architectures benchmarked. The plan's 235 GPU-hours was optimistic by 66%: the atlas is **391 GPU-h** and `vgg16` alone is **45%** of it. Cost model re-anchored on measurement (D-10's lesson) |
 | 2026-08-08 | **D-43 — the benchmark measured a machine the pipeline never uses.** `cudnn.benchmark=False` while every real run has it True; ResNet-50 read 82 img/s where ~180 is expected. One `set_perf_flags` now serves both |

@@ -106,7 +106,7 @@ SCRATCH_ROOT = Path("/kaggle/temp") if ON_KAGGLE else Path(
     os.environ.get("MSC_SCRATCH", Path.cwd() / "scratch"))
 
 # One repo per dataset. A second dataset gets `msc-tinyimagenet`, etc.
-HF_REPO = "Shanmuk4622/msc-cifar100"
+HF_REPO = os.environ.get("MSC_HF_REPO", "Shanmuk4622/msc-imagenet100")
 # Retained so older notebooks and the audit tool can still name the previous
 # two-repo layout.
 HF_MODEL_REPO = "Shanmuk4622/msc-kd"
@@ -3926,14 +3926,60 @@ def model_size_mb(model) -> float:
 #      StagedBackbone.forward_prefix exists and why we profile a wrapper that
 #      truncates rather than reading a mid-layer activation from a full pass.
 
-_PROFILER_CACHE: Dict[str, Any] = {}
+_PROFILER_CACHE: Dict[str, Any] = {
+    "allow_mixed": os.environ.get("MSC_ALLOW_MIXED_PROFILER", "") in ("1", "true"),
+}
+
+
+def profilers_used() -> Set[str]:
+    """Every profiler that has actually produced a number in this process.
+
+    More than one means the atlas is priced two ways and cross-architecture
+    comparison is invalid (D-45).
+    """
+    return set(_PROFILER_CACHE.get("used", set()))
 
 
 def _get_profiler() -> Tuple[str, Optional[Callable], str]:
-    """Pick one profiler and stick with it. fvcore > ptflops > thop > analytic."""
+    """Pick ONE profiler for the whole zoo and stick with it.
+
+    **D-45.** fvcore counts every convolutional backbone here and then fails on
+    ViT / DeiT / Swin with `type Tensor doesn't define __round__ method` -- it
+    traces with `torch.jit`, and tracing a positional-embedding resample trips
+    over a Python `round()` applied to what became a tensor. The old code logged
+    the failure and fell back to the analytic counter *per architecture*, so a
+    single atlas was priced with **two different profilers**.
+
+    That is the exact thing this module's own comment forbids, and it is worse
+    than it sounds: the analytic fallback hooks `Conv2d` and `Linear` only, so
+    for a transformer it **misses the attention matmuls entirely** -- QK^T and
+    AV. Those scale with tokens squared while the linear parts scale with
+    tokens, so the resolution axis is distorted for exactly the architectures
+    the study is about, and rho is DEFINED in FLOPs.
+
+    `torch.utils.flop_counter.FlopCounterMode` is preferred now: it works by
+    `__torch_dispatch__` rather than tracing, so there is nothing to trip over,
+    and it counts matmul and scaled-dot-product-attention natively. It reports
+    true FLOPs (2*m*n*k for a matmul), not MACs, so no doubling is applied.
+    """
     if "chosen" in _PROFILER_CACHE:
         return _PROFILER_CACHE["chosen"]
     chosen = ("analytic", None, "builtin")
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+
+        def _f(model, shape):
+            m = FlopCounterMode(display=False)
+            with m:
+                model(torch.zeros(*shape))
+            return int(m.get_total_flops())
+        # Prove it on a token model before adopting it. A profiler that works
+        # for ResNet and fails for ViT is how the atlas ended up mixed.
+        chosen = ("torch.flop_counter", _f, torch.__version__)
+        _PROFILER_CACHE["chosen"] = chosen
+        return chosen
+    except Exception:
+        pass
     try:
         import fvcore
         from fvcore.nn import FlopCountAnalysis
@@ -4004,9 +4050,27 @@ def measure_flops(model, shape) -> int:
     model = model.eval()
     try:
         if fn is not None:
-            return int(fn(model, tuple(shape)))
-    except Exception as e:
-        log(f"profiler {name} failed ({str(e)[:80]}); using analytic fallback", "FLOP")
+            n = int(fn(model, tuple(shape)))
+            _PROFILER_CACHE.setdefault("used", set()).add(name)
+            return n
+    except Exception as e:                                       # noqa: BLE001
+        # D-45. Falling back silently gives one atlas two profilers and two
+        # accounting conventions, which corrupts every cross-architecture
+        # number while every individual table still looks reasonable. The
+        # analytic counter hooks Conv2d and Linear only -- for a transformer
+        # that omits attention entirely.
+        if not _PROFILER_CACHE.get("allow_mixed"):
+            raise RuntimeError(
+                f"FLOPs profiler '{name}' failed on this model "
+                f"({type(e).__name__}: {str(e)[:120]}).\n"
+                f"Refusing to fall back: the rest of the zoo was priced with "
+                f"'{name}', and mixing profilers silently corrupts every "
+                f"transfer number (D-45). rho is DEFINED in FLOPs.\n"
+                f"Set MSC_ALLOW_MIXED_PROFILER=1 only if you accept that."
+            ) from e
+        log(f"profiler {name} failed ({str(e)[:80]}); ANALYTIC FALLBACK -- "
+            f"this table is not comparable to the others", "ALARM")
+    _PROFILER_CACHE.setdefault("used", set()).add("analytic")
     return _analytic_flops(model, tuple(shape))
 
 
@@ -9703,22 +9767,37 @@ class Session:
                   "nothing will survive this session ***")
 
     # ------------------------------------------------------------------
-    def prepare_data(self) -> Path:
-        if dataset_spec(self.dataset)["backend"] == "packed":
-            self.data_root = locate_imagenet100()
-            man = read_json(self.data_root / "manifest.json", {}) or {}
-            self.data_fingerprint = str(man.get("fingerprint", ""))
-        else:
-            self.data_root = locate_cifar100()
-            self.data_fingerprint = ""
+    def prepare_data(self, required: bool = True) -> Optional[Path]:
+        """Locate the dataset. `required=False` returns None instead of raising.
+
+        D-46. The dry runs are SYNTHETIC -- they push noise through the whole
+        path and never open the dataset. But `config()` called this, which
+        raised when the pack did not exist, so the cheapest and earliest check
+        in the whole notebook could not run until after the most expensive
+        prerequisite was complete. Exactly backwards: a config-level bug should
+        surface before a 40-minute packing job, not after it.
+        """
+        try:
+            if dataset_spec(self.dataset)["backend"] == "packed":
+                self.data_root = locate_imagenet100()
+                man = read_json(self.data_root / "manifest.json", {}) or {}
+                self.data_fingerprint = str(man.get("fingerprint", ""))
+            else:
+                self.data_root = locate_cifar100()
+                self.data_fingerprint = ""
+        except Exception:                                        # noqa: BLE001
+            if required:
+                raise
+            self.data_root, self.data_fingerprint = None, ""
         return self.data_root
 
     def config(self, arch: str, seed: int = 1, method: str = "base",
-               **overrides) -> Dict[str, Any]:
+               require_data: bool = True, **overrides) -> Dict[str, Any]:
         if self.data_root is None:
-            self.prepare_data()
+            self.prepare_data(required=require_data)
         cfg = base_config(arch, self.dataset, seed, phase=self.phase, method=method)
-        cfg.update({"data_root": str(self.data_root),
+        cfg.update({"data_root": str(self.data_root) if self.data_root
+                    else "<not packed yet>",
                     "output_root": str(self.work)})
         # The fingerprint is set BEFORE overrides and BEFORE the hash, because
         # it must participate in config_hash: two runs that disagree about which
@@ -10369,6 +10448,17 @@ class Session:
         return n
 
 
+def preflight_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Three states, not two. A prerequisite that has not been done yet is not
+    a failure, and lumping the two together makes the count unreadable (D-46)."""
+    ch = report.get("checks", {})
+    passed = [k for k, v in ch.items() if v.get("ok") is True]
+    failed = [k for k, v in ch.items() if v.get("ok") is False]
+    todo = [k for k, v in ch.items() if v.get("ok") is None]
+    return {"passed": passed, "failed": failed, "todo": todo,
+            "ok": not failed, "n": len(ch)}
+
+
 def preflight(session: "Session", archs: Optional[Sequence[str]] = None,
               quick: bool = True) -> Dict[str, Any]:
     """Cheap checks that catch the expensive mistakes.
@@ -10399,19 +10489,57 @@ def preflight(session: "Session", archs: Optional[Sequence[str]] = None,
             if torch.cuda.is_available() else "CPU only -- training will be impractically slow")
     rec("pandas", pd is not None)
     rec("parquet engine", _parquet_ok(), "pyarrow or fastparquet")
-    rec("HF token", bool(session.hub.token), "from Kaggle Secrets or env")
-    rec("HF repo reachable", session.hub.enabled and session.hub.hub is not None,
-        session.hub.repo_id)
+    # D-46. These used to run unconditionally and FAIL in a local-only session
+    # -- reporting "no HF token" and naming the CIFAR repo -- on a programme
+    # that is deliberately offline and stores nothing remotely. A preflight
+    # that fails on the intended configuration teaches the operator to ignore
+    # it, which is the D-17 cost, and the two red lines here sat beside a real
+    # failure the operator then had to disentangle.
+    if getattr(session, "local_only", False):
+        rec("store: LOCAL ONLY (HuggingFace not used)", True,
+            "nothing is uploaded, nothing is fetched, nothing is deleted")
+        _rr = Path(session.work)
+        try:
+            _pb = _rr / ".msc_preflight_probe"
+            ensure_dir(_rr)
+            _pb.write_text("ok", encoding="utf-8")
+            _ok = _pb.read_text(encoding="utf-8") == "ok"
+            _pb.unlink()
+        except Exception as _e:                                  # noqa: BLE001
+            _ok, _e = False, str(_e)[:120]
+        rec("results root writable", _ok,
+            f"{_rr}  (probe written and read back)" if _ok else str(_e))
+        _free = free_mb(session.work) / 1024
+        rec("results root has room", _free > 120,
+            f"{_free:.0f} GB free, ~120 GB recommended for the full atlas")
+    else:
+        rec("HF token", bool(session.hub.token), "from Kaggle Secrets or env")
+        rec("HF repo reachable",
+            session.hub.enabled and session.hub.hub is not None,
+            session.hub.repo_id)
     rec("working disk >2 GB", free_mb(session.work) > 2048, f"{free_mb(session.work)} MB")
     rec("scratch disk >5 GB", free_mb(session.scratch) > 5120,
         f"{free_mb(session.scratch)} MB")
 
+    # D-46. "The dataset has not been packed yet" is a PREREQUISITE NOT DONE,
+    # not a broken pipeline, and at this point in NB1 it is the expected state.
+    # Reporting it as FAIL alongside genuine failures makes the summary line
+    # unreadable and hides which of them actually needs thought.
     try:
-        root = session.prepare_data()
-        ok, detail = data_present(_ds, root)
-        rec(f"{_ds} present", ok, detail)
-    except Exception as e:
-        rec(f"{_ds} present", False, str(e)[:160])
+        root = session.prepare_data(required=False)
+        if root is None:
+            report["checks"][f"{_ds} packed"] = {"ok": None,
+                                                 "detail": "not built yet"}
+            print(f"  [TODO] {_ds} packed  -- not built yet. Run:")
+            print(f"         python tools/pack_imagenet100.py "
+                  f"--src <folder with train/> --out <DATA_DIR>")
+            print(f"         Everything below runs on synthetic data and does "
+                  f"not need it.")
+        else:
+            ok, detail = data_present(_ds, root)
+            rec(f"{_ds} packed", ok, detail)
+    except Exception as e:                                       # noqa: BLE001
+        rec(f"{_ds} packed", False, str(e)[:160])
 
     if _TORCH_OK and archs:
         dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -10648,6 +10776,13 @@ def _selftest() -> bool:
             _failed.append(name)
         d = str(detail)
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {d}" if d else ""))
+
+    def _src_of_module() -> str:
+        try:
+            return Path(globals().get("__file__", "msc_lib.py")).read_text(
+                encoding="utf-8")
+        except Exception:                                        # noqa: BLE001
+            return ""
 
     def _raises(fn, exc=Exception) -> bool:
         """Assert a call fails, and fails with the RIGHT exception.
@@ -12086,6 +12221,33 @@ def _selftest() -> bool:
     check("the ImageNet recipe never asks for local cleanup",
           base_config("resnet50", "imagenet100")["cleanup_local_after_complete"]
           is False)
+
+    print("one FLOPs profiler for the whole zoo (D-45)")
+    check("a profiler fallback RAISES rather than switching silently",
+          "Refusing to fall back" in _insp.getsource(measure_flops),
+          "fvcore priced the CNNs and failed on ViT/DeiT/Swin, so one atlas "
+          "was measured two ways -- and the analytic fallback hooks Conv2d and "
+          "Linear only, losing a transformer's attention matmuls entirely")
+    check("...and the escape hatch is explicit, not a default",
+          "MSC_ALLOW_MIXED_PROFILER" in _insp.getsource(measure_flops)
+          or "MSC_ALLOW_MIXED_PROFILER" in _src_of_module(),
+          "mixing is possible but has to be asked for")
+    # Compare IMPORT STATEMENTS, not any mention of the names. The first
+    # version compared `.index()` over the whole source and matched the
+    # docstring that explains why fvcore is no longer first -- the same
+    # prose-instead-of-code mistake the notebook validator already made twice.
+    _gp = _insp.getsource(_get_profiler)
+    _i_fc = _gp.find("from torch.utils.flop_counter import")
+    _i_fv = _gp.find("import fvcore")
+    check("torch's flop counter is IMPORTED before fvcore",
+          _i_fc >= 0 and _i_fv >= 0 and _i_fc < _i_fv,
+          "it dispatches instead of tracing, so a positional-embedding "
+          "resample cannot trip it, and it counts attention natively")
+    check("profilers_used() reports what actually produced numbers",
+          isinstance(profilers_used(), set))
+    check("the analytic fallback is documented as conv+linear only",
+          "conv + linear only" in _insp.getsource(_analytic_flops),
+          "that omission is the whole defect for a transformer")
 
     print("storage resolution (D-44)")
     _cands = storage_candidates()

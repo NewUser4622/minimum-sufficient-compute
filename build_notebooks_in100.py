@@ -384,13 +384,29 @@ failure going unrecorded.
 """),
         code(f"""
 report = M.preflight(sess, archs=M.zoo_for_dataset('{DATASET}'), quick=False)
-n_ok = sum(1 for v in report['checks'].values() if v['ok'])
-n_all = len(report['checks'])
+summ = M.preflight_summary(report)
+failed = summ['failed']
+
 print()
-print(f'{{n_ok}}/{{n_all}} checks passed')
-failed = [k for k, v in report['checks'].items() if not v['ok']]
+print(f"{{len(summ['passed'])}} passed, {{len(failed)}} failed, "
+      f"{{len(summ['todo'])}} not yet done, of {{summ['n']}}")
+for k in summ['todo']:
+    print(f'  TODO   {{k}}  -- a prerequisite, not a failure')
 for k in failed:
-    print(f'  FAILED: {{k}}  -- {{report["checks"][k]["detail"]}}')
+    print(f'  FAILED {{k}}  -- {{report["checks"][k]["detail"]}}')
+
+# D-45: one profiler for the whole zoo, or cross-architecture rho is invalid.
+used = M.profilers_used()
+print()
+print(f'FLOPs profiler: {{sorted(used)}}')
+if len(used) > 1:
+    print('  *** MORE THAN ONE PROFILER PRICED THIS ZOO. Cross-architecture')
+    print('  *** transfer numbers would be invalid: the analytic fallback')
+    print('  *** counts Conv2d and Linear only, so a transformer loses its')
+    print('  *** attention matmuls entirely, and rho is DEFINED in FLOPs.')
+    failed = failed + ['mixed FLOPs profilers']
+else:
+    print('  one profiler for all eight -- rho is comparable across the zoo')
 """),
         md("""
 ---
@@ -413,8 +429,10 @@ frame → parquet write → **parquet read back** → `compute_msc`.
 """),
         code(f"""
 bad = []
+# require_data=False: these are SYNTHETIC. They never open the dataset, so
+# they must not wait on a 40-minute packing job to tell you a config is broken.
 for arch in M.zoo_for_dataset('{DATASET}'):
-    cfg = sess.config(arch, seed=1)
+    cfg = sess.config(arch, seed=1, require_data=False)
     for name, fn in (('backbone', M.backbone_dry_run), ('oracle', M.oracle_dry_run)):
         ok, why = fn(cfg)
         print(f'  [{{"OK" if ok else "FAIL"}}] {{arch:16s}} {{name:9s}} {{why}}')

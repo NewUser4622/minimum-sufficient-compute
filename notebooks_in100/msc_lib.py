@@ -150,9 +150,36 @@ def now_iso() -> str:
 
 
 def ensure_dir(p) -> Path:
+    """Create a directory, or say *why not* in words the operator can act on.
+
+    D-44. A default path pointed at `D:\\` on a machine with no D: drive, and
+    the failure surfaced as
+
+        FileNotFoundError: [WinError 3] The system cannot find the path
+        specified: 'D:\\'
+
+    forty lines deep in `pathlib.mkdir`, from a call two frames inside library
+    import. Nothing in that traceback says "edit the path at the top of the
+    notebook", which is the entire remedy.
+    """
     p = Path(p)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except (FileNotFoundError, NotADirectoryError, OSError) as e:
+        anchor = p
+        while anchor.parent != anchor and not anchor.parent.exists():
+            anchor = anchor.parent
+        raise OSError(
+            f"cannot create {p}\n"
+            f"  the first missing level is: {anchor}\n"
+            f"  ({type(e).__name__}: {e})\n"
+            f"  If that is a drive letter, the drive does not exist on this "
+            f"machine.\n"
+            f"  Set DATA_DIR / MSC_ROOT at the top of the notebook to a path "
+            f"that does,\n"
+            f"  or leave them as None and they will be chosen automatically."
+        ) from e
 
 
 def _atomic_replace(tmp, path, attempts: int = 20, pause: float = 0.15) -> None:
@@ -1120,8 +1147,24 @@ def enforce_offline(verbose: bool = True) -> Dict[str, str]:
     Call this BEFORE importing anything that might fetch. `msc_lib` calls it at
     import time when `MSC_OFFLINE` is set, which is the default for the
     ImageNet-100 profile.
+
+    D-44. This used to `ensure_dir(TORCH_HOME)` unconditionally, so **importing
+    the library failed** when `MSC_SCRATCH` pointed somewhere that did not
+    exist. An import that depends on a writable directory turns a
+    fix-one-line-and-re-run into a traceback with no obvious cause, and it
+    happens in the bootstrap cell before the operator has reached the cell that
+    sets the path. A cache directory is a convenience; nothing here needs it to
+    exist in order to import.
     """
-    ensure_dir(Path(OFFLINE_ENV["TORCH_HOME"]))
+    try:
+        ensure_dir(Path(OFFLINE_ENV["TORCH_HOME"]))
+    except Exception:                                            # noqa: BLE001
+        import tempfile as _tf
+        OFFLINE_ENV["TORCH_HOME"] = str(Path(_tf.gettempdir()) / "msc_torch")
+        try:
+            ensure_dir(Path(OFFLINE_ENV["TORCH_HOME"]))
+        except Exception:                                        # noqa: BLE001
+            pass
     for k, v in OFFLINE_ENV.items():
         os.environ.setdefault(k, v)
     if verbose:
@@ -2432,6 +2475,143 @@ def locate_imagenet100(prefer_scratch: bool = True, verbose: bool = True) -> Pat
         "then either set MSC_IN100_DIR=<dest>, place it at "
         f"{SCRATCH_ROOT / 'data' / 'in100'}, or attach it as a Kaggle Dataset.\n"
         f"Looked in: {[str(c) for c in cands[:8]]}")
+
+
+def storage_candidates(min_gb: float = 0.0) -> List[Dict[str, Any]]:
+    """Every writable root on this machine, with free space, largest first.
+
+    Windows has no `/`, so "somewhere with room" has to be discovered rather
+    than assumed. Drive letters are probed for existence; a machine with no
+    `D:` simply does not report one, which is the whole point (D-44).
+    """
+    roots: List[Path] = []
+    if os.name == "nt":
+        roots += [Path(f"{c}:\\") for c in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                  if Path(f"{c}:\\").exists()]
+    else:
+        roots += [Path("/"), Path.home()]
+    roots.append(Path.cwd())
+
+    out, seen = [], set()
+    for r in roots:
+        try:
+            key = str(r.resolve()).lower()
+            if key in seen or not r.exists():
+                continue
+            seen.add(key)
+            u = shutil.disk_usage(r)
+            free = u.free / 2**30
+            if free >= min_gb:
+                out.append({"root": str(r), "free_gb": free,
+                            "total_gb": u.total / 2**30})
+        except Exception:                                        # noqa: BLE001
+            continue
+    return sorted(out, key=lambda d: -d["free_gb"])
+
+
+def resolve_storage(data_dir=None, results_root=None,
+                    need_data_gb: float = 26.0,
+                    need_results_gb: float = 120.0,
+                    verbose: bool = True) -> Dict[str, Any]:
+    """Decide where the pack and the results live, and PROVE both are usable.
+
+    `None` means "choose for me": the roomiest drive that actually exists gets
+    `msc_data/in100` and `msc_results`. A default that names a drive letter is
+    wrong on any machine without that letter, and the resulting
+    `FileNotFoundError: [WinError 3] ... 'D:\\\\'` names neither the setting nor
+    the file that has to change (D-44).
+
+    Writability is established by **writing a probe file and reading it back**,
+    not by `os.access` -- which lies on Windows network shares and on
+    permission-inherited folders. Same discipline as `verify_run_artifacts`:
+    presence is not usability.
+    """
+    report: Dict[str, Any] = {"ok": True, "problems": [], "notes": []}
+    cands = storage_candidates()
+
+    def _pick(kind, need):
+        for c in cands:
+            if c["free_gb"] >= need:
+                return Path(c["root"]) / ("msc_data/in100" if kind == "data"
+                                          else "msc_results")
+        return None
+
+    if data_dir is None:
+        # An existing pack anywhere beats a fresh guess.
+        for c in cands:
+            for sub in ("msc_data/in100", "in100", "data/in100"):
+                p = Path(c["root"]) / sub
+                if _has_imagenet100(p):
+                    data_dir = p
+                    report["notes"].append(f"found an existing pack at {p}")
+                    break
+            if data_dir:
+                break
+    if data_dir is None:
+        data_dir = _pick("data", need_data_gb)
+    if results_root is None:
+        results_root = _pick("results", need_results_gb)
+
+    if data_dir is None or results_root is None:
+        report["ok"] = False
+        report["problems"].append(
+            f"no drive has enough free space "
+            f"(need {need_data_gb:.0f} GB for the pack and "
+            f"{need_results_gb:.0f} GB for results). "
+            f"Found: {[(c['root'], round(c['free_gb'])) for c in cands]}")
+        return {**report, "data_dir": data_dir, "results_root": results_root,
+                "candidates": cands}
+
+    data_dir, results_root = Path(data_dir), Path(results_root)
+    for label, path, need in (("results", results_root, need_results_gb),
+                              ("data", data_dir, need_data_gb)):
+        try:
+            ensure_dir(path)
+        except Exception as e:                                   # noqa: BLE001
+            report["ok"] = False
+            report["problems"].append(f"{label}: {e}")
+            continue
+        try:
+            probe = path / ".msc_write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            if probe.read_text(encoding="utf-8") != "ok":
+                raise OSError("wrote a probe file and read back something else")
+            probe.unlink()
+        except Exception as e:                                   # noqa: BLE001
+            report["ok"] = False
+            report["problems"].append(
+                f"{label}: {path} is not writable ({type(e).__name__}: {e})")
+            continue
+        free = shutil.disk_usage(path).free / 2**30
+        report[f"{label}_free_gb"] = free
+        if free < need:
+            report["problems"].append(
+                f"{label}: {path} has {free:.0f} GB free, "
+                f"{need:.0f} GB recommended")
+            report["ok"] = False
+
+    report.update({"data_dir": str(data_dir), "results_root": str(results_root),
+                   "candidates": cands})
+    if verbose:
+        print("storage")
+        for c in cands:
+            print(f"    {c['root']:<6s} {c['free_gb']:7.1f} GB free of "
+                  f"{c['total_gb']:7.1f}")
+        print(f"    data    -> {data_dir}   "
+              f"({report.get('data_free_gb', 0):.0f} GB free, "
+              f"need ~{need_data_gb:.0f})")
+        print(f"    results -> {results_root}   "
+              f"({report.get('results_free_gb', 0):.0f} GB free, "
+              f"need ~{need_results_gb:.0f})")
+        for n in report["notes"]:
+            print(f"    note: {n}")
+        for pb in report["problems"]:
+            print(f"    *** {pb}")
+        print("    " + ("both roots exist, are writable, and were verified by "
+                        "writing and reading back a probe file"
+                        if report["ok"] else
+                        "*** FIX THE ABOVE before running anything else"))
+    return report
 
 
 def data_present(dataset: str, root) -> Tuple[bool, str]:
