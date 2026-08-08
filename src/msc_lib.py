@@ -2698,9 +2698,11 @@ if _TORCH_OK:
         supports_native_resolution = True
 
         def __init__(self, stem: nn.Module, blocks: Sequence[nn.Module],
-                     classifier: nn.Module, feature_dim_fn: Callable[[int], int],
+                     classifier: nn.Module,
+                     feature_dim_fn: Optional[Callable[[int], int]] = None,
                      depth_fractions: Sequence[float] = DEPTH_FRACTIONS,
-                     final_norm: Optional[nn.Module] = None):
+                     final_norm: Optional[nn.Module] = None,
+                     probe_res: Optional[int] = None):
             super().__init__()
             self.stem = stem
             self.blocks = nn.ModuleList(blocks)
@@ -2747,12 +2749,61 @@ if _TORCH_OK:
             self.stage_cuts = tuple(uniq)
             self.requested_depth_fractions = tuple(depth_fractions)
             self.depth_fractions = tuple(c / n for c in uniq)
-            self.feature_dims = tuple(feature_dim_fn(c - 1) for c in self.stage_cuts)
+            # ASK THE MODEL (rule 2). `feature_dim_fn` is a hand-written map
+            # from block index to channel count, and writing one means reading
+            # somebody else's module internals: `b.conv3.out_channels`,
+            # `b.branch2[-2].out_channels`, `m.reduction.out_features`. Three of
+            # those four guesses were right and one was not -- ShuffleNetV2's
+            # `branch2[-2]` is a BatchNorm2d, which has no `out_channels`, and
+            # the architecture failed to build at all.
+            #
+            # A literal that is right for three of four cases is exactly the
+            # thing rule 2 is about, and the fix is not to correct the index.
+            # It is to stop guessing: run one forward pass and read the shapes
+            # off the tensors the backbone actually produces. That is definitive
+            # by construction and cannot drift when torchvision reorders a
+            # block.
+            if feature_dim_fn is not None:
+                self.feature_dims = tuple(feature_dim_fn(c - 1)
+                                          for c in self.stage_cuts)
+            else:
+                self.feature_dims = self._probe_feature_dims(
+                    int(probe_res or 224))
             if len(uniq) < len(depth_fractions):
                 log(f"{type(self).__name__} has only {n} blocks -- using "
                     f"K={len(uniq)} depth exits at "
                     f"{[round(f,2) for f in self.depth_fractions]} instead of "
                     f"{list(depth_fractions)}", "ZOO")
+
+        def _probe_feature_dims(self, res: int) -> Tuple[int, ...]:
+            """Channel count at every exit, read off a real forward pass.
+
+            Handles both layouts the zoo contains: (B,C,H,W) for convolutional
+            backbones and (B,N,C) for token models. Subclasses that speak a
+            third layout normalise it in `forward_features` -- SwinBackbone
+            permutes NHWC to NCHW there -- so this sees only the two.
+            """
+            was = self.training
+            self.eval()
+            try:
+                try:
+                    dev = next(self.parameters()).device
+                except StopIteration:
+                    dev = torch.device("cpu")
+                with torch.no_grad():
+                    feats = self.forward_features(
+                        torch.zeros(1, 3, res, res, device=dev))
+            finally:
+                self.train(was)
+            dims = []
+            for f in feats:
+                if f.dim() == 4:
+                    dims.append(int(f.shape[1]))          # (B, C, H, W)
+                elif f.dim() == 3:
+                    dims.append(int(f.shape[2]))          # (B, N, C)
+                else:
+                    dims.append(int(f.reshape(f.shape[0], -1).shape[1]))
+            return tuple(dims)
 
         def _run_to(self, x, upto_block: int):
             x = self.stem(x)
@@ -3265,7 +3316,8 @@ if _TORCH_OK:
                 f"torchvision is required for the ImageNet zoo ({e}). "
                 f"pip install torchvision") from e
 
-    def build_resnet_imagenet(depth: int, num_classes: int = 100) -> StagedBackbone:
+    def build_resnet_imagenet(depth: int, num_classes: int = 100,
+                              probe_res: int = 224) -> StagedBackbone:
         """torchvision ResNet-18/50, decomposed by residual block.
 
         8 blocks for R18, 16 for R50 -- comfortably more than the 5 depth
@@ -3275,16 +3327,15 @@ if _TORCH_OK:
         tvm = _tv()
         net = {18: tvm.resnet18, 50: tvm.resnet50}[depth](weights=None)
         stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
-        blocks, dims = [], []
-        for layer in (net.layer1, net.layer2, net.layer3, net.layer4):
-            for b in layer:
-                blocks.append(b)
-                dims.append(b.conv3.out_channels if hasattr(b, "conv3")
-                            else b.conv2.out_channels)
-        return StagedBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
-                              lambda i: dims[i])
+        blocks = [b for layer in (net.layer1, net.layer2, net.layer3, net.layer4)
+                  for b in layer]
+        bb = StagedBackbone(stem, blocks, nn.Identity(), None,
+                            probe_res=probe_res)
+        bb.classifier = nn.Linear(bb.feature_dims[-1], num_classes)
+        return bb
 
-    def build_vgg_imagenet(depth: int = 16, num_classes: int = 100) -> StagedBackbone:
+    def build_vgg_imagenet(depth: int = 16, num_classes: int = 100,
+                           probe_res: int = 224) -> StagedBackbone:
         """torchvision VGG-16 with BN, conv stack only, GAP+Linear head."""
         tvm = _tv()
         net = {11: tvm.vgg11_bn, 13: tvm.vgg13_bn,
@@ -3310,30 +3361,29 @@ if _TORCH_OK:
                 blocks.append(m)
                 i += 1
             dims.append(cin)
-        return StagedBackbone(nn.Identity(), blocks,
-                              nn.Linear(dims[-1], num_classes), lambda i: dims[i])
+        bb = StagedBackbone(nn.Identity(), blocks, nn.Identity(), None,
+                            probe_res=probe_res)
+        bb.classifier = nn.Linear(bb.feature_dims[-1], num_classes)
+        return bb
 
-    def build_shufflenetv2_imagenet(num_classes: int = 100,
-                                    width: str = "1.0x") -> StagedBackbone:
+    def build_shufflenetv2_imagenet(num_classes: int = 100, width: str = "1.0x",
+                                    probe_res: int = 224) -> StagedBackbone:
         tvm = _tv()
         net = {"0.5x": tvm.shufflenet_v2_x0_5, "1.0x": tvm.shufflenet_v2_x1_0,
                "1.5x": tvm.shufflenet_v2_x1_5}[width](weights=None)
         stem = nn.Sequential(net.conv1, net.maxpool)
-        blocks, dims = [], []
-        for stage in (net.stage2, net.stage3, net.stage4):
-            for b in stage:
-                blocks.append(b)
-                dims.append(b.branch2[-2].out_channels)
+        blocks = [b for stage in (net.stage2, net.stage3, net.stage4) for b in stage]
         blocks.append(net.conv5)
-        dims.append(net.conv5[0].out_channels)
-        return StagedBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
-                              lambda i: dims[i])
+        bb = StagedBackbone(stem, blocks, nn.Identity(), None,
+                            probe_res=probe_res)
+        bb.classifier = nn.Linear(bb.feature_dims[-1], num_classes)
+        return bb
 
     def build_convnext_tiny(num_classes: int = 100,
                             dims: Sequence[int] = (96, 192, 384, 768),
                             depths: Sequence[int] = (3, 3, 9, 3),
-                            drop_path: float = 0.1,
-                            stem_patch: int = 4) -> StagedBackbone:
+                            drop_path: float = 0.1, stem_patch: int = 4,
+                            probe_res: int = 224) -> StagedBackbone:
         """ConvNeXt-T geometry, built from the same blocks as the CIFAR femto.
 
         Ours rather than torchvision's, because `_ConvNeXtBlock` and
@@ -3358,7 +3408,8 @@ if _TORCH_OK:
                 k += 1
         return StagedBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
                               lambda i: bdims[i],
-                              final_norm=_LayerNorm2d(dims[-1]))
+                              final_norm=_LayerNorm2d(dims[-1]),
+                              probe_res=probe_res)
 
     def build_vit_small(num_classes: int = 100, dim: int = 384, depth: int = 12,
                         heads: int = 6, patch: int = 16, img: int = 224,
@@ -3413,23 +3464,24 @@ if _TORCH_OK:
                 h = self.final_norm(h)
             return self.classifier(self.pooled(h))
 
-    def build_swin_tiny(num_classes: int = 100) -> "SwinBackbone":
+    def build_swin_tiny(num_classes: int = 100,
+                        probe_res: int = 224) -> "SwinBackbone":
         tvm = _tv()
         net = tvm.swin_t(weights=None)
         feats = list(net.features)
         stem = feats[0]                                    # patch embed
-        blocks, dims = [], []
+        blocks = []
         for m in feats[1:]:
             if isinstance(m, nn.Sequential):               # a stage of blocks
-                for b in m:
-                    blocks.append(b)
-                    dims.append(b.norm1.normalized_shape[0])
+                blocks.extend(list(m))
             else:                                          # PatchMerging
                 blocks.append(m)
-                dims.append(m.reduction.out_features)
-        return SwinBackbone(stem, blocks, nn.Linear(dims[-1], num_classes),
-                            lambda i: dims[i],
-                            final_norm=_LayerNorm2d(dims[-1]))
+        bb = SwinBackbone(stem, blocks, nn.Identity(), None,
+                          probe_res=probe_res)
+        c = bb.feature_dims[-1]
+        bb.final_norm = _LayerNorm2d(c)
+        bb.classifier = nn.Linear(c, num_classes)
+        return bb
 
 
 # --------------------------------------------------------------------------
@@ -3541,6 +3593,12 @@ def build_model(arch: str, num_classes: Optional[int] = None,
 
     kind, kwargs = meta["builder"]
     kwargs = dict(kwargs)
+    # The ImageNet builders read their exit dimensions off a real forward pass,
+    # so they need to know what resolution to probe at. Taken from the dataset,
+    # never defaulted -- probing a 224px model at 32px would produce feature
+    # maps of the wrong spatial size and, for Swin, would not run at all.
+    if meta.get("zoo") == "imagenet" and dataset is not None:
+        kwargs.setdefault("probe_res", native_res(dataset))
     kwargs.update(overrides)
     fn = {
         "resnet": build_resnet_cifar, "wrn": build_wrn, "vgg": build_vgg,
@@ -5693,7 +5751,9 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
             sched.step()
 
         stage = "optimisation_health"
-        _h, _flat = optimisation_health(model)
+        # Four values, not two. Unpacking it wrongly is the kind of thing that
+        # only a dry run which actually CALLS it can find -- which is the point.
+        _wn, _un, _ratio, _flat = optimisation_health(model)
 
         stage = "evaluate"
         val = evaluate(model, loader, dev, amp=amp, criterion=crit,
@@ -5712,7 +5772,10 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
                    "val_accuracy": float(val["accuracy"]),
                    "learning_rate": float(opt.param_groups[0]["lr"]),
                    "amp_enabled": bool(amp)}
-            row.update({k: v for k, v in _h.items() if k in _HISTORY_SET})
+            row.update({k: v for k, v in
+                        {"weight_norm": _wn, "update_norm": _un,
+                         "update_to_weight_ratio": _ratio}.items()
+                        if k in _HISTORY_SET})
             # strict=True: an unknown column RAISES and names the column you
             # probably meant. This is the check that would have caught D-22's
             # five wrong names in microseconds instead of at the end of epoch 0
@@ -5783,7 +5846,7 @@ def oracle_dry_run(cfg: Dict[str, Any], device=None,
         bb = build_model(cfg["arch"], n_cls, dataset=ds).to(dev).eval()
         # K from the model. Never a literal -- D-01b, D-28 and D-33 were all
         # this, and D-33 was a hardcoded 5 inside the check written for D-28.
-        me = MultiExit(bb, n_cls).to(dev).eval()
+        me = MultiExitModel(bb, n_cls, freeze=True).to(dev).eval()
         n_heads = len(me.heads)
         if n_heads != len(bb.feature_dims):
             return False, (f"MultiExit built {n_heads} heads for a backbone "
@@ -11035,6 +11098,152 @@ def _selftest() -> bool:
           "resolve_meta" in _insp.getsource(BackgroundUploader.files_present),
           "the repo-info body was silently truncated mid-JSON at ~69 KB and the "
           "cut landed just past `vgg8`, exactly where the missing runs were")
+
+    print("names and arities resolve without running anything")
+    # Three of the five offline-verify failures were things a torch-free check
+    # can catch, and all three reached the user because the only thing that
+    # could find them needed a GPU:
+    #
+    #   NameError: name 'MultiExit' is not defined     (the class is MultiExitModel)
+    #   ValueError: too many values to unpack          (optimisation_health returns 4)
+    #   AttributeError: 'BatchNorm2d' has no 'out_channels'  (guessed at internals)
+    #
+    # None of them needed a model, a dataset or a device. They needed somebody
+    # to compare a name against what exists -- which is rule 3 generalised from
+    # column names to every name.
+    import ast as _a2
+
+    def _free_names(fn) -> Set[str]:
+        """Names a function READS that it does not itself bind."""
+        try:
+            t = _a2.parse(textwrap.dedent(_insp.getsource(fn)))
+        except Exception:                                        # noqa: BLE001
+            return set()
+        bound, used = set(), set()
+        for nd in _a2.walk(t):
+            if isinstance(nd, _a2.Name):
+                (bound if isinstance(nd.ctx, _a2.Store) else used).add(nd.id)
+            elif isinstance(nd, (_a2.FunctionDef, _a2.AsyncFunctionDef)):
+                bound.add(nd.name)
+                for arg in list(nd.args.args) + list(nd.args.kwonlyargs):
+                    bound.add(arg.arg)
+                if nd.args.vararg:
+                    bound.add(nd.args.vararg.arg)
+                if nd.args.kwarg:
+                    bound.add(nd.args.kwarg.arg)
+            elif isinstance(nd, _a2.ExceptHandler) and nd.name:
+                bound.add(nd.name)
+            elif isinstance(nd, (_a2.Import, _a2.ImportFrom)):
+                for al in nd.names:
+                    bound.add((al.asname or al.name).split(".")[0])
+            elif isinstance(nd, _a2.ClassDef):
+                bound.add(nd.name)
+            elif isinstance(nd, _a2.comprehension):
+                for sub in _a2.walk(nd.target):
+                    if isinstance(sub, _a2.Name):
+                        bound.add(sub.id)
+        return used - bound
+
+    def _module_level_names() -> Set[str]:
+        """Every name this module defines AT MODULE SCOPE, including the ones
+        inside `if _TORCH_OK:` blocks.
+
+        `globals()` is the wrong universe here. Half this file -- `ExitHead`,
+        `MultiExitModel`, `MSCLoss`, `MSCStudent`, `_PrefixWrapper` -- lives
+        under a torch guard, so on a machine without torch those names are
+        genuinely absent and the check would flag five false positives and be
+        switched off within a day. They exist on the machine that runs the
+        experiment, which is the machine the check is about.
+
+        Parsing the source gets the real answer on both.
+        """
+        try:
+            t = _a2.parse(Path(globals().get("__file__", "msc_lib.py")).read_text(
+                encoding="utf-8"))
+        except Exception:                                        # noqa: BLE001
+            return set()
+        out: Set[str] = set()
+
+        def walk_body(body):
+            for nd in body:
+                if isinstance(nd, (_a2.FunctionDef, _a2.AsyncFunctionDef,
+                                   _a2.ClassDef)):
+                    out.add(nd.name)
+                elif isinstance(nd, _a2.Assign):
+                    for tg in nd.targets:
+                        if isinstance(tg, _a2.Name):
+                            out.add(tg.id)
+                elif isinstance(nd, _a2.AnnAssign) and isinstance(nd.target, _a2.Name):
+                    out.add(nd.target.id)
+                elif isinstance(nd, (_a2.Import, _a2.ImportFrom)):
+                    for al in nd.names:
+                        out.add((al.asname or al.name).split(".")[0])
+                elif isinstance(nd, (_a2.If, _a2.Try)):
+                    walk_body(nd.body)
+                    walk_body(getattr(nd, "orelse", []) or [])
+                    for h in getattr(nd, "handlers", []) or []:
+                        walk_body(h.body)
+        walk_body(t.body)
+        return out
+
+    _G = (set(globals()) | set(dir(__import__("builtins")))
+          | _module_level_names())
+    for _fn in (backbone_dry_run, oracle_dry_run, msckd_dry_run,
+                _imagenet_config, build_budget_table, verify_run_artifacts):
+        _un = sorted(n for n in _free_names(_fn) if n not in _G)
+        check(f"every name in {_fn.__name__} resolves", not _un,
+              f"unresolved: {_un}" if _un else
+              "would have caught `MultiExit` before it cost an offline run")
+
+    def _arity_ok(caller, callee_name: str, n_expected: int) -> bool:
+        """Is every tuple-unpack of `callee_name(...)` the right width?"""
+        try:
+            t = _a2.parse(textwrap.dedent(_insp.getsource(caller)))
+        except Exception:                                        # noqa: BLE001
+            return True
+        for nd in _a2.walk(t):
+            if isinstance(nd, _a2.Assign) and isinstance(nd.value, _a2.Call):
+                f = nd.value.func
+                if (getattr(f, "id", None) or getattr(f, "attr", None)) != callee_name:
+                    continue
+                for tg in nd.targets:
+                    if isinstance(tg, (_a2.Tuple, _a2.List)) \
+                            and len(tg.elts) != n_expected:
+                        return False
+        return True
+
+    for _fn in (backbone_dry_run, train_backbone):
+        check(f"{_fn.__name__} unpacks optimisation_health as 4 values",
+              _arity_ok(_fn, "optimisation_health", 4),
+              "it returns (weight_norm, update_norm, ratio, flat)")
+
+    print("the zoo asks the model instead of guessing (rule 2)")
+    # The ShuffleNetV2 failure was `b.branch2[-2].out_channels` on a
+    # BatchNorm2d. The index was wrong, but correcting the index would have
+    # been the wrong fix: three sibling builders made the same kind of guess
+    # and happened to be right. Feature dims now come from a forward probe, so
+    # there is nothing left to guess. This asserts the guessing did not return.
+    _FOREIGN = ("out_channels", "normalized_shape", "out_features", "num_features",
+                "branch2", "conv3", "reduction")
+    for _name in zoo_for_dataset("imagenet100"):
+        _kind = ZOO[_name]["builder"][0]
+        _bfn = {"resnet_in": "build_resnet_imagenet", "vgg_in": "build_vgg_imagenet",
+                "shufflenetv2_in": "build_shufflenetv2_imagenet",
+                "convnext_tiny": "build_convnext_tiny", "vit_small": "build_vit_small",
+                "swin_tiny": "build_swin_tiny"}[_kind]
+        _src = _insp.getsource(globals()[_bfn]) if _bfn in globals() else ""
+        _bad = [a for a in _FOREIGN if f".{a}" in _src]
+        check(f"{_bfn} does not introspect foreign module internals",
+              not _bad, f"found {_bad}" if _bad else
+              "feature dims come from a forward probe")
+    check("StagedBackbone can derive feature dims by probing",
+          "_probe_feature_dims" in _insp.getsource(StagedBackbone)
+          if _TORCH_OK else True)
+    check("build_model passes the dataset's resolution to the probe",
+          "probe_res" in _insp.getsource(build_model)
+          and "native_res(dataset)" in _insp.getsource(build_model),
+          "probing a 224px model at 32px gives the wrong spatial size, and "
+          "Swin would not run at all")
 
     print("offline and local-only operation")
     _env = enforce_offline(verbose=False)
