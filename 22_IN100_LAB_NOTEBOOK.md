@@ -29,7 +29,7 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
 | **Defects found this port** | **3** (D-37, D-38, D-39) · 3 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
-| **Artifacts** | `huggingface.co/datasets/Shanmuk4622/msc-imagenet100` — not yet created |
+| **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
 > **Nothing in this document is a scientific result.** No model has been
 > trained. Every number here is about the infrastructure.
