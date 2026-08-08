@@ -64,6 +64,7 @@ After this, unplug it.
 | ✅ | Zoo registered, dry runs written and wired in. |
 | ✅ | **Five notebooks generated** in `notebooks_in100/`, validated clean. |
 | ✅ | Throughput measured for 6 of 8 architectures (`benchmark/results/`). |
+| ⬜ | **Dataset not packed yet** — NB1 step 3 does it (`RUN_PACKER = True`). |
 | ⬜ | **Nothing has trained.** No architecture in this zoo has completed a run. |
 | ⬜ | `resnet50` and `vgg16` need re-measuring after D-43; `vit`/`deit` after D-42. |
 
@@ -107,14 +108,23 @@ This takes about 20 seconds and needs no GPU, no network and no dataset.
 
 Once. ~20–40 minutes on 24 cores. Needs **25 GB** free.
 
-Run **cell 2 of NB1 first** — it picks the storage roots and prints `DATA_DIR`.
-Then paste that into `--out`:
+**Easiest: do it from NB1.** Step 3 of the notebook runs the packer itself,
+as a subprocess with live output, using the `DATA_DIR` cell 2 already resolved
+and a `SRC_DIR` it auto-detects. Set `RUN_PACKER = True` and re-run that cell.
+It defaults to `False` so a 40-minute job never starts by accident.
+
+Or from a terminal, using the `DATA_DIR` cell 2 printed:
 
 ```
 python tools/pack_imagenet100.py ^
     --src "C:\Users\Administrator\Desktop\New folder" ^
     --out "<the DATA_DIR that cell 2 printed>"
 ```
+
+**Labels are folder-order.** Sorted WNIDs map to class 0–99 (`n01440764` → 0,
+`n01855672` → 99). Arbitrary and deterministic; nothing downstream depends on
+matching official ImageNet indices, and the mapping is published in
+`manifest.json`.
 
 **Do not hardcode a drive letter.** That was D-44: a default naming `D:\` on a
 machine with no D: drive, failing forty lines deep in `pathlib` with a message
