@@ -349,6 +349,94 @@ SESSION_PUBLIC = ({n for n in dir(M.Session) if not n.startswith("_")}
                   | _source_level_names(_LIBSRC, cls="Session"))
 
 
+def _signatures(path: Path, cls: str | None = None) -> dict:
+    """Parameter names and positional counts for every function in a source
+    file, or for the methods of one class.
+
+    D-47, one layer out. The notebook validator already checked that `M.x`
+    EXISTS. It did not check that the call matches `x`'s signature, so
+    `M.resume_acceptance_test(..., interrupt_after=2)` shipped -- the parameter
+    is `kill_at`. Every name in that line is real; the call is still wrong.
+
+    Names being real is not the same as calls being right, and this is the
+    third distinct place that distinction has cost something.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return {}
+    out: dict = {}
+
+    def sig(nd, drop_self=False):
+        aa = nd.args
+        pos = list(aa.posonlyargs) + list(aa.args)
+        if drop_self and pos and pos[0].arg in ("self", "cls"):
+            pos = pos[1:]
+        return {"min": len(pos) - len(aa.defaults), "max": len(pos),
+                "star": aa.vararg is not None, "kwargs": aa.kwarg is not None,
+                "names": {x.arg for x in pos + list(aa.kwonlyargs)}}
+
+    def walk(body, want=None):
+        for nd in body:
+            if isinstance(nd, ast.ClassDef):
+                if want and nd.name == want:
+                    for sub in nd.body:
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            out[sub.name] = sig(sub, drop_self=True)
+                elif not want:
+                    walk(nd.body, want)
+            elif isinstance(nd, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not want:
+                    out.setdefault(nd.name, sig(nd))
+            elif isinstance(nd, (ast.If, ast.Try)):
+                walk(nd.body, want)
+                walk(getattr(nd, "orelse", []) or [], want)
+                for h in getattr(nd, "handlers", []) or []:
+                    walk(h.body, want)
+    walk(tree.body, cls)
+    return out
+
+
+LIB_SIGS = _signatures(ROOT / "src" / "msc_lib.py")
+SESSION_SIGS = _signatures(ROOT / "src" / "msc_lib.py", cls="Session")
+
+
+def _call_problems(tree: ast.AST):
+    """Calls to `M.x(...)` / `sess.x(...)` whose arguments do not fit."""
+    bad = []
+    for nd in ast.walk(tree):
+        if not isinstance(nd, ast.Call) or not isinstance(nd.func, ast.Attribute):
+            continue
+        base = getattr(nd.func.value, "id", None)
+        if base in ("M", "msc_lib"):
+            sigs, label = LIB_SIGS, "msc_lib"
+        elif base in ("sess", "session"):
+            sigs, label = SESSION_SIGS, "Session"
+        else:
+            continue
+        sg = sigs.get(nd.func.attr)
+        if not sg:
+            continue
+        if any(isinstance(x, ast.Starred) for x in nd.args):
+            continue
+        npos = len(nd.args)
+        kws = {k.arg for k in nd.keywords if k.arg}
+        if npos > sg["max"] and not sg["star"]:
+            bad.append((f"{label}.{nd.func.attr}(): {npos} positional, "
+                        f"max {sg['max']}", getattr(nd, "lineno", 0)))
+        elif npos + len(kws & sg["names"]) < sg["min"]:
+            bad.append((f"{label}.{nd.func.attr}(): too few arguments, "
+                        f"needs {sg['min']}", getattr(nd, "lineno", 0)))
+        for k in sorted(kws - sg["names"]):
+            if not sg["kwargs"]:
+                near = difflib.get_close_matches(k, sorted(sg["names"]), n=2,
+                                                cutoff=0.5)
+                bad.append((f"{label}.{nd.func.attr}() has no parameter "
+                            f"'{k}'" + (f" -- did you mean {near}?" if near
+                                        else ""), getattr(nd, "lineno", 0)))
+    return bad
+
+
 def _library_calls(tree: ast.AST):
     """(`attribute`, `line`, `kind`) for every `M.x` and `sess.x` reference."""
     out = []
@@ -438,6 +526,21 @@ def self_test() -> bool:
                   f"notebooks and does not exist")
             ok = False
 
+    # -- the arity check must be able to fail (D-47) -------------------------
+    _probe = ast.parse("M.resume_acceptance_test(sess, arch='x', "
+                       "epochs=4, interrupt_after=2)")
+    if not _call_problems(_probe):
+        print("  [SELFTEST FAIL] the arity check does not catch "
+              "`interrupt_after`, which is not a parameter of "
+              "resume_acceptance_test")
+        ok = False
+    _good = ast.parse("M.resume_acceptance_test(sess, arch='x', epochs=4, "
+                      "kill_at=2)")
+    if _call_problems(_good):
+        print(f"  [SELFTEST FAIL] the arity check rejects a VALID call: "
+              f"{_call_problems(_good)}")
+        ok = False
+
     print(f"  [SELFTEST {'PASS' if ok else 'FAIL'}] "
           f"this checker catches the {len(d36)} D-36 read-names; "
           f"append_history_row(strict) catches all {len(d22)} D-22 write-names; "
@@ -501,6 +604,9 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                 problems.append(
                     f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
                     f"exist" + (f" -- did you mean {near}?" if near else ""))
+
+            for msg, ln in _call_problems(tree):
+                problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")
 
             # D-44: a literal drive letter is wrong on any machine without
             # that drive, and the failure is a WinError deep inside pathlib

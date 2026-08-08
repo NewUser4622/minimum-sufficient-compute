@@ -28,7 +28,7 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Self-checks** | **352** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **11** (D-37 … D-47) · 11 fixed · 0 open |
+| **Defects found this port** | **12** (D-37 … D-48) · 12 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,66 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-48 · The same defect, one layer out — a notebook call with a wrong keyword
+
+**Severity:** NB1 step 6 crashed · **Status:** **fixed**
+**Found:** 2026-08-08 by the user running NB1
+
+```
+TypeError: resume_acceptance_test() got an unexpected keyword argument 'interrupt_after'
+```
+
+The parameter is **`kill_at`**. Every name in that line is real — `M` exists,
+`resume_acceptance_test` exists, `sess` exists. The call is still wrong.
+
+**This is D-47 exactly, one layer out, and I fixed only the inner layer.**
+D-47's arity check covers calls *inside* `msc_lib`. The notebook validator
+checked that `M.x` **exists** and stopped there. So the same class of defect
+survived in the place I had just finished writing.
+
+That is the pattern D-32 warned about verbatim: *"when work can be skipped at N
+points, an invalidation must be understood at ALL N. Fixing the first one
+relocates the symptom and looks like progress."* Here N = 2 — library-internal
+calls and notebook calls — and I fixed one.
+
+**Contamination analysis.** None. A `TypeError` at the top of a cell, before
+anything ran.
+
+**Fix.** The notebook validator now extracts **signatures** from `msc_lib.py`
+(module functions and `Session` methods) and checks every `M.x(...)` and
+`sess.x(...)` call for positional count and keyword names, suggesting the
+closest real parameter. Verified against the actual line:
+
+```
+OLD -> msc_lib.resume_acceptance_test() has no parameter 'interrupt_after'
+NEW -> clean
+```
+
+and end-to-end, by feeding the validator a notebook containing the bug —
+generation refused, exit 1.
+
+---
+
+### Note · packing no longer needs a terminal round-trip
+
+Not a defect. The `[TODO] imagenet100 packed` in steps 3 and 4 was **correct**
+— the pack had not been built and the D-46 fix reports that as a prerequisite
+rather than a failure. But it required leaving the notebook to run a command
+with two paths pasted in, which is friction with nothing to recommend it.
+
+NB1 now runs the packer itself, as a subprocess with live output, using the
+`DATA_DIR` cell 2 already resolved and a `SRC_DIR` it auto-detects. `RUN_PACKER
+= False` by default, so a 40-minute job never starts by accident.
+
+**On the labelling, since it was asked about:** folders sorted by WNID map to
+class indices 0–99 (`n01440764` → 0, `n01855672` → 99). Arbitrary, and that is
+fine — nothing downstream depends on matching official ImageNet indices. What
+would matter is the mapping *changing* between runs, and the fingerprint makes
+that impossible. It is published in `manifest.json` as `classes` and
+`class_names` either way.
+
+---
 
 ### D-47 · Names that exist, calls that don't — 16 dry-run failures
 
@@ -880,6 +940,8 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-48 — the same defect one layer out.** `M.resume_acceptance_test(..., interrupt_after=2)`; the parameter is `kill_at`. D-47's arity check covered library-internal calls only, so the class survived in the notebooks. D-32's lesson verbatim: fixing one of N skip points relocates the symptom. The validator now checks notebook call signatures too |
+| 2026-08-08 | **NB1 packs the dataset itself** — subprocess with live output, `RUN_PACKER=False` by default. The TODO was correct; the terminal round-trip was friction |
 | 2026-08-08 | **D-47 — names that exist, calls that don't.** `load_checkpoint` called with 6 of 8 positional args; `msc_for_run`'s `MSCResult` treated as an array. Two existence guards passed both. Arity is now checked by AST, verified against the real bug |
 | 2026-08-08 | **D-45 — one atlas, two FLOPs profilers.** fvcore priced the CNNs and failed on ViT/DeiT/Swin, whose tables were then built by a counter that cannot see attention. rho is DEFINED in FLOPs. torch's flop_counter is now preferred and a fallback RAISES. **Every budget table built before this fix is void** |
 | 2026-08-08 | **D-46 — the preflight failed on the intended configuration.** HF checks in a local-only run, plus "not packed yet" reported as a failure — two false reds beside the genuine D-45, which printed PASS. Three states now, and the synthetic dry runs no longer require the pack |

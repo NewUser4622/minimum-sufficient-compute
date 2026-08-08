@@ -310,6 +310,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 
 | # | symptom | cause | now |
 |---|---|---|---|
+| **D-48** | `TypeError: resume_acceptance_test() got an unexpected keyword argument` | a notebook call named a parameter that does not exist; the existence check could not see it | validator now checks notebook call signatures, suggesting the closest real parameter |
 | **D-47** | `TypeError: load_checkpoint() missing 2 required positional arguments` / `MSCResult has no len()` | calls named real functions but passed the wrong things; existence guards cannot see arity | AST arity check over every internal call |
 | **D-46** | preflight reports `FAILED: HF token` / `imagenet100 present` | HF checks ran in a local-only session; "not packed yet" counted as a failure | HF checks skipped when local; three states (pass/fail/todo); dry runs no longer need the pack |
 | **D-45** | `[FLOP] profiler fvcore failed ... using analytic fallback` | fvcore priced the CNNs, the analytic counter priced the transformers — and it cannot see attention | torch's flop_counter preferred; a fallback now RAISES. **Delete `budgets/` and rebuild if you saw this** |

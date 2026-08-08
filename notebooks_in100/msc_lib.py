@@ -6148,6 +6148,17 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
     amp = bool(cfg.get("amp_enabled", True)) if amp is None else bool(amp)
     amp = amp and dev.type == "cuda"
     stage = "build"
+    # Two warnings are guaranteed on a 2-sample synthetic batch and mean
+    # nothing here: sklearn's "y_pred contains classes not in y_true" (2 samples
+    # against 100 classes), and torch's scheduler-before-optimizer notice (the
+    # AMP scaler legitimately skips the first step while it finds a loss scale).
+    # They are suppressed INSIDE the dry run only, because eight architectures
+    # x two dry runs printed sixteen paragraphs of noise around the two lines
+    # that actually mattered -- and a report nobody can read is a report nobody
+    # reads (D-17's cost, in a new place).
+    _wctx = warnings.catch_warnings()
+    _wctx.__enter__()
+    warnings.filterwarnings("ignore", category=UserWarning)
     try:
         n_cls = num_classes_for(ds)
         res = int(cfg.get("input_res", native_res(ds)))
@@ -6228,8 +6239,13 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
             m2 = build_model(cfg["arch"], n_cls, dataset=ds).to(dev)
             o2, s2 = build_optimizer(m2, cfg)
             sc2 = torch.amp.GradScaler(dev.type, enabled=amp)
-            start, best, _dyn, wall, joules = load_checkpoint(
-                ck, cfg, m2, o2, s2, sc2)
+            # Eight positional arguments, and it returns a DICT. Getting either
+            # wrong is the D-47 defect: a signature mismatch that no
+            # name-resolution check can see, because every name involved exists.
+            res = load_checkpoint(ck, cfg, m2, o2, s2, sc2, None, dev,
+                                  strict_hash=True)
+            start = int(res["start_epoch"])
+            best = float(res["best_metric"])
             if int(start) != 1:
                 return False, (f"checkpoint says resume at epoch {start}, "
                                f"expected 1 after writing epoch 0")
@@ -6242,6 +6258,8 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
         return True, f"ok ({time.time() - t0:.2f}s, {res}px, {n_cls} classes)"
     except Exception as e:                                       # noqa: BLE001
         return False, f"at stage '{stage}': {type(e).__name__}: {e}"
+    finally:
+        _wctx.__exit__(None, None, None)
 
 
 def oracle_dry_run(cfg: Dict[str, Any], device=None,
@@ -6277,6 +6295,9 @@ def oracle_dry_run(cfg: Dict[str, Any], device=None,
     amp = bool(cfg.get("amp_enabled", True)) if amp is None else bool(amp)
     amp = amp and dev.type == "cuda"
     stage = "build"
+    _wctx = warnings.catch_warnings()
+    _wctx.__enter__()
+    warnings.filterwarnings("ignore", category=UserWarning)
     try:
         n_cls = num_classes_for(ds)
         res = int(cfg.get("input_res", native_res(ds)))
@@ -6335,9 +6356,17 @@ def oracle_dry_run(cfg: Dict[str, Any], device=None,
         rho = budgets["axes"]["depth"]["rho"]
         if not all(rho[i] < rho[i + 1] for i in range(len(rho) - 1)):
             return False, f"depth rho is not strictly ascending: {rho}"
-        msc = msc_for_run(back, budgets, axis="depth", tau=0.1)
-        if msc is None or len(msc) != n:
-            return False, "msc_for_run did not return one value per sample"
+        # MSCResult is a dataclass, not an array: `.msc` is the per-sample
+        # vector. `len()` on the container raises, which is what D-47 was.
+        res_msc = msc_for_run(back, budgets, axis="depth", tau=0.1)
+        vec = getattr(res_msc, "msc", None)
+        if vec is None or len(vec) != n:
+            return False, (f"msc_for_run returned "
+                           f"{type(res_msc).__name__} with "
+                           f"{0 if vec is None else len(vec)} values, expected "
+                           f"one per sample ({n})")
+        if not ((vec > 0).all() and (vec <= 1.0 + 1e-9).all()):
+            return False, "MSC values fall outside (0, 1] -- rho is a fraction"
 
         del bb, me
         if dev.type == "cuda":
@@ -6347,6 +6376,8 @@ def oracle_dry_run(cfg: Dict[str, Any], device=None,
                       f"{len(frame.columns)} per-sample columns)")
     except Exception as e:                                       # noqa: BLE001
         return False, f"at stage '{stage}': {type(e).__name__}: {e}"
+    finally:
+        _wctx.__exit__(None, None, None)
 
 
 def msckd_dry_run(cfg: Dict[str, Any], teacher, device, amp: bool,
@@ -12089,6 +12120,88 @@ def _selftest() -> bool:
         check(f"{_fn.__name__} unpacks optimisation_health as 4 values",
               _arity_ok(_fn, "optimisation_health", 4),
               "it returns (weight_norm, update_norm, ratio, flat)")
+
+    print("every internal call matches its callee's signature (D-47)")
+    # D-47. `backbone_dry_run` called `load_checkpoint` with 6 positional
+    # arguments; it takes 8. Every name involved existed, so the
+    # name-resolution guard from D-38 passed it, and the failure only appeared
+    # when the user ran it on real hardware -- eight architectures deep, twice.
+    #
+    # Names being real is not the same as calls being right. Arity is
+    # mechanically checkable from the same source.
+    def _defs() -> Dict[str, Any]:
+        try:
+            t = _a2.parse(Path(globals().get("__file__", "msc_lib.py"))
+                          .read_text(encoding="utf-8"))
+        except Exception:                                        # noqa: BLE001
+            return {}
+        out = {}
+
+        def walk(body):
+            for nd in body:
+                if isinstance(nd, (_a2.FunctionDef, _a2.AsyncFunctionDef)):
+                    aa = nd.args
+                    pos = list(aa.posonlyargs) + list(aa.args)
+                    ndef = len(aa.defaults)
+                    out[nd.name] = {
+                        "min": len(pos) - ndef, "max": len(pos),
+                        "star": aa.vararg is not None,
+                        "kw": {x.arg for x in list(pos) + list(aa.kwonlyargs)},
+                        "kwargs": aa.kwarg is not None,
+                    }
+                elif isinstance(nd, (_a2.If, _a2.Try)):
+                    walk(nd.body)
+                    walk(getattr(nd, "orelse", []) or [])
+                    for h in getattr(nd, "handlers", []) or []:
+                        walk(h.body)
+                elif isinstance(nd, _a2.ClassDef):
+                    pass          # methods carry `self`; out of scope here
+        walk(t.body)
+        return out
+
+    _SIG = _defs()
+
+    def _bad_calls(fn) -> List[str]:
+        try:
+            t = _a2.parse(textwrap.dedent(_insp.getsource(fn)))
+        except Exception:                                        # noqa: BLE001
+            return []
+        bad = []
+        for nd in _a2.walk(t):
+            if not isinstance(nd, _a2.Call):
+                continue
+            name = getattr(nd.func, "id", None)
+            sig = _SIG.get(name) if name else None
+            if not sig:
+                continue
+            npos = len(nd.args)
+            if any(isinstance(x, _a2.Starred) for x in nd.args):
+                continue
+            given = npos + len({k.arg for k in nd.keywords if k.arg})
+            if npos > sig["max"] and not sig["star"]:
+                bad.append(f"{name}(): {npos} positional, max {sig['max']}")
+            elif given < sig["min"]:
+                bad.append(f"{name}(): {given} args, needs at least "
+                           f"{sig['min']}")
+            for k in nd.keywords:
+                if k.arg and k.arg not in sig["kw"] and not sig["kwargs"]:
+                    bad.append(f"{name}(): no parameter '{k.arg}'")
+        return bad
+
+    for _fn in (backbone_dry_run, oracle_dry_run, msckd_dry_run,
+                analyse_q1_all, analyse_q2_all, analyse_q3_all,
+                analyse_q4_all, compare_routing_methods,
+                analyse_q3_shuffled_control_all, verify_run_artifacts,
+                resolve_storage, in100_estimate):
+        _b = _bad_calls(_fn)
+        check(f"calls in {_fn.__name__} match their signatures", not _b,
+              "; ".join(_b[:3]) if _b else
+              "arity and keyword names checked against the definitions")
+    check("the arity checker can actually fail",
+          bool(_SIG.get("load_checkpoint"))
+          and _SIG["load_checkpoint"]["min"] >= 8,
+          f"load_checkpoint needs {_SIG.get('load_checkpoint', {}).get('min')} "
+          f"positional args -- the dry run passed 6")
 
     print("the zoo asks the model instead of guessing (rule 2)")
     # The ShuffleNetV2 failure was `b.branch2[-2].out_channels` on a

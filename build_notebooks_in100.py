@@ -291,22 +291,25 @@ if fails:
 else:
     print('OK -- all eight build and price with the network blocked.')
 """),
-        md(f"""
+        md("""
 ---
 ## Step 3 · Pack the dataset
 
-Converts {len(ARCHS)}… sorry — converts **129,395 loose JPEGs** into one
-`256×256` uint8 memmap, and freezes the splits.
+129,395 loose JPEGs → one `256×256` uint8 memmap, with the splits frozen.
+**~20–40 minutes on 24 cores, one time.**
 
-**Run this from a terminal, not from the notebook** — it uses 22 worker
-processes and takes 20–40 minutes:
+You do not have to leave the notebook. The cell below runs the packer as a
+subprocess with live output, using the `DATA_DIR` cell 2 already chose. Set
+`SRC_DIR` to the folder that contains `train/`, and flip `RUN_PACKER` to True.
 
-```
-python tools/pack_imagenet100.py --src "C:\\Users\\Administrator\\Desktop\\New folder" --out "<DATA_DIR from the cell above>"
-```
+### How the labels are assigned
 
-It is resumable at chunk granularity, so an interruption continues rather than
-restarting. The cell below just checks the result.
+Folders sorted by WNID → class index 0…99. `n01440764` is 0, `n01855672` is 99.
+Arbitrary but **deterministic and published**: the mapping lives in
+`manifest.json` as `classes` and `class_names`. Nothing downstream depends on
+matching official ImageNet indices, so an arbitrary-but-fixed labelling is
+exactly right — what would matter is if it changed between runs, and the
+fingerprint makes that impossible.
 
 ### The fingerprint is the thing to read
 
@@ -314,33 +317,91 @@ restarting. The cell below just checks the result.
 2b6269ef51ff87b2c9e00fa17c44326ce634a67892c9eb550ec518a6dd2d2b6c
 ```
 
-It is a pure function of the file names and the split seeds, so it reproduces
-on any machine. **A different value means your source tree differs from the one
-this port was designed against** — and it goes into `config_hash`, so two runs
-that disagree about which 10,000 images are `val` will refuse to be compared
-rather than producing per-sample tables that align by index and describe
-different pictures.
+A pure function of the file names and the split seeds, so it reproduces on any
+machine. **A different value means your source tree differs from the one this
+port was designed against.** It goes into `config_hash`, so two runs that
+disagree about which 10,000 images are `val` refuse to be compared rather than
+producing per-sample tables that align by index and describe different pictures.
+
+Resumable at chunk granularity — an interruption continues rather than
+restarting.
 """),
         code("""
-from pathlib import Path
-import json
+# Set this to the folder that CONTAINS train/. Leave None to auto-detect.
+SRC_DIR    = None
+RUN_PACKER = False        # <-- flip to True to actually pack
 
-root = Path(DATA_DIR)
-ok, detail = M.data_present('imagenet100', root)
+import subprocess, sys
+from pathlib import Path
+
+if SRC_DIR is None:
+    # Look for a directory holding train/<wnid>/*.JPEG near the usual places.
+    cands = [Path.home() / 'Desktop' / 'New folder',
+             Path.cwd().parent, Path.cwd().parent.parent]
+    for c in cands:
+        try:
+            t = Path(c) / 'train'
+            if t.is_dir() and any(d.name.startswith('n0') for d in t.iterdir()):
+                SRC_DIR = str(c)
+                break
+        except Exception:
+            continue
+
+ok, detail = M.data_present('imagenet100', DATA_DIR)
+if ok:
+    print('already packed -- nothing to do')
+    print(' ', detail)
+elif not RUN_PACKER:
+    print('NOT PACKED YET. This is the next step, not a failure.')
+    print()
+    print(f'  source detected : {SRC_DIR or "NOT FOUND -- set SRC_DIR above"}')
+    print(f'  destination     : {DATA_DIR}')
+    print()
+    print('  Set RUN_PACKER = True and re-run this cell (~20-40 min),')
+    print('  or run the same thing in a terminal:')
+    print(f'    python tools/pack_imagenet100.py --src "{SRC_DIR}" --out "{DATA_DIR}"')
+elif not SRC_DIR:
+    print('*** SRC_DIR not found. Set it to the folder containing train/.')
+else:
+    tool = Path.cwd().parent / 'tools' / 'pack_imagenet100.py'
+    if not tool.exists():
+        tool = Path.cwd() / 'tools' / 'pack_imagenet100.py'
+    print(f'packing {SRC_DIR} -> {DATA_DIR}')
+    print('(live output below; safe to interrupt, it resumes)')
+    proc = subprocess.Popen([sys.executable, str(tool), '--src', str(SRC_DIR),
+                             '--out', str(DATA_DIR)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line.rstrip())
+    proc.wait()
+    print(f'packer exit code {proc.returncode}')
+"""),
+        code("""
+# Whatever route you took, verify the result here.
+import json
+from pathlib import Path
+
+ok, detail = M.data_present('imagenet100', DATA_DIR)
 print(f'pack present: {ok}')
 print(f'  {detail}')
+PACKED = ok
 
 if ok:
-    man = json.loads((root / 'manifest.json').read_text())
-    spl = json.loads((root / 'splits.json').read_text())
+    man = json.loads((Path(DATA_DIR) / 'manifest.json').read_text())
+    spl = json.loads((Path(DATA_DIR) / 'splits.json').read_text())
     print()
     print(f"  images        {man['count']:,}")
-    print(f"  classes       {man['n_classes']}")
-    print(f"  stored at     {man['stored_res']}px  ({man['resize_policy']})")
+    print(f"  classes       {man['n_classes']}   "
+          f"({man['classes'][0]} = 0  ...  {man['classes'][-1]} = "
+          f"{man['n_classes']-1})")
+    print(f"  stored at     {man['stored_res']}px")
+    print(f"  policy        {man['resize_policy']}")
     print(f"  val           {len(spl['val']):,}")
     print(f"  train         {len(spl['train']):,}")
     print(f"  holdout       {len(spl['holdout']):,}  (a slice OF train, aug off)")
-    print(f"  decode fails  {len(man.get('failures', []))}  (packed as zeros, excluded from every split)")
+    print(f"  decode fails  {len(man.get('failures', []))}  "
+          f"(packed as zeros, excluded from every split)")
     print()
     print(f"  fingerprint   {man['fingerprint']}")
     EXPECTED = '2b6269ef51ff87b2c9e00fa17c44326ce634a67892c9eb550ec518a6dd2d2b6c'
@@ -349,10 +410,12 @@ if ok:
         print('  *** FINGERPRINT DOES NOT MATCH THE DESIGN.')
         print(f'  *** expected {EXPECTED}')
         print('  *** Your source tree differs. Every downstream comparison')
-        print('  *** would be against different images. Investigate before continuing.')
+        print('  *** would be against different images. Investigate first.')
 else:
     print()
-    print('  Run the packer first (see the markdown above).')
+    print('  Not packed yet. Everything below still runs -- the preflight and')
+    print('  both dry runs are SYNTHETIC and never open the dataset. Only')
+    print('  NB2 onward needs it.')
 """),
         md("""
 ---
@@ -458,7 +521,7 @@ that is a clean completion followed by an extension, a completely different code
 path, and it validated nothing while looking like it did.
 """),
         code("""
-res = M.resume_acceptance_test(sess, arch='resnet18', epochs=4, interrupt_after=2)
+res = M.resume_acceptance_test(sess, arch='resnet18', epochs=4, kill_at=2)
 print()
 print('RESUME OK' if res.get('passed') else 'RESUME FAILED -- do not train')
 for k, v in res.items():
