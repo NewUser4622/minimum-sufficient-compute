@@ -437,6 +437,56 @@ def _call_problems(tree: ast.AST):
     return bad
 
 
+def _result_key_problems(tree: ast.AST):
+    """Keys read off a library result that the library does not declare.
+
+    D-51/D-52. `res.get('passed')` where the key is `ok` reported a PASSING
+    resume test as a failure. `ctrl['passes']` where the column is `passed`
+    would have raised KeyError during analysis, after every GPU-hour was spent.
+
+    Existence checks (D-39), signature checks (D-47/D-48) and schema checks
+    (D-22/D-36) all pass on both. None of them can see a key read off a
+    returned dict or frame -- so this does.
+
+    Single-assignment dataflow, per cell: `x = M.f(...)` then `x['k']` or
+    `x.get('k')`. That covers how every notebook here is written and stays
+    simple enough to trust.
+    """
+    src_of: dict = {}
+    for nd in ast.walk(tree):
+        if isinstance(nd, ast.Assign) and isinstance(nd.value, ast.Call) \
+                and isinstance(nd.value.func, ast.Attribute):
+            base = getattr(nd.value.func.value, "id", None)
+            if base in ("M", "msc_lib", "sess", "session"):
+                for tg in nd.targets:
+                    if isinstance(tg, ast.Name):
+                        src_of[tg.id] = nd.value.func.attr
+
+    bad = []
+    for nd in ast.walk(tree):
+        var = key = None
+        if isinstance(nd, ast.Subscript) and isinstance(nd.value, ast.Name):
+            sl = nd.slice
+            if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                var, key = nd.value.id, sl.value
+        elif isinstance(nd, ast.Call) and isinstance(nd.func, ast.Attribute) \
+                and nd.func.attr == "get" and isinstance(nd.func.value, ast.Name):
+            if nd.args and isinstance(nd.args[0], ast.Constant) \
+                    and isinstance(nd.args[0].value, str):
+                var, key = nd.func.value.id, nd.args[0].value
+        if not var or var not in src_of:
+            continue
+        fn = src_of[var]
+        if M.result_key_ok(fn, key):
+            continue
+        near = difflib.get_close_matches(key, list(M.RESULT_KEYS.get(fn, ())),
+                                         n=2, cutoff=0.5)
+        bad.append((f"{var} = {fn}(...) then {var}[{key!r}], but {fn} declares "
+                    f"no such key" + (f" -- did you mean {near}?" if near else ""),
+                    getattr(nd, "lineno", 0)))
+    return bad
+
+
 def _library_calls(tree: ast.AST):
     """(`attribute`, `line`, `kind`) for every `M.x` and `sess.x` reference."""
     out = []
@@ -526,6 +576,25 @@ def self_test() -> bool:
                   f"notebooks and does not exist")
             ok = False
 
+    # -- the result-key check must be able to fail (D-51, D-52) -------------
+    for bad_src, why in (
+            ("res = M.resume_acceptance_test(sess)\nprint(res.get('passed'))",
+             "the exact D-51 line"),
+            ("ctrl = M.analyse_q3_shuffled_control_all(sess)\n"
+             "bad = ctrl[~ctrl['passes']]", "the exact D-52 line")):
+        if not _result_key_problems(ast.parse(bad_src)):
+            print(f"  [SELFTEST FAIL] the result-key check does not catch "
+                  f"{why}")
+            ok = False
+    for good_src in ("res = M.resume_acceptance_test(sess)\nprint(res['ok'])",
+                     "ctrl = M.analyse_q3_shuffled_control_all(sess)\n"
+                     "bad = ctrl[~ctrl['passed']]",
+                     "q = M.analyse_q1_all(sess)\nprint(q['rho_seed_tau0.1'])"):
+        if _result_key_problems(ast.parse(good_src)):
+            print(f"  [SELFTEST FAIL] the result-key check rejects a VALID "
+                  f"read: {_result_key_problems(ast.parse(good_src))}")
+            ok = False
+
     # -- the arity check must be able to fail (D-47) -------------------------
     _probe = ast.parse("M.resume_acceptance_test(sess, arch='x', "
                        "epochs=4, interrupt_after=2)")
@@ -604,6 +673,9 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                 problems.append(
                     f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
                     f"exist" + (f" -- did you mean {near}?" if near else ""))
+
+            for msg, ln in _result_key_problems(tree):
+                problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")
 
             for msg, ln in _call_problems(tree):
                 problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")

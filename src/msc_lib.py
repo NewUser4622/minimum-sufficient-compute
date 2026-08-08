@@ -9189,8 +9189,15 @@ def analyse_q3_shuffled_control_all(session, phase: str = "p1",
             r.update({"arch_a": a, "arch_b": b})
             rows.append(r)
     df = pd.DataFrame(rows)
-    if len(df) and "passes" not in df.columns and "ok" in df.columns:
-        df["passes"] = df["ok"]
+    # D-52. The primitive returns `passed`. This wrapper looked for `ok` to
+    # synthesise a `passes` column, so `passes` was never created and NB4's
+    # `ctrl['passes']` would have raised KeyError -- in the ANALYSIS phase,
+    # after every GPU-hour was already spent. One name, taken from the
+    # primitive, and no renaming layer to get wrong.
+    if len(df) and "passed" not in df.columns:
+        raise KeyError(
+            f"the shuffled control returned {sorted(df.columns)} with no "
+            f"'passed' column -- the alignment gate cannot be evaluated")
     return df
 
 
@@ -9314,6 +9321,86 @@ def verify_paper_artifacts(data_dir, method: bool = False) -> Dict[str, Any]:
             missing.append(rel)
         rows.append({"artifact": rel, "state": state, "bytes": n, "backs": why})
     return {"ok": not missing, "missing": missing, "rows": rows}
+
+
+RESUME_TEST_KEYS = (
+    "arch", "epochs", "kill_at", "interrupt_fired", "resume_status",
+    "epochs_ref", "epochs_cut", "duplicate_epochs", "final_acc_ref",
+    "final_acc_cut", "acc_delta", "post_seam_epochs_compared",
+    "max_post_seam_loss_deviation", "ref_run", "cut_run", "diagnosis", "ok",
+)
+
+
+# =============================================================================
+# declared result keys -- what a caller may read from each of these
+# =============================================================================
+# D-51 and D-52. A notebook read `res.get('passed')` where the key is `ok`, and
+# reported a PASSING resume test as a failure. A wrapper synthesised a `passes`
+# column by looking for `ok` when the primitive returns `passed`, which would
+# have raised KeyError during analysis, after every GPU-hour was spent.
+#
+# Four earlier guards check that functions EXIST (D-39), that calls match
+# SIGNATURES (D-47, D-48), and that column literals match the schema (D-22,
+# D-36). None of them can see a KEY read off a returned dict or frame. This
+# registry closes that: `build_notebooks_in100.py` refuses to generate a
+# notebook that reads a key not declared here.
+#
+# Declaring the set is what makes a guess detectable. A guess against an
+# undeclared dict is indistinguishable from a correct read until it runs.
+RESULT_KEYS: Dict[str, Tuple[str, ...]] = {
+    "resolve_storage": ("ok", "problems", "notes", "data_dir", "results_root",
+                        "candidates", "data_free_gb", "results_free_gb"),
+    "preflight": ("checked_utc", "dataset", "input_res", "resolution_grid",
+                  "checks"),
+    "preflight_summary": ("passed", "failed", "todo", "ok", "n"),
+    "resume_acceptance_test": RESUME_TEST_KEYS,
+    "in100_estimate": ("rows", "total_gpu_hours", "days", "epochs", "seeds",
+                       "share"),
+    "confirm_on_disk": ("ok", "done", "resumable", "at_risk", "unknown",
+                        "detail"),
+    "confirm_on_hf": ("ok", "done", "resumable", "at_risk", "unknown"),
+    "verify_run_artifacts": ("run_id", "root", "ok", "missing_required",
+                             "empty", "unreadable", "total_bytes", "files"),
+    "verify_paper_artifacts": ("ok", "missing", "rows"),
+    "parse_run_id": ("run_id", "phase", "arch", "dataset", "method", "seed",
+                     "family"),
+    "set_perf_flags": ("deterministic", "cudnn_benchmark",
+                       "cudnn_deterministic", "tf32_matmul", "error"),
+    "data_present": (),                       # returns a tuple, not a dict
+    # DataFrame-returning analyses: the COLUMNS a caller may read.
+    "analyse_q1_all": ("arch", "family", "n_seeds", "n_pairs", "top1_mean",
+                       "top1_spread"),
+    "analyse_q2_all": ("arch", "family", "run_id", "tau", "pc1", "n"),
+    "analyse_q3_all": ("run_a", "run_b", "axis", "tau", "spearman_raw", "T",
+                       "ceiling_a", "ceiling_b", "n", "jaccard_top10",
+                       "arch_a", "arch_b", "pair_type"),
+    "analyse_q3_shuffled_control_all": ("passed", "spearman_raw", "z", "n",
+                                        "null_sd", "z_max", "rho_floor",
+                                        "tau", "axis", "arch_a", "arch_b"),
+    "analyse_q4_all": ("run_a", "run_b", "axis", "tau", "split", "delta_r2",
+                       "delta_r2_lo", "delta_r2_hi", "partial_spearman",
+                       "r2_difficulty_only", "r2_difficulty_plus_msc",
+                       "battery", "n_battery_scores", "arch_a", "arch_b",
+                       "pair_type"),
+    "compare_routing_methods": ("run_id", "student", "seed", "arm",
+                                "best_accuracy", "b1_static", "b2_confidence",
+                                "b10_msckd", "b11_oracle", "avg_flops_ratio",
+                                "gamma", "ltt_epsilon",
+                                "frac_b2_b11_gap_closed"),
+}
+# `analyse_q1_all` also emits rho_seed_tau{t} / j10_tau{t} per tau; matched by
+# shape rather than enumerated, since the tau grid is a parameter.
+RESULT_KEY_PATTERNS = (r"^rho_seed(_sd)?_tau[\d.]+$", r"^j10_tau[\d.]+$")
+
+
+def result_key_ok(fn: str, key: str) -> bool:
+    """May a caller read `key` from `fn`'s result?"""
+    declared = RESULT_KEYS.get(fn)
+    if declared is None:
+        return True                      # undeclared function: nothing to check
+    if key in declared:
+        return True
+    return any(re.match(p, key) for p in RESULT_KEY_PATTERNS)
 
 
 def phase0_decision(seed_rho: float, transfer_T: float, delta_r2: float) -> Dict[str, Any]:
@@ -10848,14 +10935,6 @@ def _parquet_ok() -> bool:
             return True
         except Exception:
             return False
-
-
-RESUME_TEST_KEYS = (
-    "arch", "epochs", "kill_at", "interrupt_fired", "resume_status",
-    "epochs_ref", "epochs_cut", "duplicate_epochs", "final_acc_ref",
-    "final_acc_cut", "acc_delta", "post_seam_epochs_compared",
-    "max_post_seam_loss_deviation", "ref_run", "cut_run", "diagnosis", "ok",
-)
 
 
 def resume_acceptance_test(session: "Session", arch: str = "resnet20",
@@ -12608,6 +12687,40 @@ def _selftest() -> bool:
     check("the analytic fallback is documented as conv+linear only",
           "conv + linear only" in _insp.getsource(_analytic_flops),
           "that omission is the whole defect for a transformer")
+
+    print("every readable result key is declared (D-51, D-52)")
+    check("RESULT_KEYS covers the functions the notebooks read from",
+          {"resolve_storage", "preflight_summary", "resume_acceptance_test",
+           "in100_estimate", "confirm_on_disk", "verify_paper_artifacts",
+           "analyse_q1_all", "analyse_q2_all", "analyse_q3_all",
+           "analyse_q3_shuffled_control_all", "analyse_q4_all",
+           "compare_routing_methods"} <= set(RESULT_KEYS),
+          f"{len(RESULT_KEYS)} functions declared")
+    check("the D-51 key is rejected",
+          not result_key_ok("resume_acceptance_test", "passed"))
+    check("...and the real one accepted",
+          result_key_ok("resume_acceptance_test", "ok"))
+    check("the D-52 key is rejected",
+          not result_key_ok("analyse_q3_shuffled_control_all", "passes"),
+          "the primitive returns `passed`; a wrapper synthesising `passes` "
+          "from a key that does not exist would have raised KeyError during "
+          "ANALYSIS, after every GPU-hour was spent")
+    check("...and the real one accepted",
+          result_key_ok("analyse_q3_shuffled_control_all", "passed"))
+    check("tau-suffixed Q1 columns match by shape, not enumeration",
+          result_key_ok("analyse_q1_all", "rho_seed_tau0.1")
+          and result_key_ok("analyse_q1_all", "j10_tau0.3")
+          and not result_key_ok("analyse_q1_all", "rho_seed_tau"),
+          "the tau grid is a parameter, so the columns cannot be listed")
+    check("an undeclared function is not policed",
+          result_key_ok("some_function_with_no_contract", "anything"),
+          "declaring the set is opt-in; a check that guesses at undeclared "
+          "contracts would be the 73-false-positive mistake again")
+    check("the shuffled control wrapper demands `passed` explicitly",
+          '"passed" not in df.columns' in
+          _insp.getsource(analyse_q3_shuffled_control_all),
+          "silently producing a frame without the gate column is how D-52 "
+          "would have survived to analysis")
 
     print("result-dict keys are pinned (D-51)")
     # D-51. The notebook read `res.get('passed')`; the key is `ok`. `.get()`

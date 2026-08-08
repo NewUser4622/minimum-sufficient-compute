@@ -58,11 +58,11 @@ After this, unplug it.
 
 | | |
 |---|---|
-| ✅ | Library ported. **373** offline self-checks pass, exit code verified. |
+| ✅ | Library ported. **381** offline self-checks pass, exit code verified. |
 | ✅ | Local-only + offline. Nothing uploaded, nothing fetched, nothing deleted. |
 | ✅ | Packing tool, verified against the real data (dry run only — not yet packed). |
 | ✅ | Zoo registered, dry runs written and wired in. |
-| ✅ | **Five notebooks generated** in `notebooks_in100/`, validated clean. |
+| ✅ | **Five notebooks generated**, all validated: columns, library names, call signatures, result keys, drive letters. |
 | ✅ | Throughput measured for 6 of 8 architectures (`benchmark/results/`). |
 | ✅ | **Dataset packed.** `RUN_PACKER` is one-time; re-running the cell is a no-op. |
 | ✅ | **Resume verified on hardware** — post-seam loss drift 0.31% vs a 5% tolerance. |
@@ -83,7 +83,7 @@ echo $?          # must be 0
 Expect the last three lines to read:
 
 ```
-  373 checks run, 0 failed
+  381 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```
@@ -321,6 +321,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 
 | # | symptom | cause | now |
 |---|---|---|---|
+| **D-52** | `KeyError: 'passes'` in NB4's shuffled control | the primitive returns `passed`; a wrapper synthesised `passes` from a key that does not exist | one name from the primitive; `RESULT_KEYS` checks every notebook read at build time |
 | **D-51** | `RESUME TEST: PASS` followed by `RESUME FAILED -- do not train` | the notebook read `res.get('passed')`; the key is `ok` | reads `res['ok']` so a typo raises; key set pinned by `RESUME_TEST_KEYS` |
 | **D-50** | `[LIFE] session limit reached at 0.1 h -- pausing cleanly at epoch 1`, every epoch | `session_limit_h = 0.0` meant "no limit" and was read as "zero hours" | `<= 0`, `None` and negative are all unbounded; the armed line says `NONE -- runs to completion` |
 | **D-49** | `IndexError: index 121978 is out of bounds for axis 0 with size 119395` | `sample_idx` is the GLOBAL pack index; dynamics arrays were sized by the split length | datasets declare `index_space`; `train_backbone` asks rather than assumes |
@@ -346,7 +347,7 @@ python src/msc_lib.py --selftest
 Look at the **counts**, not the last line:
 
 ```
-  373 checks run, 0 failed
+  381 checks run, 0 failed
 
 ALL CHECKS PASSED
 ```

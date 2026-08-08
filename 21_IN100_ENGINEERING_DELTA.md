@@ -224,7 +224,26 @@ produces a sample whose minimum sufficient compute is undefined.
 | lists + canary + floor in `_selftest` | 8 | a scalar that a tuple unpack silently destroyed (**D-37**) |
 | AST-parsing source checks | — | substring greps that matched their own docstrings |
 
-Self-checks **232 → 278**, all passing, **exit code verified against a canary**.
+Self-checks **232 → 381**, all passing, **exit code verified against a canary**.
+
+### Build-time name checking, in five layers
+
+Every one was added after a real failure, and each catches what the previous
+one structurally cannot. The through-line: **a name that exists is not the same
+as a name used correctly.**
+
+| layer | added after | catches |
+|---|---|---|
+| column literals vs `HISTORY_FIELDS`/`FINAL_FIELDS` | D-22, D-36 | a column that is not in the schema |
+| repo paths must go through an accessor | D-16, D-23, D-25 | a hand-spelled `runs/...` |
+| library **names** must exist | D-39 | `M.analyse_q1_all` when it was never written |
+| call **signatures** must match | D-47, D-48 | `resume_acceptance_test(interrupt_after=2)` — the parameter is `kill_at` |
+| result **keys** must be declared | D-51, D-52 | `res.get('passed')` when the key is `ok` |
+| drive letters are forbidden | D-44 | `r'D:\...'` on a machine with no D: |
+
+Plus, inside the library rather than at build time: an AST arity check on
+internal calls, a signature check on every zoo builder, and a canary proving
+the harness itself can fail.
 
 ---
 

@@ -25,10 +25,10 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered · all 8 build, price and dry-run on the GPU |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **373** offline, all passing, exit code verified |
+| **Self-checks** | **381** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
-| **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **15** (D-37 … D-51) · 15 fixed · 0 open |
+| **Notebooks** | **5** (`notebooks_in100/`) · columns, library names, call signatures, result keys and drive letters all validated at build time |
+| **Defects found this port** | **16** (D-37 … D-52) · 16 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,79 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-52 · A gate column that could never exist — found by auditing the other four notebooks
+
+**Severity:** **`KeyError` in the analysis phase, after every GPU-hour is spent**
+**Status:** **fixed** · **Found:** 2026-08-08 auditing NB2–NB5 for the D-51 pattern
+
+`analyse_q3_shuffled_control` returns **`passed`**. Its atlas-wide wrapper did:
+
+```python
+if len(df) and "passes" not in df.columns and "ok" in df.columns:
+    df["passes"] = df["ok"]
+```
+
+There is no `ok` column, so **`passes` was never created** — and NB4 reads
+`ctrl[~ctrl['passes']]`.
+
+**Where it would have surfaced is what makes it serious.** The shuffled control
+is the alignment gate for Q3: it proves the per-sample tables are genuinely
+row-aligned across architectures, and Q3 is uninterpretable without it. This
+`KeyError` fires in NB4, **after** the atlas has trained (~10 days) and been
+measured. Not a lost result — but the last place you want to discover a typo.
+
+Three names for one concept — `ok`, `passed`, `passes` — and a renaming layer
+in between. The wrapper now uses the primitive's name and **raises** if the
+column is absent, rather than quietly returning a frame without the gate.
+
+**Contamination analysis.** None. Nothing has been analysed.
+
+---
+
+### The guard: declared result keys
+
+D-51 and D-52 are the same defect at two ends of the pipeline, and neither was
+catchable by anything already in place:
+
+| existing guard | catches | misses this |
+|---|---|---|
+| D-39 | a function that does not exist | `resume_acceptance_test` exists |
+| D-47/D-48 | a call whose arguments do not fit | the calls are fine |
+| D-22/D-36 | a column absent from `HISTORY_FIELDS` | these are result keys, not schema |
+
+**A key read off a returned dict or frame had no owner.** `RESULT_KEYS` now
+declares, per function, what a caller may read — 17 functions — and
+`build_notebooks_in100.py` **refuses to generate** a notebook that reads
+anything else, suggesting the closest declared name.
+
+Declaring the set is what makes a guess *detectable*. A guess against an
+undeclared contract is indistinguishable from a correct read until it runs.
+
+Two deliberate limits, both to avoid the 73-false-positive mistake:
+
+- **Undeclared functions are not policed.** Opt-in, not inferred.
+- **Q1's τ-suffixed columns match by shape** (`rho_seed_tau0.1`, `j10_tau0.3`),
+  because the τ grid is a parameter and the columns cannot be enumerated.
+
+Verified against both real lines and three valid ones:
+
+```
+D-51 res.get('passed')  -> resume_acceptance_test declares no such key
+D-52 ctrl['passes']     -> analyse_q3_shuffled_control_all declares no such key
+VALID res['ok']         -> clean
+VALID ctrl['passed']    -> clean
+VALID q['rho_seed_tau0.1'] -> clean
+```
+
+**The audit that found it.** Every `x = M.f(...)` followed by `x[k]` across all
+five notebooks was extracted and checked against the function's real return.
+41 reads, one wrong. The other 40 were already subscripts rather than `.get()`,
+so a typo among them would at least have raised.
+
+Self-checks 373 → **381**.
+
+---
 
 ### D-51 · A passing test reported as failed, because of one wrong key
 
@@ -1176,6 +1249,8 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-52 — a gate column that could never exist.** `analyse_q3_shuffled_control` returns `passed`; the wrapper synthesised `passes` from a nonexistent `ok`, and NB4 read `passes`. KeyError in ANALYSIS, after ten days of training. Found by auditing NB2-NB5 for the D-51 pattern |
+| 2026-08-08 | **`RESULT_KEYS` — result keys are now declared and checked at build time.** The fifth name-checking guard, and the first that can see a key read off a returned dict or frame |
 | 2026-08-08 | **RESUME VERIFIED ON REAL HARDWARE.** `resnet18`, 4 epochs, real interrupt at 2, resumed in a fresh call: post-seam loss drift **0.31%** against a 5% tolerance, 0 duplicate rows, 4/4 epochs both legs. Five CIFAR defects were about resume; it works here |
 | 2026-08-08 | **D-51 — a passing test reported as failed.** `res.get('passed')`; the key is `ok`. `.get()` on a required key turns a typo into a wrong answer, a subscript turns it into an error. Key set now pinned. Resume test cut to 5% of the data: two minutes, not forty |
 | 2026-08-08 | **D-50 — "no session limit" read as "a limit of zero".** Every run paused after epoch 1; over a ten-day atlas that is a manual restart every few minutes. It also broke the resume test in a way that pointed at resume rather than at the watchdog — the D-06 shape. The test now names the failure MODE, not just the verdict |

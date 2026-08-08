@@ -1050,7 +1050,7 @@ halted the analysis on a perfectly healthy pair.
         code("""
 ctrl = M.analyse_q3_shuffled_control_all(sess)
 M.save_analysis(sess.data_dir, 'q3_shuffled_control', ctrl)
-bad = ctrl[~ctrl['passes']]
+bad = ctrl[~ctrl['passed']]
 print(f"{len(ctrl) - len(bad)}/{len(ctrl)} shuffled controls pass  "
       f"(max |z| = {ctrl['z'].abs().max():.2f} against a 5-sigma threshold)")
 if len(bad):

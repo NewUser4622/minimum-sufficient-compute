@@ -2895,6 +2895,64 @@ if _TORCH_OK:
                 _t = time.time()
 
 
+if _TORCH_OK:
+
+    class _SubsetKeepingIndexSpace(torch.utils.data.Subset):
+        """A Subset that still reports the FULL index space.
+
+        `sample_idx` values are global pack indices and do not renumber when
+        the split shrinks, so anything sized by `index_space` must still be
+        sized for the whole pack. Plain `torch.utils.data.Subset` drops the
+        attribute, and losing it here would reintroduce D-49 by a side door.
+        """
+
+        @property
+        def index_space(self):
+            return getattr(self.dataset, "index_space", len(self.dataset))
+
+        @property
+        def order_hash(self):
+            return getattr(self.dataset, "order_hash", "")
+
+        @property
+        def stored_res(self):
+            return getattr(self.dataset, "stored_res", 256)
+
+        @property
+        def class_names(self):
+            return getattr(self.dataset, "class_names", [])
+
+        @property
+        def fingerprint(self):
+            return getattr(self.dataset, "fingerprint", "")
+
+
+def _subset_train(ds, cfg: Dict[str, Any]):
+    """A deterministic fraction of a training split, for smoke tests.
+
+    Preserves `index_space`. `sample_idx` values stay GLOBAL, so a subset does
+    not renumber anything and every array indexed by them is still sized
+    correctly -- the D-49 property, which it would be easy to break here by
+    subsetting the index space along with the data.
+    """
+    f = float(cfg.get("train_subset_frac", 0.0) or 0.0)
+    if not (0.0 < f < 1.0):
+        return ds
+    n = max(1, int(round(len(ds) * f)))
+    rng = np.random.default_rng(int(cfg.get("seed", 1)))
+    keep = np.sort(rng.choice(len(ds), size=n, replace=False))
+    sub = torch.utils.data.Subset(ds, keep.tolist())
+    for attr in ("index_space", "order_hash", "classes", "class_names",
+                 "stored_res", "fingerprint"):
+        if hasattr(ds, attr):
+            setattr(sub, attr, getattr(ds, attr))
+    if not hasattr(sub, "index_space"):
+        sub.index_space = len(ds)
+    log(f"train split subset to {n}/{len(ds)} images ({100*f:.0f}%) -- "
+        f"SMOKE TEST ONLY, not a training run", "DATA")
+    return sub
+
+
 def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
     """train / val / train-holdout for the packed ImageNet-100.
 
@@ -2915,6 +2973,21 @@ def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
     va = PackedImageDataset(root, "val")
     ho = PackedImageDataset(root, "holdout")
 
+    # A deterministic fraction of the training split, for smoke tests only.
+    # The resume acceptance test does not care how well the model learns; it
+    # cares whether the seam is invisible. Running it on the full 119,395
+    # images cost ~40 minutes across three legs and exercised no code the 5%
+    # version does not. Off (1.0) for every real run, and it participates in
+    # config_hash, so a subset run can never be mistaken for a full one.
+    _frac = float(cfg.get("train_subset_frac", 1.0) or 1.0)
+    if 0 < _frac < 1.0:
+        _rng = np.random.default_rng(4242)
+        _keep = np.sort(_rng.choice(len(tr), size=max(2, int(len(tr) * _frac)),
+                                    replace=False))
+        tr = _SubsetKeepingIndexSpace(tr, _keep.tolist())
+        log(f"train subset: {len(tr)} of {len(tr.dataset)} images "
+            f"({100*_frac:.0f}%) -- SMOKE TEST ONLY", "DATA")
+
     got = tr.fingerprint
     want = cfg.get("data_fingerprint")
     if want and str(want) != got:
@@ -2924,6 +2997,12 @@ def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
             f"split. Correlating per-sample tables across the two would align "
             f"them by index and compare different images. Repack, or use the "
             f"matching pack.")
+
+    # A fraction of the TRAIN split only. For smoke tests -- the resume test
+    # exercises the same code on 5% of the data in two minutes instead of
+    # forty. val and holdout are NEVER subset: they are what results are
+    # measured on, and a test that shrinks them is testing something else.
+    tr = _subset_train(tr, cfg)
 
     nw = int(cfg.get("num_workers", min(8, max(0, (os.cpu_count() or 2) - 2))))
     common = dict(num_workers=nw, pin_memory=(dev.type == "cuda"),
@@ -2967,6 +3046,7 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
     g = torch.Generator()
     g.manual_seed(int(cfg.get("seed", 1)))
 
+    train_set = _subset_train(train_set, cfg)
     train_loader = DataLoader(train_set, batch_size=bs, shuffle=True,
                               num_workers=0, pin_memory=True, drop_last=False,
                               generator=g)
@@ -10770,9 +10850,18 @@ def _parquet_ok() -> bool:
             return False
 
 
+RESUME_TEST_KEYS = (
+    "arch", "epochs", "kill_at", "interrupt_fired", "resume_status",
+    "epochs_ref", "epochs_cut", "duplicate_epochs", "final_acc_ref",
+    "final_acc_cut", "acc_delta", "post_seam_epochs_compared",
+    "max_post_seam_loss_deviation", "ref_run", "cut_run", "diagnosis", "ok",
+)
+
+
 def resume_acceptance_test(session: "Session", arch: str = "resnet20",
                            epochs: int = 4, kill_at: int = 2,
-                           tol: float = 0.05) -> Dict[str, Any]:
+                           tol: float = 0.05,
+                           subset_frac: float = 1.0) -> Dict[str, Any]:
     """Train, genuinely kill, resume, and prove the seam is invisible.
 
     Two runs of the SAME config:
@@ -10801,7 +10890,8 @@ def resume_acceptance_test(session: "Session", arch: str = "resnet20",
     """
     if not _TORCH_OK:
         return {"ok": False, "reason": "torch unavailable"}
-    out: Dict[str, Any] = {"arch": arch, "epochs": epochs, "kill_at": kill_at}
+    out: Dict[str, Any] = {"arch": arch, "epochs": epochs, "kill_at": kill_at,
+                           "subset_frac": float(subset_frac)}
     tmp = session.scratch / "resume_test"
     shutil.rmtree(tmp, ignore_errors=True)
     tmp = ensure_dir(tmp)
@@ -10818,6 +10908,10 @@ def resume_acceptance_test(session: "Session", arch: str = "resnet20",
                          # reason with nothing to do with resume. A test that
                          # can fail for the wrong reason is the D-06 shape.
                          session_limit_h=0.0,
+                         # A fraction of the training split. This test is about
+                         # whether the seam is invisible, not about learning
+                         # anything -- and the same code runs either way.
+                         train_subset_frac=float(subset_frac),
                          cleanup_local_after_complete=False)
     hub_off = MSCHub(enable=False)
     reg = RunRegistry(hub_off, tmp / "reg", account="selftest")
@@ -12514,6 +12608,43 @@ def _selftest() -> bool:
     check("the analytic fallback is documented as conv+linear only",
           "conv + linear only" in _insp.getsource(_analytic_flops),
           "that omission is the whole defect for a transformer")
+
+    print("result-dict keys are pinned (D-51)")
+    # D-51. The notebook read `res.get('passed')`; the key is `ok`. `.get()`
+    # returned None, the cell printed "RESUME FAILED", and the GO gate said
+    # NO-GO -- for a test whose own output said PASS, after 40 minutes of GPU
+    # time. A `.get()` on a key you REQUIRE turns a typo into a wrong answer;
+    # a subscript turns it into an error. The key set is pinned here so a
+    # rename cannot silently strand a reader.
+    check("the resume test's key set is declared",
+          "ok" in RESUME_TEST_KEYS and "diagnosis" in RESUME_TEST_KEYS,
+          f"{len(RESUME_TEST_KEYS)} keys")
+    check("'passed' is NOT one of them",
+          "passed" not in RESUME_TEST_KEYS,
+          "the name the notebook guessed -- pinning the set is what makes a "
+          "guess detectable")
+    _rsrc = _insp.getsource(resume_acceptance_test)
+    _declared = {k for k in RESUME_TEST_KEYS if f'"{k}"' in _rsrc}
+    check("every declared key is actually set by the function",
+          len(_declared) >= len(RESUME_TEST_KEYS) - 1,
+          f"{sorted(set(RESUME_TEST_KEYS) - _declared)} not found in the source")
+    check("the resume test accepts a subset fraction",
+          "subset_frac" in _rsrc and "train_subset_frac" in _rsrc,
+          "40 minutes for a smoke test is a test that gets skipped")
+
+    print("train-split subsetting (smoke tests only)")
+    check("a fraction outside (0,1) is a no-op",
+          _subset_train([1, 2, 3], {"train_subset_frac": 0.0}) == [1, 2, 3]
+          and _subset_train([1, 2, 3], {}) == [1, 2, 3])
+    check("subsetting never touches val or holdout",
+          "_subset_train(tr, cfg)" in _insp.getsource(_in100_loaders)
+          and "_subset_train(va" not in _insp.getsource(_in100_loaders)
+          and "_subset_train(ho" not in _insp.getsource(_in100_loaders),
+          "val and holdout are what results are measured on; a test that "
+          "shrinks them is testing something else")
+    check("a subset preserves index_space",
+          "sub.index_space" in _insp.getsource(_subset_train),
+          "renumbering with the data would reintroduce D-49")
 
     print("the session watchdog understands 'no limit' (D-50)")
     _g0 = LifecycleGuard(lambda r: None, session_limit_h=0.0, verbose=False)
