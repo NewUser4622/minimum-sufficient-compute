@@ -25,10 +25,10 @@ Defect numbering continues from the CIFAR log, which ended at **D-36**.
 | **Dataset** | 129,395 images · 100 classes · fingerprint `2b6269ef…` |
 | **Zoo** | 8 architectures registered, **0 built on a GPU yet** |
 | **Storage** | **local disk only** — no HuggingFace, no network at run time |
-| **Self-checks** | **339** offline, all passing, exit code verified |
+| **Self-checks** | **352** offline, all passing, exit code verified |
 | **Telemetry** | **160** per-epoch + **91** final columns · parity with CIFAR confirmed (§D-40) |
 | **Notebooks** | **5** (`notebooks_in100/`), validated clean, base64 round-trips |
-| **Defects found this port** | **10** (D-37 … D-46) · 10 fixed · 0 open |
+| **Defects found this port** | **11** (D-37 … D-47) · 11 fixed · 0 open |
 | **Runs trained** | 0 / 24 |
 | **Artifacts** | local, under `MSC_ROOT/runs/` — nothing uploaded, nothing deleted |
 
@@ -52,6 +52,68 @@ the one that reproduces, and that is the one to distrust.
 ---
 
 ## 2. Defect log
+
+### D-47 · Names that exist, calls that don't — 16 dry-run failures
+
+**Severity:** every dry run failed; NB1 could not reach GO · **Status:** **fixed**
+**Found:** 2026-08-08 by the user running NB1 on real hardware
+
+```
+[FAIL] resnet50  backbone  at stage 'checkpoint round trip':
+       TypeError: load_checkpoint() missing 2 required positional arguments:
+       'dynamics' and 'device'
+[FAIL] resnet50  oracle    at stage 'compute_msc':
+       TypeError: object of type 'MSCResult' has no len()
+```
+
+Both dry runs, all eight architectures, 16 failures — **two bugs, both mine.**
+
+| call | I wrote | it is |
+|---|---|---|
+| `load_checkpoint` | 6 positional args, unpacked as a 5-tuple | **8** positional args, returns a **dict** |
+| `msc_for_run` | treated the return as an array, `len(msc)` | returns an **`MSCResult` dataclass**; the vector is `.msc` |
+
+**Why the existing guards missed it, and this is the point.** D-38 added a check
+that every free name in the dry runs **resolves**. It passes here: `load_checkpoint`
+exists, `msc_for_run` exists, every name is real. D-39 added a check that every
+`M.x` a notebook calls exists. Also passes.
+
+**Names being real is not the same as calls being right.** Two guards, both
+about existence, and neither could see a call that names the right function and
+hands it the wrong things. The guard needed was arity — and arity is
+mechanically checkable from the same source the names came from.
+
+**Contamination analysis.** None. Both are hard `TypeError`s in a synthetic dry
+run, which is the benign shape: loud, immediate, before any GPU time and before
+the run is claimed. The dry runs did exactly their job — this is a *defect in
+the check*, found by the check.
+
+**Also fixed: the output was unreadable.** Eight architectures × two dry runs
+printed sixteen paragraphs of sklearn's `y_pred contains classes not in y_true`
+(2 samples against 100 classes) and torch's `lr_scheduler.step() before
+optimizer.step()` (the AMP scaler legitimately skips the first step while it
+finds a loss scale). Both are guaranteed on a synthetic batch and mean nothing.
+They are now suppressed **inside the dry runs only**, because a report nobody
+can read is a report nobody reads — the D-17 cost, in a new place.
+
+**Guard added.** An AST arity check: for every call to a module-level function
+from within the dry runs, the analysis wrappers, `verify_run_artifacts`,
+`resolve_storage` and `in100_estimate`, the positional count must fall within
+the callee's range and every keyword must name a real parameter.
+
+**Verified against the actual bug**, not just asserted:
+
+```
+old call passed 6 positional; load_checkpoint needs >= 8   ->  CAUGHT
+```
+
+The oracle dry run now also asserts MSC lies in (0, 1], since ρ is a fraction
+and a value outside that range means the budget table is wrong rather than the
+sweep.
+
+Self-checks 339 → **352**.
+
+---
 
 ### D-45 · One atlas, two FLOPs profilers — and a transformer with no attention counted
 
@@ -818,6 +880,7 @@ would have been theatre.
 
 | Date | Event |
 |---|---|
+| 2026-08-08 | **D-47 — names that exist, calls that don't.** `load_checkpoint` called with 6 of 8 positional args; `msc_for_run`'s `MSCResult` treated as an array. Two existence guards passed both. Arity is now checked by AST, verified against the real bug |
 | 2026-08-08 | **D-45 — one atlas, two FLOPs profilers.** fvcore priced the CNNs and failed on ViT/DeiT/Swin, whose tables were then built by a counter that cannot see attention. rho is DEFINED in FLOPs. torch's flop_counter is now preferred and a fallback RAISES. **Every budget table built before this fix is void** |
 | 2026-08-08 | **D-46 — the preflight failed on the intended configuration.** HF checks in a local-only run, plus "not packed yet" reported as a failure — two false reds beside the genuine D-45, which printed PASS. Three states now, and the synthetic dry runs no longer require the pack |
 | 2026-08-08 | **D-44 — a default path named a drive that does not exist.** NB1 died twice on `WinError 3` for `D:\`, once in the bootstrap cell because `enforce_offline` made *import* depend on a writable directory. Defaults are now `None` and `resolve_storage()` picks the roomiest existing root, proving it by writing and reading back a probe file. Build-time guard: no notebook may contain a drive-letter literal |
