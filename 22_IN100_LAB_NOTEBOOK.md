@@ -1456,3 +1456,101 @@ source of truth for the arm, and it is the one that names the artifact.
 keys. It absorbed a typo here; it will absorb the next one. The column checker
 caught this one only because the key was *read* in a notebook — a key that is
 set and never read is still invisible.
+
+---
+
+## D-55 — the model and its input disagreed on memory format, for 69 epochs
+
+**Symptom.** ResNet-50 trained at a flat **80 img/s** on an RTX 4000 Ada.
+1,491 s per epoch, 41 h projected for one run of 100 epochs. Three days of wall
+clock produced two thirds of one run out of a planned atlas of twenty-four.
+
+Nothing looked broken. Loss fell monotonically, val top-1 reached **80.6% by
+epoch 66**, `*BEST*` kept appearing. The training was correct. It was slow.
+
+**The tell was the flatness.** Across 69 epochs the reading was `80` on 159
+lines and `81` on 9. Thermal throttling drifts. Disk contention spikes. Other
+processes come and go. A number that never moves is a *fixed tax per batch*,
+and that narrows the search enormously — it points at layout, batch size, or a
+serial per-batch cost, and away from anything environmental.
+
+**Cause.** `GPUBatchLoader` ends every batch with
+
+```python
+x = x.contiguous(memory_format=torch.channels_last)
+```
+
+unconditionally, and `base_config` declares `channels_last: True`. Of the
+**sixteen** places this library constructs a model, **one** applied that
+format: `backbone_dry_run`. Every path that actually trains or measures —
+`train_backbone`, `run_oracle`, `train_exit_heads`, `train_msc_kd` — built an
+NCHW model and fed it NHWC activations.
+
+cuDNN cannot convolve an input and a weight that disagree on layout. It
+converts one of them: per convolution, per batch, forward and backward, across
+all 53 convolutions of ResNet-50. The GPU sits near 100% utilisation the entire
+time, which is why every "is the GPU busy" check passed. It was busy
+transposing.
+
+**Two rules failed, and the second is why it survived three days.**
+
+> **Rule 7 — an invariant in a comment is not a mechanism.** `channels_last:
+> True` sat in the config as a declaration that nothing enforced. It was read
+> by exactly one function out of sixteen.
+
+> **Rule 8 — test the thing you WROTE, not the things you imported.** The dry
+> run applied the memory format. The trainer did not. So `[DRY] backbone dry
+> run ok` certified a configuration the real run never executed. The dry run
+> was not merely insufficient here — it was *actively misleading*, because it
+> was the artifact that authorised starting a three-day run.
+
+**And D-43, which I got backwards.** The throughput benchmark measured
+resnet50 at **82 img/s**. I recorded that as "understated, RE-MEASURE pending
+(D-43)" and told the user to re-measure before trusting the atlas budget — and
+that annotation was still sitting in the NB2 estimate table while the real run
+produced **80**. The benchmark had been right to within 2.5%. The prose
+dismissing it was wrong.
+
+I dismissed it because I had a prior that a 4000 Ada "should" do ~180, and I
+attributed the gap to a known defect in the benchmark rather than to the
+pipeline. That is rule 12 inverted: I scrutinised the *unfavourable*
+measurement until it went away, and left the favourable estimate standing.
+457 GPU-h was the honest number all along, and the plan's 235 was never the
+thing that needed explaining.
+
+**Contamination.**
+
+- Every IN-100 training and measurement run so far. All are numerically valid
+  — memory format changes arithmetic only through summation order, which AMP
+  already forfeits, far below seed-to-seed variation. Nothing needs discarding.
+- `IN100_MEASURED_IMG_S` and every budget derived from it describe the broken
+  configuration. The whole atlas estimate must be re-derived after measuring.
+- The `RE-MEASURE pending (D-43)` annotations on `resnet50` and `vgg16` are
+  wrong in the direction they claim and must be removed once re-measured.
+- The completed 69 epochs are **not lost**. Memory format is a stride, not a
+  parameter: `state_dict` is identical either way, so the checkpoint resumes
+  into a channels_last model and simply runs faster from epoch 69 on.
+
+**Fix — one accessor, one assertion, one source check.**
+
+1. `place_model(model, device, cfg, tag)` is now the only sanctioned way to
+   put a model on a device. Twelve construction sites route through it.
+2. `assert_layout_match(model, x)` runs on the **first batch of the run** and
+   *raises*. It compares input format against conv-weight format and fails if
+   they disagree. Microseconds, once. This is the mechanism rule 7 asked for:
+   the failure it guards produces correct numbers and therefore never
+   announces itself.
+3. A self-test parses this module's own source and fails if any function in
+   the compute set builds a model with a bare `.to(device)`. It ships with a
+   canary proving it can fail (D-37).
+
+**The source check earned itself immediately.** On first run it failed on
+`train_msc_kd:9815`, `MSCStudent(...).to(device)` — a thirteenth site my
+manual grep had missed because I had searched for `build_model` and
+`MultiExitModel` and not for the third constructor. A hand audit of sixteen
+sites missed one; the mechanism did not.
+
+**Not yet answered.** Whether layout is the *whole* story. `tools/verify_d55.py`
+measures the two arms in isolated, VRAM-capped subprocesses;
+`tools/diagnose_epochs.py` reads `gpu0_util_mean_pct` and `dataload_frac` out
+of the 69 epochs already on disk. No new budget gets written from an estimate.
