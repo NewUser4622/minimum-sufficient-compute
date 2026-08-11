@@ -6340,9 +6340,7 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
     try:
         n_cls = num_classes_for(ds)
         res = int(cfg.get("input_res", native_res(ds)))
-        model = build_model(cfg["arch"], n_cls, dataset=ds).to(dev)
-        if cfg.get("channels_last"):
-            model = model.to(memory_format=torch.channels_last)
+        model = place_model(build_model(cfg["arch"], n_cls, dataset=ds), dev, cfg)
 
         stage = "optimizer"
         opt, sched = build_optimizer(model, cfg)
@@ -6414,7 +6412,7 @@ def backbone_dry_run(cfg: Dict[str, Any], device=None,
             save_checkpoint(ck, cfg, model, opt, sched, scaler, epoch=0,
                             best_metric=float(val["accuracy"]), dynamics=None,
                             wall_seconds=1.0, energy_joules=0.0)
-            m2 = build_model(cfg["arch"], n_cls, dataset=ds).to(dev)
+            m2 = place_model(build_model(cfg["arch"], n_cls, dataset=ds), dev, cfg)
             o2, s2 = build_optimizer(m2, cfg)
             sc2 = torch.amp.GradScaler(dev.type, enabled=amp)
             # Eight positional arguments, and it returns a DICT. Getting either
@@ -6485,10 +6483,10 @@ def oracle_dry_run(cfg: Dict[str, Any], device=None,
         n_cls = num_classes_for(ds)
         res = int(cfg.get("input_res", native_res(ds)))
         grid = resolutions_for(ds)
-        bb = build_model(cfg["arch"], n_cls, dataset=ds).to(dev).eval()
+        bb = place_model(build_model(cfg["arch"], n_cls, dataset=ds), dev, cfg).eval()
         # K from the model. Never a literal -- D-01b, D-28 and D-33 were all
         # this, and D-33 was a hardcoded 5 inside the check written for D-28.
-        me = MultiExitModel(bb, n_cls, freeze=True).to(dev).eval()
+        me = place_model(MultiExitModel(bb, n_cls, freeze=True), dev, cfg).eval()
         n_heads = len(me.heads)
         if n_heads != len(bb.feature_dims):
             return False, (f"MultiExit built {n_heads} heads for a backbone "
@@ -6591,7 +6589,7 @@ def msckd_dry_run(cfg: Dict[str, Any], teacher, device, amp: bool,
         # failed every healthy run.
         _bb = build_model(cfg["arch"], n_cls)
         n_heads = len(_bb.feature_dims)
-        student = MSCStudent(_bb, n_cls, n_heads).to(device)
+        student = place_model(MSCStudent(_bb, n_cls, n_heads), device, cfg)
         # Resolution from the dataset, not from a `cfg.get(..., 32)` default.
         # The old fallback meant an ImageNet run whose config happened to omit
         # `image_size` would dry-run at 32px, pass, and then fail for real an
@@ -7006,6 +7004,78 @@ def _truncate_history(path: Path, start_epoch: int) -> None:
     except Exception as e:
         log(f"history truncate failed: {e}", "RESUME")
 
+def place_model(model, device, cfg: Optional[Dict[str, Any]] = None,
+                tag: str = ""):
+    """Move a model to `device` in the memory format the LOADER actually emits.
+
+    **D-55, and it cost three days of wall clock.**
+
+    `GPUBatchLoader` ends every batch with
+
+        x = x.contiguous(memory_format=torch.channels_last)
+
+    unconditionally. `base_config` sets `channels_last: True`. And of the
+    sixteen places this library constructs a model, exactly ONE applied that
+    format -- `backbone_dry_run`. Every real path (`train_backbone`,
+    `run_oracle`, `train_exit_heads`, `train_msc_kd`) built an NCHW model and
+    then fed it NHWC activations.
+
+    cuDNN cannot run a convolution whose input and weight disagree on layout.
+    It converts one of them, per convolution, per batch, forward and backward,
+    for the whole network. ResNet-50 on an RTX 4000 Ada held a flat 80 img/s
+    for 69 consecutive epochs -- flat because a layout conversion is a fixed
+    tax, not a variable one. Nothing looked broken. The loss fell, the accuracy
+    climbed to 80.6%, and each epoch took 25 minutes instead of about 8.
+
+    Two rules failed together, and the second is why it survived:
+
+      Rule 7, an invariant in a comment is not a mechanism. `channels_last:
+      True` sat in the config as a statement of intent that nothing enforced.
+
+      Rule 8, test the thing you WROTE. The dry run applied the format. The
+      trainer did not. So the dry run passed a configuration the real run never
+      executed, and passing it is what authorised the three-day run.
+
+    This function is now the only sanctioned way to put a model on a device.
+    One place to read, one place to change, and `assert_layout_match` below
+    turns the invariant into something that fails loudly on batch one.
+    """
+    model = model.to(device)
+    want_cl = True if cfg is None else bool(cfg.get("channels_last", True))
+    if want_cl:
+        model = model.to(memory_format=torch.channels_last)
+    if tag:
+        log(f"{tag}: {'channels_last' if want_cl else 'contiguous'} on {device}",
+            "PERF")
+    return model
+
+
+def assert_layout_match(model, x, where: str = "train") -> None:
+    """Fail on the first batch if activations and weights disagree on layout.
+
+    The mechanism D-55 did not have. Checked once per run -- it walks a handful
+    of conv weights and costs microseconds -- and raises rather than warns,
+    because the failure mode it guards is a 5x slowdown that produces correct
+    numbers and therefore never announces itself.
+    """
+    w = next((m.weight for m in model.modules()
+              if isinstance(m, nn.Conv2d) and m.weight.dim() == 4), None)
+    if w is None or x.dim() != 4:
+        return
+    x_cl = x.is_contiguous(memory_format=torch.channels_last)
+    w_cl = w.is_contiguous(memory_format=torch.channels_last)
+    if x_cl != w_cl:
+        raise RuntimeError(
+            f"[{where}] memory-format mismatch: input is "
+            f"{'channels_last' if x_cl else 'contiguous'} but conv weights are "
+            f"{'channels_last' if w_cl else 'contiguous'}.\n"
+            f"cuDNN will convert one of them on every convolution of every "
+            f"batch. This is D-55: it is not a correctness bug, it is a ~5x "
+            f"throughput bug that trains to the right answer slowly.\n"
+            f"Build the model through place_model(model, device, cfg).")
+
+
+
 
 def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                    work_root=None, data_root_out=None,
@@ -7092,7 +7162,8 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     cfg["sample_order_hash"] = order_hash
     n_train = len(train_loader.dataset)
 
-    model = build_model(cfg["arch"], cfg["num_classes"]).to(device)
+    model = place_model(build_model(cfg["arch"], cfg["num_classes"]),
+                        device, cfg, tag=f'{cfg["arch"]} backbone')
     optimizer, scheduler = build_optimizer(model, cfg)
     amp = bool(cfg.get("amp_enabled", True)) and device.type == "cuda"
     try:
@@ -7221,6 +7292,11 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                 x, y, idx = batch
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
+                if epoch == start_epoch and step == 0:
+                    # D-55. Once per run, on the first batch, before 25 minutes
+                    # of epoch go by. The check that would have caught a flat
+                    # 80 img/s on the first minute instead of the third day.
+                    assert_layout_match(model, x, where=f'train {cfg["arch"]}')
                 with torch.amp.autocast(device_type=device.type, enabled=amp):
                     logits = model(x)
                     loss = criterion(logits, y)
@@ -7691,7 +7767,8 @@ def train_exit_heads(cfg: Dict[str, Any], backbone, train_loader, val_loader,
 
     ~20 epochs at LR 0.01 with cosine decay, roughly 15 minutes per model.
     """
-    me = MultiExitModel(backbone, cfg["num_classes"], freeze=True).to(device)
+    me = place_model(MultiExitModel(backbone, cfg["num_classes"], freeze=True),
+                     device, cfg, tag="exit heads")
     params = [p for p in me.heads.parameters() if p.requires_grad]
     opt = torch.optim.SGD(params, lr=float(cfg.get("exit_lr", 0.01)),
                           momentum=0.9, weight_decay=5e-4, nesterov=True)
@@ -8090,7 +8167,8 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
         raise FileNotFoundError(
             f"no ckpt_best.pt for {run_id}. Train the backbone first (notebook 02).")
 
-    backbone = build_model(cfg["arch"], cfg["num_classes"]).to(device)
+    backbone = place_model(build_model(cfg["arch"], cfg["num_classes"]),
+                           device, cfg, tag="oracle backbone")
     blob = torch.load(ckpt, map_location=device, weights_only=False)
     backbone.load_state_dict(blob["model"], strict=True)
     backbone.eval()
@@ -8102,7 +8180,8 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
 
     # --- exit heads --------------------------------------------------------
     heads_path = run_dir / "exit_heads.pt"
-    me = MultiExitModel(backbone, cfg["num_classes"], freeze=True).to(device)
+    me = place_model(MultiExitModel(backbone, cfg["num_classes"], freeze=True),
+                     device, cfg)
     if heads_path.exists() and not cfg.get("force_rerun"):
         try:
             me.heads.load_state_dict(torch.load(heads_path, map_location=device,
@@ -9620,7 +9699,8 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
         hub.hub.download(work, allow_patterns=[f"runs/{teacher_run}/**"])
     if not t_ck.exists():
         raise FileNotFoundError(f"teacher checkpoint missing for {teacher_run}")
-    teacher = build_model(teacher_arch, cfg["num_classes"]).to(device)
+    teacher = place_model(build_model(teacher_arch, cfg["num_classes"]),
+                          device, cfg, tag=f"{teacher_arch} teacher")
     teacher.load_state_dict(torch.load(t_ck, map_location=device,
                                        weights_only=False)["model"], strict=True)
     teacher.eval()
@@ -9662,7 +9742,8 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
             log(f"pull failed: {type(e).__name__}: {e}", "MSCKD")
         t_heads_p = find_exit_heads(work, teacher_run)
 
-    t_me = MultiExitModel(teacher, cfg["num_classes"], freeze=True).to(device)
+    t_me = place_model(MultiExitModel(teacher, cfg["num_classes"], freeze=True),
+                       device, cfg)
     if t_heads_p is not None:
         log(f"reusing teacher exit heads from {t_heads_p.relative_to(work)}",
             "MSCKD")

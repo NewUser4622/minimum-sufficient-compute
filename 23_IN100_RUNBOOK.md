@@ -341,6 +341,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | `TypeError: train_backbone() missing 2 required positional arguments: 'hub' and 'registry'` | `run_all` was passed the raw library function; it calls `fn(cfg)` with one argument | D-54 — use `sess.run_all(cfgs)` (defaults to `sess.train`), `fn=sess.oracle`, or a closure. Guarded at run time in `run_all` and at build time by `_callback_arity_problems`. |
 | Shuffled-target control looks as good as the real method | the arm never actually shuffled: an invented config key (`shuffle_msc_targets`) that nothing reads | D-54b — derive the arm from `method`. Distrust the favourable reading first (rule 12). |
 | Training is correct but ~5x too slow; img/s identical every epoch | model built NCHW while GPUBatchLoader emits channels_last -- cuDNN transposes every conv, every batch | D-55 — build via `place_model()`. `assert_layout_match` now fails on batch 1. Diagnose with `tools/diagnose_epochs.py`, measure with `tools/verify_d55.py`. |
+| Low VRAM use, GPU idle, `img/s` flat and far below the card's capability | one random 192 KiB read per image from a 24 GiB memmap, 64 per batch, plus Windows IPC (~15 MiB/s) | D-56 — `ram_cache: True` loads the pack resident and `RAMBatchLoader` gathers whole batches. Measure with `tools/verify_loader.py --data-dir <pack>`. |
 
 ### Reading the self-test after any change
 

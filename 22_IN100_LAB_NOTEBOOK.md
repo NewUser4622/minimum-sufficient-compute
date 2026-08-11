@@ -1554,3 +1554,83 @@ sites missed one; the mechanism did not.
 measures the two arms in isolated, VRAM-capped subprocesses;
 `tools/diagnose_epochs.py` reads `gpu0_util_mean_pct` and `dataload_frac` out
 of the 69 epochs already on disk. No new budget gets written from an estimate.
+
+---
+
+## D-56 — the GPU was idle; the bottleneck was one random read per image
+
+**Symptom.** After the D-55 memory-format fix, unchanged: `1.19 b/s`,
+`img/s=58`, `vram=4.3G`. 0.84 s per batch of 64.
+
+**The D-55 fix buying nothing IS the finding.** A compute-path fix that
+changes throughput by zero means compute was never the constraint. I should
+have concluded that from the flatness alone before writing a line of
+`place_model` — a fixed per-batch tax is *equally* consistent with a fixed
+per-batch **wait**, and I only considered the first. D-55 was a real defect and
+worth fixing; it was not this defect.
+
+`vram=4.3G` of 20 GiB said the same thing twice and I did not read it either.
+A GPU that is the bottleneck is usually full. This one was 21% occupied.
+
+**Cause.** `PackedImageDataset.__getitem__`:
+
+```python
+img = np.asarray(self._mmap()[g])       # ONE random 192 KiB read
+return torch.from_numpy(img), int(self.labels[i]), g
+```
+
+Per batch that is 64 independent random reads scattered across a 24 GiB file,
+64 Python round trips, a `default_collate` stack of 64 tensors, and 12.6 MiB
+pickled through a Windows pipe to the parent process. Measured end to end:
+about **15 MiB/s**. NVMe does 1-2 GiB/s at this block size. 15 MiB/s is what a
+spinning disk gives on random access — the pack is not being served from cache
+and 24 GiB of random reads is the worst possible access pattern for it.
+
+Meanwhile the arithmetic ResNet-50 needs is ~0.07 s of the 0.84 s. The card
+spent **92% of every batch waiting.**
+
+**Fix — remove the disk, the per-sample gather, and the IPC together.**
+
+`load_pack_to_ram` reads the pack once, sequentially, into one resident uint8
+array; `RAMBatchLoader` gathers a whole batch with a single `arr[idx]` and
+hands `GPUBatchLoader` byte-identical `(uint8 NHWC, labels, GLOBAL idx)`. One
+prefetch **thread** keeps the gather off the critical path — a thread and not a
+process, because Windows spawn would copy 23.5 GiB into every worker, which is
+the OOM this design exists to avoid. `num_workers` goes to 0 and there is
+nothing left to serialise.
+
+Augmentation stays in `GPUBatchLoader`, untouched. That is the D-40 rule: the
+augmentation lives in the loader so that eleven consumer sites cannot each
+forget it, and a faster loader must not become a twelfth place it can go wrong.
+
+**Two things this nearly broke, both caught before shipping.**
+
+1. **`.indices` means two different things.** `PackedImageDataset.indices` are
+   GLOBAL pack indices; `torch.utils.data.Subset.indices` are POSITIONS in the
+   parent. My first `RAMBatchLoader` read `ds.indices` directly, so on the
+   subset path it would have trained on images `[1, 3]` where it meant
+   `[200, 400]` — numerically valid, silently wrong, images and labels sheared
+   apart. This is D-49 through a side door, and the quiet version is worse than
+   the one that raised. `pack_view_of` walks the wrapper chain and indexes
+   through at each level; the self-test asserts the naive and resolved answers
+   *differ*, so it cannot pass against a broken implementation.
+
+2. **`ram_cache` must not enter `config_hash`.** It very nearly did, by being
+   an ordinary config key. Hashing it would have made every checkpoint on disk
+   unresumable the moment it flipped — 69 epochs of ResNet-50 discarded to
+   change a buffering strategy. It is in `_HASH_EXCLUDE` with
+   `ram_headroom_gb`, `num_workers` and `prefetch_batches`, and a check proves
+   the hash is unchanged. `batch_size` is deliberately NOT excluded: it scales
+   the learning rate and is the recipe, not a knob.
+
+**Safety.** `ram_budget_ok` is asked *before* allocating and refuses unless the
+pack plus 6 GiB of headroom fits in available RAM, falling back to the memmap
+with a reason. Slow is survivable; swapping a Windows box is what cost two
+hours and someone else's admin password in D-41.
+
+**Still open.** Whether the resident loader is fast enough to make the model
+the bottleneck, and what batch size to run once it is. `tools/verify_loader.py`
+measures both arms with no model attached. VRAM at 4.3 of 20 GiB says batch
+size has room — but `batch_size` scales the LR, so raising it restarts the
+resnet50 run, and that trade is only worth making once a full run costs hours
+instead of days. Measure first.

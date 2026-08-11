@@ -2736,6 +2736,227 @@ class PackedImageDataset(Dataset):
         return torch.from_numpy(img), int(self.labels[i]), g
 
 
+# ---------------------------------------------------------------------------
+# D-56: the pack lives in RAM, and batches are gathered whole.
+# ---------------------------------------------------------------------------
+_RAM_PACK: Dict[str, Any] = {}
+
+
+def ram_budget_ok(nbytes: int, headroom_gb: float = 6.0) -> Tuple[bool, str]:
+    """Is there room for `nbytes` in RAM with `headroom_gb` left over?
+
+    Asked BEFORE allocating, because the failure mode of getting this wrong on
+    Windows is not a Python MemoryError -- it is the machine paging itself to
+    a standstill, and this project has already cost its owner two hours and a
+    second person's admin password once (D-41).
+    """
+    try:
+        import psutil
+        avail = psutil.virtual_memory().available
+    except Exception:                                            # noqa: BLE001
+        return False, "psutil unavailable -- cannot prove there is room"
+    need = int(nbytes) + int(headroom_gb * 2**30)
+    ok = avail >= need
+    return ok, (f"{nbytes/2**30:.1f} GiB pack + {headroom_gb:.0f} GiB headroom "
+                f"vs {avail/2**30:.1f} GiB available")
+
+
+def load_pack_to_ram(root: Path, count: int, res: int,
+                     headroom_gb: float = 6.0) -> Optional[np.ndarray]:
+    """Read `images_256.u8` into a single resident uint8 array, once per process.
+
+    Returns None -- and says why -- if it will not fit. Falling back to the
+    memmap is slow, and slow is survivable; swapping is not.
+    """
+    key = str(Path(root).resolve())
+    if key in _RAM_PACK:
+        return _RAM_PACK[key]
+
+    path = Path(root) / "images_256.u8"
+    nbytes = count * res * res * 3
+    ok, why = ram_budget_ok(nbytes, headroom_gb)
+    if not ok:
+        log(f"RAM cache DECLINED: {why}", "DATA")
+        log("falling back to memmap. Slow, but it cannot swap the machine.",
+            "DATA")
+        return None
+
+    log(f"RAM cache: reading {nbytes/2**30:.1f} GiB into memory ({why})", "DATA")
+    t0 = time.time()
+    arr = np.empty((count, res, res, 3), dtype=np.uint8)
+    chunk = max(1, int(512 * 2**20) // (res * res * 3))
+    with open(path, "rb", buffering=0) as fh:
+        done = 0
+        while done < count:
+            n = min(chunk, count - done)
+            got = fh.readinto(
+                memoryview(arr[done:done + n]).cast("B"))
+            if not got:
+                raise RuntimeError(f"short read at image {done} of {count}")
+            done += n
+            if done % (chunk * 8) < chunk or done == count:
+                pct = 100.0 * done / count
+                log(f"  {pct:5.1f}%  {done:,}/{count:,} images "
+                    f"({(time.time()-t0):.0f}s)", "DATA")
+    dt = time.time() - t0
+    log(f"RAM cache ready in {dt:.0f}s "
+        f"({nbytes/2**30/max(dt,1e-9):.2f} GiB/s from disk)", "DATA")
+    _RAM_PACK[key] = arr
+    return arr
+
+
+def pack_root_of(ds):
+    """Unwrap however many Subsets deep to the PackedImageDataset itself."""
+    seen = 0
+    while hasattr(ds, "dataset") and not hasattr(ds, "stored_res"):
+        ds = ds.dataset
+        seen += 1
+        if seen > 8:
+            raise RuntimeError("dataset wrapping deeper than 8 -- refusing to guess")
+    return ds
+
+
+def pack_view_of(ds) -> Tuple[np.ndarray, np.ndarray]:
+    """`(global pack indices, labels)` for a PackedImageDataset or any Subset of one.
+
+    **This is D-49 waiting to happen again, and it nearly did.** Two different
+    attributes are both spelled `indices`:
+
+        PackedImageDataset.indices   GLOBAL pack indices for this split
+        torch.utils.data.Subset.indices   POSITIONS into the parent dataset
+
+    Reading the second where the first is meant produces indices that are
+    numerically valid, silently wrong, and land on the wrong images. D-49 was
+    this confusion costing an IndexError; the quiet version costs a
+    mislabelled training set that still trains.
+
+    Resolved by composition rather than by remembering: walk the wrapper chain
+    and index through at each level.
+    """
+    if hasattr(ds, "dataset") and not hasattr(ds, "stored_res"):
+        gi, lb = pack_view_of(ds.dataset)
+        pos = np.asarray(ds.indices, dtype=np.int64)
+        return gi[pos], lb[pos]
+    return (np.asarray(ds.indices, dtype=np.int64),
+            np.asarray(ds.labels, dtype=np.int64))
+
+
+if _TORCH_OK:
+
+    class RAMBatchLoader:
+        """Yields whole uint8 batches from a resident array. No workers, no IPC.
+
+        **D-56.** The per-sample path cost ~0.84 s per batch of 64 while the
+        model needed ~0.07 s, and none of it was compute: `PackedImageDataset.
+        __getitem__` did ONE random 192 KiB read per sample from a 24 GiB file,
+        64 times a batch, then `default_collate` stacked 64 tensors and Windows
+        pickled 12.6 MiB through a pipe to the parent. Effective rate ~15 MiB/s,
+        which is spinning-disk territory, not SSD.
+
+        Three costs removed at once:
+
+          * the disk, because the pack is resident;
+          * the per-sample gather, because `arr[idx]` fetches the batch in one
+            numpy call instead of 64 Python round trips plus a stack;
+          * the IPC, because with the data already in this process there is
+            nothing to send and `num_workers` goes to 0.
+
+        A single prefetch thread keeps the gather off the critical path. Threads
+        and not processes deliberately: a process would have to copy 23.5 GiB
+        under Windows spawn, which is the OOM this class exists to avoid.
+
+        The contract is byte-identical to the DataLoader it replaces --
+        `(uint8 NHWC, int64 labels, int64 GLOBAL idx)` -- so `GPUBatchLoader`
+        wraps it unchanged and augmentation stays in exactly one place (D-40).
+        """
+
+        def __init__(self, ds, arr: np.ndarray, batch_size: int,
+                     shuffle: bool, seed: int = 0, prefetch: int = 3,
+                     pin: bool = True):
+            self.dataset = ds
+            self.arr = arr
+            self.batch_size = int(batch_size)
+            self.shuffle = bool(shuffle)
+            self.seed = int(seed)
+            self.prefetch = max(1, int(prefetch))
+            self.pin = bool(pin) and torch.cuda.is_available()
+            self._epoch = 0
+            # NOT ds.indices -- see pack_view_of. On a Subset that attribute
+            # means positions in the parent, not global pack indices.
+            self._idx, self._lab = pack_view_of(ds)
+            if len(self._idx) != len(ds):
+                raise RuntimeError(
+                    f"pack view is {len(self._idx)} rows but the dataset is "
+                    f"{len(ds)} -- refusing to train on a misaligned view")
+
+        def __len__(self) -> int:
+            n = len(self._idx)
+            return (n + self.batch_size - 1) // self.batch_size
+
+        def _order(self) -> np.ndarray:
+            n = len(self._idx)
+            if not self.shuffle:
+                return np.arange(n, dtype=np.int64)
+            # Reshuffled every epoch, seeded from (seed, epoch) so a resumed
+            # run does not repeat the order it already trained on.
+            g = np.random.default_rng((self.seed, self._epoch))
+            return g.permutation(n)
+
+        def _make(self, sl: np.ndarray):
+            # Sorting the batch's positions makes the gather sequential in the
+            # resident array. Batch membership is unchanged; only the order
+            # within the batch differs, and nothing downstream depends on it --
+            # every row carries its own global sample_idx (D-49).
+            sl = np.sort(sl)
+            g = self._idx[sl]
+            x = torch.from_numpy(self.arr[g])
+            y = torch.from_numpy(self._lab[sl])
+            i = torch.from_numpy(g)
+            if self.pin:
+                x, y, i = x.pin_memory(), y.pin_memory(), i.pin_memory()
+            return x, y, i
+
+        def __iter__(self):
+            import queue
+            import threading
+
+            order = self._order()
+            self._epoch += 1
+            bs, n = self.batch_size, len(order)
+            spans = [order[b:b + bs] for b in range(0, n, bs)]
+
+            q: "queue.Queue" = queue.Queue(maxsize=self.prefetch)
+            stop = threading.Event()
+
+            def _fill():
+                try:
+                    for sp in spans:
+                        if stop.is_set():
+                            break
+                        q.put(self._make(sp))
+                except Exception as e:                           # noqa: BLE001
+                    q.put(e)
+                q.put(None)
+
+            th = threading.Thread(target=_fill, daemon=True)
+            th.start()
+            try:
+                while True:
+                    item = q.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            finally:
+                stop.set()
+                try:
+                    while not q.empty():
+                        q.get_nowait()
+                except Exception:                                # noqa: BLE001
+                    pass
+
+
 if _TORCH_OK:
 
     class GPUBatchLoader:
@@ -3005,16 +3226,40 @@ def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
     # measured on, and a test that shrinks them is testing something else.
     tr = _subset_train(tr, cfg)
 
-    nw = int(cfg.get("num_workers", min(8, max(0, (os.cpu_count() or 2) - 2))))
-    common = dict(num_workers=nw, pin_memory=(dev.type == "cuda"),
-                  persistent_workers=bool(nw), prefetch_factor=(4 if nw else None))
-    g = torch.Generator(); g.manual_seed(seed)
+    # ---- D-56: resident pack ------------------------------------------------
+    # All three splits index the SAME file, so one resident copy serves them
+    # all -- keyed on the resolved root, loaded at most once per process.
+    arr = None
+    if bool(cfg.get("ram_cache", True)):
+        base = pack_root_of(tr)
+        arr = load_pack_to_ram(root, base.count, base.stored_res,
+                               headroom_gb=float(cfg.get("ram_headroom_gb", 6.0)))
 
-    raw_tr = DataLoader(tr, batch_size=bs, shuffle=True, drop_last=False,
-                        generator=g, **common)
-    # Never shuffle eval loaders. sample_idx alignment depends on it.
-    raw_va = DataLoader(va, batch_size=eval_bs, shuffle=False, **common)
-    raw_ho = DataLoader(ho, batch_size=eval_bs, shuffle=False, **common)
+    if arr is not None:
+        # num_workers is not merely unnecessary here, it is harmful: Windows
+        # spawn would pickle a 23.5 GiB array into every child.
+        raw_tr = RAMBatchLoader(tr, arr, bs, shuffle=True, seed=seed,
+                                pin=(dev.type == "cuda"))
+        # Never shuffle eval loaders. sample_idx alignment depends on it.
+        raw_va = RAMBatchLoader(va, arr, eval_bs, shuffle=False,
+                                pin=(dev.type == "cuda"))
+        raw_ho = RAMBatchLoader(ho, arr, eval_bs, shuffle=False,
+                                pin=(dev.type == "cuda"))
+        log(f"loaders: RAM-resident, batch {bs} train / {eval_bs} eval, "
+            f"0 workers, 1 prefetch thread", "DATA")
+    else:
+        nw = int(cfg.get("num_workers", min(8, max(0, (os.cpu_count() or 2) - 2))))
+        common = dict(num_workers=nw, pin_memory=(dev.type == "cuda"),
+                      persistent_workers=bool(nw),
+                      prefetch_factor=(4 if nw else None))
+        g = torch.Generator(); g.manual_seed(seed)
+
+        raw_tr = DataLoader(tr, batch_size=bs, shuffle=True, drop_last=False,
+                            generator=g, **common)
+        # Never shuffle eval loaders. sample_idx alignment depends on it.
+        raw_va = DataLoader(va, batch_size=eval_bs, shuffle=False, **common)
+        raw_ho = DataLoader(ho, batch_size=eval_bs, shuffle=False, **common)
+        log(f"loaders: memmap, batch {bs}, {nw} workers", "DATA")
 
     mk = lambda raw, train, sd: GPUBatchLoader(
         raw, dev, res, tr.stored_res, spec["mean"], spec["std"],
@@ -5081,6 +5326,11 @@ def _imagenet_config(arch: str, dataset: str, seed: int, phase: str,
         "deterministic": False,
         "channels_last": True,
 
+        # Performance only -- excluded from config_hash, so these can change
+        # between sessions without orphaning a checkpoint (D-56).
+        "ram_cache": True,
+        "ram_headroom_gb": 6.0,
+
         # ---- the recipe contrast, and the ONLY thing that differs between
         # ---- vit_small_p16 and deit_small ------------------------------------
         # Same geometry, same optimiser, same LR, same weight decay, same
@@ -5201,7 +5451,15 @@ _HASH_EXCLUDE = {"config_hash", "output_root", "data_root", "force_rerun",
                  "cleanup_local_after_complete", "milestone_push_every_epochs",
                  "timer_push_sec", "session_limit_h", "energy_sample_hz",
                  "sysmon_hz", "eval_batch_size", "msc_lib_version",
-                 "worker_id", "run_id", "_debug_interrupt_after_epoch"}
+                 "worker_id", "run_id", "_debug_interrupt_after_epoch",
+                 # D-56. How the bytes reach the GPU is not part of the
+                 # experiment. If `ram_cache` were hashed, switching it on
+                 # would make every checkpoint on disk unresumable -- 69
+                 # epochs of ResNet-50 discarded to change a buffering
+                 # strategy. `batch_size` is deliberately NOT here: it scales
+                 # the learning rate and IS the recipe.
+                 "ram_cache", "ram_headroom_gb", "num_workers",
+                 "prefetch_batches"}
 
 
 def config_hash(cfg: Dict[str, Any]) -> str:
@@ -11262,6 +11520,68 @@ def _selftest() -> bool:
                 encoding="utf-8")
         except Exception:                                        # noqa: BLE001
             return ""
+
+    # -- D-56: performance knobs must not orphan a checkpoint ----------------
+    _c_old = {"arch": "resnet50", "seed": 1, "batch_size": 64, "lr": 0.025}
+    _c_new = dict(_c_old, ram_cache=True, ram_headroom_gb=6.0, num_workers=0,
+                  prefetch_batches=3)
+    check("D-56: turning on the RAM cache does not change config_hash",
+          config_hash(_c_old) == config_hash(_c_new),
+          "a resumable run stays resumable")
+    check("D-56 canary: batch_size DOES change config_hash",
+          config_hash(_c_old) != config_hash(dict(_c_old, batch_size=128)),
+          "batch size scales the LR -- it is the recipe, not a knob")
+
+    # -- D-56: the two meanings of `.indices` ---------------------------------
+    class _FakePack:
+        """Stands in for PackedImageDataset: `.indices` are GLOBAL."""
+        stored_res, count = 256, 1000
+        def __init__(self, gi, lb):
+            self.indices = np.asarray(gi, dtype=np.int64)
+            self.labels = np.asarray(lb, dtype=np.int64)
+        def __len__(self): return len(self.indices)
+
+    class _FakeSubset:
+        """Stands in for torch Subset: `.indices` are POSITIONS in the parent."""
+        def __init__(self, ds, pos):
+            self.dataset = ds
+            self.indices = np.asarray(pos, dtype=np.int64)
+        def __len__(self): return len(self.indices)
+
+    # split holds global pack ids 100,200,300,400,500
+    _pk = _FakePack([100, 200, 300, 400, 500], [7, 8, 9, 10, 11])
+    _gi, _lb = pack_view_of(_pk)
+    check("D-56: pack view of a bare dataset returns global indices",
+          _gi.tolist() == [100, 200, 300, 400, 500] and _lb.tolist() == [7, 8, 9, 10, 11],
+          f"{_gi.tolist()}")
+
+    # a subset keeping positions 1 and 3 -> global 200 and 400, labels 8 and 10
+    _sub = _FakeSubset(_pk, [1, 3])
+    _gi2, _lb2 = pack_view_of(_sub)
+    check("D-56: pack view of a Subset resolves POSITIONS to GLOBAL ids",
+          _gi2.tolist() == [200, 400] and _lb2.tolist() == [8, 10],
+          f"got idx={_gi2.tolist()} labels={_lb2.tolist()}")
+
+    # The naive bug: reading Subset.indices directly would give [1, 3] --
+    # valid-looking indices pointing at the wrong images. Prove they differ,
+    # or this test would pass on a broken implementation.
+    check("D-56 canary: naive .indices differs from the resolved view",
+          _sub.indices.tolist() != _gi2.tolist(),
+          f"naive={_sub.indices.tolist()} resolved={_gi2.tolist()}")
+
+    # nested subsets must compose
+    _gi3, _lb3 = pack_view_of(_FakeSubset(_sub, [1]))
+    check("D-56: nested Subsets compose",
+          _gi3.tolist() == [400] and _lb3.tolist() == [10],
+          f"{_gi3.tolist()}")
+
+    check("D-56: pack_root_of unwraps to the dataset with stored_res",
+          pack_root_of(_FakeSubset(_sub, [0])) is _pk)
+
+    _rb, _rwhy = ram_budget_ok(1)
+    check("D-56: ram_budget_ok answers with a reason either way", bool(_rwhy))
+    _nb, _ = ram_budget_ok(1 << 62)
+    check("D-56: ram_budget_ok refuses an impossible request", not _nb)
 
     # -- D-55: every model in a compute path goes through place_model --------
     def _d55_bare_model_placements():
