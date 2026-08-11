@@ -1634,3 +1634,65 @@ measures both arms with no model attached. VRAM at 4.3 of 20 GiB says batch
 size has room — but `batch_size` scales the LR, so raising it restarts the
 resnet50 run, and that trade is only worth making once a full run costs hours
 instead of days. Measure first.
+
+---
+
+## D-57 — two wrong diagnoses from aggregate numbers, next to a file with the answer
+
+**Not a defect in the pipeline. A defect in how I have been debugging it**, and
+it has now cost more of the user's time than any code defect in this project.
+
+**The record.**
+
+| | claim | fix | result |
+|---|---|---|---|
+| D-55 | model is in the wrong memory format | `place_model` everywhere | **0% change** |
+| D-56 | loader is reading from a slow disk | resident RAM pack | **0% change** |
+
+D-56 disproved its own premise on the way past: the RAM cache read 23.7 GiB at
+**3.40 GiB/s**. That is NVMe. The "~15 MiB/s, spinning-disk territory" figure I
+built the whole diagnosis on was not measured — it was inferred from throughput
+by assuming the answer.
+
+**The number that was there the whole time.** `0.045 kWh` per `1491 s` epoch is
+**108 W on a 130 W card** — 83% of TDP, logged on every epoch line since epoch
+1. A starved GPU idles at 20-30 W. This one was working flat out and returning
+80 img/s, which is the signature of *memory-bound work*, not of a stall. Both of
+my diagnoses were stall theories. Both were excluded by a number printed on
+every line I had already read.
+
+**Why it kept happening.** Aggregate throughput cannot distinguish waiting from
+augmenting from computing. Every argument built on it is a guess dressed as an
+inference. `dataload_frac` and `augment_frac` have been computed since D-40 —
+but written only to `epochs.csv`, which nobody opens during a run. I twice
+proposed a tool to read them and twice moved on to a fix before the number came
+back, because a fix feels like progress and waiting does not.
+
+Rule 1 says dry-run the whole path before expensive work. The debugging
+equivalent -- measure the whole path before an expensive fix -- is the same
+rule, and I broke it twice.
+
+**Fix.**
+
+1. **The split is on the progress bar**, refreshed with everything else:
+   `wait%` (blocked on the next batch), `aug%` (GPU augmentation), `step` (ms
+   of forward+backward+optimizer). Whichever dominates is the answer. No tool,
+   no file, no theory. Backed by two real accessors — `EpochTelemetry.
+   load_seconds()` and `GPUBatchLoader.augment_seconds()` — because my first
+   version of this called `tel.load_time_sec()` and `loader.augment_share()`,
+   neither of which exists. That is D-39 exactly, in the patch written to stop
+   guessing.
+   `augment_seconds()` returns `None` rather than `0.0` before its first
+   sample: a confident zero is how you conclude augmentation is free when you
+   have merely not measured it.
+
+2. **`tools/bisect_speed.py`** adds one thing at a time — compute alone,
+   +augmentation, +real data, +instrumentation — in isolated VRAM-capped
+   subprocesses. The stage that drops throughput is the cause. Stage 1 also
+   answers the question neither D-55 nor D-56 asked: *what can this card do at
+   all?* If a 130 W Ada card at batch 64 and 224px tops out near 150 img/s
+   with no loader attached, then no amount of plumbing was ever going to help
+   and the levers are batch size, resolution and architecture.
+
+**Open.** Everything. The cause is not yet known and this entry does not claim
+one. The next entry gets written from the bisection output, not before it.

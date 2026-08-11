@@ -3077,6 +3077,19 @@ if _TORCH_OK:
                     "augment_s": self._aug_s * (n / sampled),
                     "batches": n, "augment_sampled": sampled}
 
+        def augment_seconds(self) -> Optional[float]:
+            """Estimated GPU-augmentation seconds so far this epoch, or None.
+
+            `_aug_s` is sampled every SYNC_EVERY batches because measuring it
+            needs a `cuda.synchronize`, so it is scaled to the batches actually
+            seen. Returns None before the first sample rather than 0.0 -- a
+            confident zero is how you conclude augmentation is free when you
+            have simply not measured it yet.
+            """
+            if self._n_sampled <= 0 or self._n_batches <= 0:
+                return None
+            return self._aug_s * (self._n_batches / self._n_sampled)
+
         def reset_timing(self) -> None:
             self._wait_s = 0.0
             self._aug_s = 0.0
@@ -5704,6 +5717,11 @@ class EpochTelemetry:
         else:
             self.losses.append(loss)
 
+
+    def load_seconds(self) -> float:
+        """Seconds this epoch spent blocked waiting for the next batch."""
+        return float(np.sum(self.dataload_times)) if self.dataload_times else 0.0
+
     def add_step(self, grad_norm: Optional[float], clipped: bool,
                  skipped: bool = False):
         self.opt_steps += 1
@@ -7609,6 +7627,28 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                         # going and learns nothing from those batches. If it is
                         # happening, it should be visible while it happens.
                         _post["nan"] = str(tel.bad_batches)
+                    # D-57. Where the batch time GOES, on the bar, while it is
+                    # going. Two separate wrong diagnoses (D-55 memory format,
+                    # D-56 disk) were argued from a throughput number and a
+                    # VRAM number because the split was only ever written to
+                    # epochs.csv, which nobody opens mid-run. The loader has
+                    # been measuring `wait` and `aug` the whole time.
+                    #
+                    #   wait  main loop blocked on the next batch
+                    #   aug   GPU augmentation (grid_sample, normalise, cast)
+                    #   step  forward + backward + optimizer
+                    #
+                    # Whichever is largest is the thing to fix. No tool to run,
+                    # no file to open, no theory required.
+                    _lt = tel.load_seconds()
+                    _st = max(1e-9, time.time() - _t_epoch0)
+                    _post["wait"] = f"{100.0*_lt/_st:.0f}%"
+                    _as = None
+                    if hasattr(train_loader, "augment_seconds"):
+                        _as = train_loader.augment_seconds()
+                    if _as is not None:
+                        _post["aug"] = f"{100.0*_as/_st:.0f}%"
+                    _post["step"] = f"{1000.0*max(0.0, _st-_lt-(_as or 0.0))/max(1, step+1):.0f}ms"
                     if device.type == "cuda":
                         _post["vram"] = (f"{torch.cuda.max_memory_allocated()/2**30:.1f}G")
                     _bar.set_postfix(_post, refresh=False)
