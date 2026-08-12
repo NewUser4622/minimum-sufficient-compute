@@ -1774,3 +1774,66 @@ argument — to find that out.
 (82.62%) and s2 (82.12%) are numerically valid and stay comparable to seed 3
 run under the new layout. What was lost is time: roughly 35 h per ResNet-50
 seed, twice.
+
+---
+
+## D-60 — the fix that protected 90 hours is what orphaned them
+
+**Symptom.**
+
+```
+RuntimeError: config_hash mismatch for p0-vit_small_p16-imagenet100-base-s2:
+  checkpoint 971a9a257b42 != config 7f5ee93dcca1
+```
+
+73 epochs, refused.
+
+**Cause.** `config_hash` hashes everything **except** `_HASH_EXCLUDE`. So
+*adding* a key to that set changes the hash of every config that has ever
+existed — the key leaves the hashed space entirely. In D-59 I added
+`channels_last` to the exclusion **specifically to stop the flip from orphaning
+finished runs**, and that addition is what orphaned them.
+
+**The test passed.** That is the part worth keeping.
+
+```python
+check("D-59: flipping channels_last does not change config_hash",
+      config_hash(dict(c, channels_last=True))
+      == config_hash(dict(c, channels_last=False)))
+```
+
+Both sides are computed under the **new** rule, where the key is excluded from
+both. It is `hash(x) == hash(x)`. The assertion cannot fail — for any key, in
+any project, forever — and I wrote it, watched it pass, and reported that the
+runs were safe.
+
+D-37 was a self-test that could not fail. This is the same defect in a single
+line, written 400 checks later, in the check whose entire job was to prove a
+change was safe. The lesson does not generalise by having been learned once.
+**A test of an invariant across versions must compare across versions.** Both
+sides being green is not the same as the invariant holding.
+
+**Fix.** `_HASH_EXCLUDE_HISTORY` records every rule this project has hashed
+under. `hash_compatible(cfg, stored)` re-includes the keys excluded *now* but
+hashed *then*, tries each plausible past value, and asks whether any assignment
+reproduces the stored hash. If one does, everything else in the hash is
+byte-identical and the difference is confined to keys since declared
+performance-only.
+
+Verified against the real artifact rather than a fixture: reconstructing with
+`channels_last=True` under rule v1 reproduces `971a9a257b42` exactly.
+
+**It cannot launder a real change.** `lr`, `batch_size`, `num_epochs`, `arch`
+and `seed` are never excluded, so no substitution of a performance key can
+reproduce a hash differing in a recipe key. Three checks assert precisely that,
+each with a changed recipe key that must still be refused, plus a canary
+asserting the old and new hashes genuinely differ — without which the whole
+test would prove nothing again.
+
+**Contamination.** One run blocked, none lost. But the same mismatch would have
+hit `resnet50-s1`, `s2` and `vit-s1` the moment anything touched them, and the
+documented remedy — `force_rerun=True` — would have silently discarded 90 hours
+while looking like the correct instruction.
+
+**Standing.** Every future addition to `_HASH_EXCLUDE` must append the previous
+set to `_HASH_EXCLUDE_HISTORY` in the same commit. The two are one operation.
