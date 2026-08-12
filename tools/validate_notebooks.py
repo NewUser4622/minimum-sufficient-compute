@@ -539,6 +539,54 @@ def _callback_arity_problems(tree: ast.AST):
     return bad
 
 
+NUMERIC_SPEC = re.compile(r"[.,]?\d*[.]\d+[eEfgG%]|[dfeEgG%]$|^\d*\.\d+f$")
+
+
+def _none_format_problems(tree: ast.AST):
+    """An f-string numeric format applied to a value that may be None.
+
+    D-61. `f"{r.get('best_accuracy', float('nan')):.2f}"` reads as careful and
+    is not: `dict.get`'s default fires only when the key is ABSENT. A key that
+    is PRESENT and None goes straight to `format()`:
+
+        TypeError: unsupported format string passed to NoneType.__format__
+
+    Paused, failed and skipped runs all report `best_accuracy: None`. So the
+    summary loop crashed on precisely the runs whose status mattered most, and
+    it crashed AFTER training finished -- which makes a successful epoch look
+    like a broken notebook.
+
+    Restricted to `.get(...)`, deliberately. A subscript that misses raises
+    KeyError -- loud, immediate, impossible to ignore. `.get` is the one that
+    hands you a None which then travels to a format spec. Flagging every
+    subscript caught 8 healthy lines (`est['total_gpu_hours']`, `g[col].min()`)
+    for one real defect, and this file's own docstring says why that is worse
+    than no check: a rule that fires on healthy data teaches you to ignore it,
+    and the next alarm is the real one.
+
+    The fix is `M.fmt_metric(value)`, which is None- and NaN-safe.
+    """
+    bad = []
+    for nd in ast.walk(tree):
+        if not isinstance(nd, ast.FormattedValue) or nd.format_spec is None:
+            continue
+        spec = "".join(v.value for v in nd.format_spec.values
+                       if isinstance(v, ast.Constant) and isinstance(v.value, str))
+        if not spec or not NUMERIC_SPEC.search(spec):
+            continue
+        v = nd.value
+        risky = None
+        if (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                and v.func.attr == "get"):
+            risky = ".get()"
+        if risky:
+            bad.append((f"numeric format {spec!r} applied to a {risky} value, "
+                        f"which is None for paused/failed/skipped runs -- use "
+                        f"M.fmt_metric(...) (D-61)",
+                        getattr(nd, "lineno", 0)))
+    return bad
+
+
 def _result_key_problems(tree: ast.AST):
     """Keys read off a library result that the library does not declare.
 
@@ -678,6 +726,23 @@ def self_test() -> bool:
                   f"notebooks and does not exist")
             ok = False
 
+    # -- the None-format check must be able to fail (D-61) ------------------
+    if not _none_format_problems(ast.parse(
+            "f\"{r.get('best_accuracy', float('nan')):.2f}\"")):
+        print("  [SELFTEST FAIL] the None-format check does not catch the exact "
+              "D-61 line")
+        ok = False
+    for good in ("f\"{M.fmt_metric(r.get('best_accuracy'))}\"",
+                 "f\"{r.get('status','?'):9s}\"",
+                 # subscripts raise KeyError, which is loud -- not this defect
+                 "f\"{est['total_gpu_hours']:.0f}\"",
+                 "f\"{g[col].mean():8.4f}\"",
+                 "f\"{name}\""):
+        if _none_format_problems(ast.parse(good)):
+            print(f"  [SELFTEST FAIL] the None-format check rejects a VALID "
+                  f"line: {good}")
+            ok = False
+
     # -- the callback-arity check must be able to fail (D-54) ---------------
     if not _callback_arity_problems(
             ast.parse("sess.run_all(cfgs, M.train_backbone)")):
@@ -802,6 +867,9 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                 problems.append(
                     f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
                     f"exist" + (f" -- did you mean {near}?" if near else ""))
+
+            for msg, ln in _none_format_problems(tree):
+                problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")
 
             for msg, ln in _callback_arity_problems(tree):
                 problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")

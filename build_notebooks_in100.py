@@ -748,8 +748,11 @@ for r in results:
     if r.get('status') == 'skipped':
         print(f"  SKIPPED   {r['run_id']}  ({r.get('reason')})")
     else:
-        print(f"  {r.get('status','?'):9s} {r['run_id']}  "
-              f"top1={r.get('best_accuracy', float('nan')):.2f}  "
+        # M.fmt_metric, not a bare format spec: a paused or failed run
+        # reports best_accuracy=None, and dict.get's default does not fire on
+        # a key that is PRESENT and null (D-61).
+        print(f"  {r.get('status','?'):9s} {r.get('run_id','?')}  "
+              f"top1={M.fmt_metric(r.get('best_accuracy'))}  "
               f"{r.get('num_epochs_run','?')} epochs")
 """),
         md("""

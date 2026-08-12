@@ -59,6 +59,7 @@ import threading
 import time
 import traceback
 import textwrap
+import itertools
 import warnings
 from inspect import signature as _inspect_signature
 from contextlib import contextmanager
@@ -5518,9 +5519,71 @@ _HASH_EXCLUDE = {"config_hash", "output_root", "data_root", "force_rerun",
                  "prefetch_batches"}
 
 
-def config_hash(cfg: Dict[str, Any]) -> str:
+# Every exclusion set this project has ever hashed under, NEWEST FIRST.
+#
+# D-60. `config_hash` hashes everything EXCEPT this set, so ADDING a key to it
+# changes the hash of every config in existence -- the key leaves the hashed
+# space entirely. Excluding `channels_last` in D-59 to protect 90 hours of
+# finished runs is the very thing that orphaned them.
+#
+# A hash whose DEFINITION changes needs a version, or every future exclusion
+# silently invalidates every checkpoint on disk.
+_HASH_EXCLUDE_V1 = _HASH_EXCLUDE - {"channels_last"}        # before D-59
+_HASH_EXCLUDE_HISTORY: Tuple[frozenset, ...] = (
+    frozenset(_HASH_EXCLUDE),
+    frozenset(_HASH_EXCLUDE_V1),
+)
+
+
+def config_hash(cfg: Dict[str, Any],
+                exclude: Optional[Iterable[str]] = None) -> str:
+    ex = _HASH_EXCLUDE if exclude is None else set(exclude)
     return sha256_of_obj({k: v for k, v in sorted(cfg.items())
-                          if k not in _HASH_EXCLUDE})
+                          if k not in ex})
+
+
+def hash_compatible(cfg: Dict[str, Any], stored: str) -> Tuple[bool, str]:
+    """Is `stored` this config's hash under some EARLIER hashing rule?
+
+    D-60. Answers "did the RECIPE change, or only the RULE?" -- the question
+    the mismatch error should have been asking all along.
+
+    For each historical exclusion set, the keys excluded NOW but hashed THEN
+    are re-included and every plausible past value is tried (for a boolean,
+    True and False). If any assignment reproduces `stored`, everything else in
+    the hash is byte-identical and the difference is confined to keys this
+    project has since declared performance-only.
+
+    This cannot launder a real change. `lr`, `batch_size`, `num_epochs`,
+    `arch` and `seed` are never excluded, so no substitution of a performance
+    key can reproduce a hash that differs in a recipe key. A match is proof.
+    """
+    if not stored:
+        return False, "no stored hash"
+    if config_hash(cfg) == stored:
+        return True, "current rule"
+    for vi, ex in enumerate(_HASH_EXCLUDE_HISTORY[1:], start=1):
+        moved = sorted(set(_HASH_EXCLUDE) - set(ex))
+        if not moved:
+            continue
+        choices = []
+        for k in moved:
+            cur = cfg.get(k)
+            vals = [cur, not cur] if isinstance(cur, bool) else [cur]
+            choices.append([(k, v) for v in vals])
+        combos = 1
+        for c in choices:
+            combos *= len(c)
+        if combos > 64:                      # bounded; never a search space
+            continue
+        for assign in itertools.product(*choices):
+            probe = dict(cfg)
+            probe.update(dict(assign))
+            if config_hash(probe, exclude=ex) == stored:
+                shown = ", ".join(f"{k}={v!r}" for k, v in assign)
+                return True, (f"rule v{vi}, before these became "
+                              f"performance-only: {shown}")
+    return False, "no historical rule reproduces it"
 
 
 def phase0_configs(dataset: str = "cifar100") -> List[Dict[str, Any]]:
@@ -7272,7 +7335,17 @@ def load_checkpoint(path, cfg, model, optimizer, scheduler, scaler,
         msg = (f"config_hash mismatch for {cfg['run_id']}: "
                f"checkpoint {str(ck.get('config_hash'))[:12]} != "
                f"config {cfg['config_hash'][:12]}")
-        if strict_hash:
+        # D-60. Before refusing, ask whether the RECIPE changed or only the
+        # hashing RULE. Adding a key to _HASH_EXCLUDE to protect finished runs
+        # is exactly what orphans them, and throwing away 73 good epochs over
+        # a memory-layout flag is the outcome this check exists to prevent.
+        _ok, _why = hash_compatible(cfg, str(ck.get("config_hash") or ""))
+        if _ok:
+            log(f"{msg}\n  ACCEPTED -- the recipe is unchanged. This checkpoint "
+                f"was hashed under {_why}. Everything hashed under both rules "
+                f"is byte-identical, so the difference is confined to keys "
+                f"since declared performance-only (D-60).", "RESUME")
+        elif strict_hash:
             # Fail loudly. A silent mismatch means you are continuing a run
             # under a config that has been edited since it started, and nobody
             # ever notices until the numbers do not reproduce.
@@ -7280,8 +7353,9 @@ def load_checkpoint(path, cfg, model, optimizer, scheduler, scaler,
                 msg + "\nThe config changed since this run started. Either restore "
                       "the original config, or set force_rerun=True to discard the "
                       "checkpoint and retrain from scratch.")
-        log(msg + " -- starting fresh", "RESUME")
-        return blank
+        else:
+            log(msg + " -- starting fresh", "RESUME")
+            return blank
 
     try:
         model.load_state_dict(ck["model"], strict=True)
@@ -11603,6 +11677,37 @@ def _selftest() -> bool:
                 encoding="utf-8")
         except Exception:                                        # noqa: BLE001
             return ""
+
+    # -- D-60: a checkpoint hashed under the OLD rule must still verify ------
+    #
+    # The D-59 test asked whether two configs hash the same under the CURRENT
+    # rule. They do, trivially -- the key is excluded from both. It could not
+    # fail, and the runs it was written to protect were orphaned anyway. The
+    # real invariant is across rule VERSIONS, so that is what is asserted here.
+    _c60 = {"arch": "vit_small_p16", "seed": 2, "batch_size": 64,
+            "num_epochs": 100, "lr": 6.25e-05, "channels_last": False,
+            "ram_cache": True}
+    _stored_v1 = config_hash(dict(_c60, channels_last=True),
+                             exclude=_HASH_EXCLUDE_V1)
+    _ok60, _why60 = hash_compatible(_c60, _stored_v1)
+    check("D-60: a checkpoint hashed before channels_last was excluded resumes",
+          _ok60, _why60)
+
+    check("D-60 canary: the OLD hash really does differ from the new one",
+          _stored_v1 != config_hash(_c60),
+          "otherwise this test proves nothing")
+
+    # It must NOT launder a recipe change. lr is never excluded, so no
+    # assignment of performance keys can reproduce a hash that differs in it.
+    _bad60, _ = hash_compatible(dict(_c60, lr=1e-3),
+                                config_hash(dict(_c60, channels_last=True),
+                                            exclude=_HASH_EXCLUDE_V1))
+    check("D-60: a changed lr is still REFUSED", not _bad60,
+          "compatibility is proof, not leniency")
+    _bad61, _ = hash_compatible(dict(_c60, batch_size=128), _stored_v1)
+    check("D-60: a changed batch_size is still REFUSED", not _bad61)
+    _bad62, _ = hash_compatible(dict(_c60, num_epochs=60), _stored_v1)
+    check("D-60: a changed num_epochs is still REFUSED", not _bad62)
 
     # -- D-59: the layout flag is honoured, and does not orphan a run --------
     _c59 = {"arch": "resnet50", "seed": 1, "batch_size": 64, "lr": 0.025}

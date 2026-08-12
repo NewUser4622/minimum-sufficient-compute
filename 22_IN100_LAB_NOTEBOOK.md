@@ -1837,3 +1837,55 @@ while looking like the correct instruction.
 
 **Standing.** Every future addition to `_HASH_EXCLUDE` must append the previous
 set to `_HASH_EXCLUDE_HISTORY` in the same commit. The two are one operation.
+
+---
+
+## D-61 — a defensive default that does not defend
+
+**Symptom.** NB2 raises after `run_all` returns. Training had already
+succeeded.
+
+```
+TypeError: unsupported format string passed to NoneType.__format__
+```
+
+**Cause.** The summary loop:
+
+```python
+f"top1={r.get('best_accuracy', float('nan')):.2f}"
+```
+
+`dict.get`'s default fires only when the key is **absent**. A key that is
+present and `None` goes straight to `format()`. Paused, failed and skipped runs
+all report `best_accuracy: None` — present, and null.
+
+So the line crashed on exactly the runs whose status the operator most needed
+to read, and it crashed *after* the training finished. A successful epoch looks
+like a broken notebook. `vit_small_p16-s2` sat at `paused`, epoch 73, having
+resumed correctly through the D-60 fix, and the notebook still reported an
+error.
+
+The `float('nan')` is what makes it worse than a plain oversight: it is a
+visible act of care that does nothing. Reviewing that line, the eye stops at
+the default and moves on.
+
+**Fix.** `M.fmt_metric(value, spec)` — None- and NaN-safe, in the library
+rather than spelled into a cell (D-39), and a build-time check that refuses any
+notebook applying a numeric format spec to a `.get()`.
+
+**And the check itself needed narrowing, which is the second lesson.** The
+first version flagged subscripts too, and reported **9 problems for 1 real
+defect**: `est['total_gpu_hours']`, `g[col].mean()` and six more, every one of
+them healthy. A subscript that misses raises `KeyError` — loud, immediate,
+impossible to miss. `.get` is the one that quietly hands back a `None`.
+
+`validate_notebooks.py` already says this in its own docstring, about its own
+first draft:
+
+> A check that fires on healthy data teaches you to ignore it, and the next
+> alarm is the real one -- which is precisely what D-17 and D-20 cost.
+
+I wrote that sentence and then shipped a checker that did it. The narrowed
+version flags the trap and nothing else, and its self-test now asserts that two
+healthy subscript lines are **accepted**, not merely that the bad line is
+caught.
