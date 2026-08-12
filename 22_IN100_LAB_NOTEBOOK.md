@@ -1889,3 +1889,72 @@ I wrote that sentence and then shipped a checker that did it. The narrowed
 version flags the trap and nothing else, and its self-test now asserts that two
 healthy subscript lines are **accepted**, not merely that the bad line is
 caught.
+
+---
+
+## D-62 — the fix was correct, and the code that ran was not the code on disk
+
+**Symptom.** Byte-identical to D-60, after D-60 was fixed, verified and
+regenerated:
+
+```
+RuntimeError: config_hash mismatch for p0-vit_small_p16-imagenet100-base-s2:
+  checkpoint 971a9a257b42 != config 7f5ee93dcca1
+```
+
+**What the evidence said, and why it was so confusing.** Everything checked out:
+
+- `notebooks_in100/msc_lib.py` was current — 667,507 bytes, matching `src/`.
+- It contained `hash_compatible` and `_HASH_EXCLUDE_HISTORY`.
+- The traceback's line 7381 landed exactly on the `raise` in the **new** code,
+  four lines *after* the `hash_compatible` call.
+- Running that same file against the run's real `config.yaml` returned
+  `True (rule v1, channels_last=True)` and reconstructed `971a9a257b42` exactly.
+- A faithfully rebuilt runtime config returned `True` too.
+
+Every artifact said the fix was present and working. The run said otherwise.
+
+**Cause.** The code executing was not the code on disk. Jupyter holds an
+imported module until something removes it, and — the part that makes this
+survive a bootstrap re-run — **any object built from the old module keeps the
+old functions**. `sess` is a `Session` whose `.train` closes over the *previous*
+`train_backbone`, which calls the *previous* `load_checkpoint`, which has no
+D-60 in it. Re-running the bootstrap cell replaces `sys.modules['msc_lib']` and
+cannot reach inside an object that already exists.
+
+So the fixed library sat on disk, unused, while its predecessor produced the
+old error. Nothing in the system could tell the two apart, and the evidence
+therefore read as "the fix does not work" when it was "the fix never ran". That
+misreading cost two rounds.
+
+**Rule 5, exactly:** *a completion cache must answer "is what I have still
+VALID?", not just "do I have something?"* An imported module is a cache. The
+notebook asked whether `msc_lib` was importable. It never asked whether it was
+**this** `msc_lib`.
+
+**Fix — the build stamp is written into the bytes, so it cannot drift.**
+
+1. `bootstrap()` appends `__MSC_BUILD__ = "<sha12>"` to the library bytes
+   *before* base64-encoding them, and the cell asserts the imported module
+   reports that exact stamp. A stale module fails immediately, by name, with
+   "restart the kernel" — instead of running.
+2. `run_all` compares `Session.run_all.__globals__["__MSC_BUILD__"]` — the
+   module that *defined* the method, which is the one that will actually
+   execute — against the live `sys.modules['msc_lib']`. This catches the case
+   the bootstrap cannot: a fresh module and a **stale object**.
+
+**Verified both directions.** The first version of this test was worthless:
+`M.__MSC_BUILD__` and `Session.run_all.__globals__` are *the same dict*, so
+setting one set the other and the guard never fired. The real scenario has two
+distinct module objects, and the test now builds two. It asserts the guard
+fires on mismatch **and** stays silent on agreement — a guard that always fires
+would break every run.
+
+**Contamination.** D-60 and D-61 were both correct when written and both
+appeared to fail. Any conclusion drawn from a run in this window is suspect,
+including my own reasoning about which fix was needed.
+
+**Standing note.** `src/msc_lib.py` carries no `__MSC_BUILD__`; it is appended
+at build time. So `_mine` is `None` when running from source and the guard is
+inert there by design — it exists for generated notebooks, which is where the
+staleness lives.

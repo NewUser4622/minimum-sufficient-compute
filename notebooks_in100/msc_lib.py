@@ -5535,6 +5535,35 @@ _HASH_EXCLUDE_HISTORY: Tuple[frozenset, ...] = (
 )
 
 
+def fmt_metric(value: Any, spec: str = ".2f", missing: str = "--") -> str:
+    """Format a metric that may legitimately be absent.
+
+    **D-61.** `f"{r.get('best_accuracy', float('nan')):.2f}"` looks defensive
+    and is not. `dict.get`'s default fires only when the key is ABSENT; a key
+    present with value `None` sails past it into `format`, which raises
+
+        TypeError: unsupported format string passed to NoneType.__format__
+
+    A run that paused, failed or was skipped reports `best_accuracy: None` --
+    present, and null. So the summary loop crashed on exactly the runs whose
+    status the operator most needed to read, AFTER the training had succeeded,
+    which makes a completed epoch look like a crashed notebook.
+
+    Anything non-numeric, including None and NaN, prints `missing`.
+    """
+    if value is None:
+        return missing
+    if isinstance(value, bool):
+        return str(value)
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if f != f:                                   # NaN
+        return missing
+    return format(f, spec)
+
+
 def config_hash(cfg: Dict[str, Any],
                 exclude: Optional[Iterable[str]] = None) -> str:
     ex = _HASH_EXCLUDE if exclude is None else set(exclude)

@@ -71,10 +71,16 @@ def notebook(cells):
 
 
 def bootstrap() -> str:
-    lib_b64 = base64.b64encode(LIB.read_bytes()).decode("ascii")
-    core_b64 = base64.b64encode(CORE.read_bytes()).decode("ascii")
-    lib_sha = hashlib.sha256(LIB.read_bytes()).hexdigest()[:12]
-    core_sha = hashlib.sha256(CORE.read_bytes()).hexdigest()[:12]
+    # D-62. Stamp the build INTO the bytes that get written, so the notebook
+    # can prove the module it IMPORTED is the module it SHIPPED. Two fixes in
+    # a row appeared not to work because a stale module was executing.
+    _lb, _cb = LIB.read_bytes(), CORE.read_bytes()
+    lib_sha = hashlib.sha256(_lb).hexdigest()[:12]
+    core_sha = hashlib.sha256(_cb).hexdigest()[:12]
+    _lb += f'\n__MSC_BUILD__ = "{lib_sha}"\n'.encode()
+    _cb += f'\n__MSC_BUILD__ = "{core_sha}"\n'.encode()
+    lib_b64 = base64.b64encode(_lb).decode("ascii")
+    core_b64 = base64.b64encode(_cb).decode("ascii")
 
     def emit(name, chunks):
         return f"_{name} = (\n" + ",\n".join(f"    '{c}'" for c in chunks) + ",\n)"
@@ -113,6 +119,8 @@ if str(WORK) not in sys.path:
     sys.path.insert(0, str(WORK))
 for _m in [m for m in list(sys.modules) if m in ('msc_lib', 'msc_core')]:
     del sys.modules[_m]          # force reimport if this cell is re-run
+import importlib
+importlib.invalidate_caches()
 
 _MISSING = []
 for _pkg, _why in (('torch', 'everything'),
@@ -137,6 +145,30 @@ if _MISSING:
 
 import msc_lib as M
 import torch
+
+# D-62. Prove the module that LOADED is the module that SHIPPED.
+#
+# Twice now a fix was applied, verified, regenerated -- and the run failed with
+# the identical error, because the code executing was not the code on disk.
+# Jupyter keeps an imported module until something removes it, and any object
+# built from the old module (a Session, say) keeps its old functions even after
+# a reimport. There was no mechanism that could tell the difference, so the
+# evidence looked like "the fix does not work" when it was "the fix never ran".
+#
+# Rule 5: a cache must answer "is what I have still VALID", not "do I have
+# something". The stamp is written into the bytes this cell decodes, so it
+# cannot drift from them.
+_want = '{lib_sha}'
+_got = getattr(M, '__MSC_BUILD__', None)
+if _got != _want:
+    raise RuntimeError(
+        f"STALE msc_lib: this notebook ships build {{_want}} but the imported "
+        f"module reports {{_got}}.\n"
+        f"  loaded from: {{getattr(M, '__file__', '?')}}\n"
+        f"  Restart the kernel (Kernel -> Restart) and run all cells. Objects "
+        f"created before a reimport keep the OLD code even after this cell "
+        f"rewrites the file (D-62).")
+print(f'msc_lib build {{_got}} verified')
 
 print(f'msc_lib {{M.__version__}}   torch {{torch.__version__}}')
 print(f'CUDA available: {{torch.cuda.is_available()}}')
