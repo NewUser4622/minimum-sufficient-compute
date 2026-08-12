@@ -543,3 +543,5 @@ def _selftest():
 if __name__ == "__main__":
     import sys
     sys.exit(0 if _selftest() else 1)
+
+__MSC_BUILD__ = "2cc4ba5e0935"

@@ -1958,3 +1958,61 @@ including my own reasoning about which fix was needed.
 at build time. So `_mine` is `None` when running from source and the guard is
 inert there by design — it exists for generated notebooks, which is where the
 staleness lives.
+
+---
+
+## D-63 — the tests agreed with me instead of with the program
+
+**Symptom.** The D-60 error again, third time, with D-60 verified present and
+D-62 confirming the right build was loaded.
+
+**What made it hard.** Every check I could run said the fix worked:
+
+- `hash_compatible(config.yaml, stored)` → `True`, reconstructing
+  `971a9a257b427f20...` in full, read out of the checkpoint's own pickle.
+- A reconstructed runtime config → `True`.
+- Library on disk current, build stamp `87c16f6986cc` matching the notebook.
+
+**Cause, and it was in my own function.** `hash_compatible` recomputed
+`config_hash(cfg)` while everything around it used the *stored*
+`cfg["config_hash"]`. By the time `load_checkpoint` runs, `cfg` has gained keys
+that were not in the dict whose hash was taken, so those two are different
+numbers — and every probe built on the drifted dict misses.
+
+Each of my tests passed a **clean** config, which is the one shape the runtime
+never has. So the function returned `True` for me and `False` on the machine,
+every time, reproducibly. That is the most expensive shape a bug can have: the
+tests confirm the author's mental model rather than exercising the program's
+actual inputs. It is D-37 and D-60's flaw a third time — not "a test that
+cannot fail", but "a test of a situation that never occurs".
+
+**Fix — probe the RECORD, not a reconstruction.** `runs/<id>/config.yaml` is
+written at claim time and is what this run *is*. Now:
+
+1. probe the live config (fast path, clean resume);
+2. probe the record; if it reproduces `stored`, the checkpoint provably
+   belongs to this run;
+3. require the live config not to **change** any key the record has. Keys it
+   merely **adds** were in no hash and cannot alter a result; a changed value
+   is a genuine edit and is still refused, by name and by value.
+
+**Verified against the real artifacts**, not fixtures: the true 64-character
+hash extracted from `ckpt_last.pt`'s pickle, and the run's own `config.yaml`.
+Six cases — clean, two drifted, and `batch_size` / `num_epochs` / `seed`
+changes — all correct. The self-test now builds a drifted config on a real
+temporary record, and its canary asserts that **without** the record the
+drifted config still fails, which is precisely what happened on your machine.
+
+**Two things fixed on the way.**
+
+- `read_yaml` did not exist. `atomic_write_yaml` had been writing `config.yaml`
+  for the whole project and nothing had ever read one back — a writer with no
+  reader, which is why the record was never consulted.
+- The D-62 build stamp broke the base64 round-trip check, which compares the
+  embedded blob to the source file; the stamp is appended after. It failed on a
+  correct build. Fixed to compare against the stamped bytes, and to report
+  *where* the first differing byte is rather than only that one exists.
+
+**The error message now names what changed.** Three rounds were spent guessing
+at a dict the program was holding and could have printed. It says
+`batch_size: 64 -> 128`, or that only runtime keys were added.

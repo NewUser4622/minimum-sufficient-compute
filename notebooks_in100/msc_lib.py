@@ -10927,6 +10927,21 @@ class Session:
             except (TypeError, ValueError) as _e:
                 if "run_all calls fn(cfg)" in str(_e):
                     raise
+        # D-62. A Session built from a PREVIOUS import keeps that module's
+        # functions. Re-running the bootstrap cell replaces sys.modules but
+        # cannot reach into an object already holding the old ones, so a fixed
+        # library and a stale `sess` produce the old failure with the new code
+        # sitting on disk. `__globals__` belongs to the module that defined
+        # this method, which is exactly the one that will run.
+        _live = getattr(sys.modules.get("msc_lib"), "__MSC_BUILD__", None)
+        _mine = Session.run_all.__globals__.get("__MSC_BUILD__")
+        if _live and _mine and _live != _mine:
+            raise RuntimeError(
+                f"STALE Session: this object was built from msc_lib {_mine}, "
+                f"but {_live} is now imported.\n"
+                f"  Every fix since {_mine} is absent from this object.\n"
+                f"  Restart the kernel and run all cells (D-62).")
+
         by_id = {c["run_id"]: c for c in cfgs}
         plan = self.plan(list(by_id), steal_stale=steal_stale, title=title,
                          done_fn=done_fn, stage=stage)
@@ -11706,6 +11721,48 @@ def _selftest() -> bool:
                 encoding="utf-8")
         except Exception:                                        # noqa: BLE001
             return ""
+
+    # -- D-62: a stale module must be detected, not silently obeyed ----------
+    import types as _types
+    _sess = Session.__new__(Session)
+    _saved = sys.modules.get("msc_lib")
+    _g = Session.run_all.__globals__
+    _had = "__MSC_BUILD__" in _g
+    _prev = _g.get("__MSC_BUILD__")
+    try:
+        _g["__MSC_BUILD__"] = "old000000000"
+        _fake = _types.ModuleType("msc_lib")
+        _fake.__MSC_BUILD__ = "new111111111"
+        sys.modules["msc_lib"] = _fake
+        _caught = False
+        try:
+            Session.run_all(_sess, [{"run_id": "x"}])
+        except RuntimeError as _e:
+            _caught = "STALE Session" in str(_e)
+        except Exception:
+            pass
+        check("D-62: a Session from an older build is refused", _caught,
+              "a fixed library and a stale object must not look like a bad fix")
+
+        # and must NOT fire when the builds agree, or every run breaks
+        _fake.__MSC_BUILD__ = "old000000000"
+        _false_alarm = False
+        try:
+            Session.run_all(_sess, [{"run_id": "x"}])
+        except RuntimeError as _e:
+            _false_alarm = "STALE Session" in str(_e)
+        except Exception:
+            pass
+        check("D-62 canary: matching builds are NOT refused", not _false_alarm)
+    finally:
+        if _saved is not None:
+            sys.modules["msc_lib"] = _saved
+        else:
+            sys.modules.pop("msc_lib", None)
+        if _had:
+            _g["__MSC_BUILD__"] = _prev
+        else:
+            _g.pop("__MSC_BUILD__", None)
 
     # -- D-60: a checkpoint hashed under the OLD rule must still verify ------
     #
@@ -13809,3 +13866,5 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(0 if _selftest() else 1)
     print(f"msc_lib v{__version__} -- run with --selftest for the offline checks")
+
+__MSC_BUILD__ = "87c16f6986cc"

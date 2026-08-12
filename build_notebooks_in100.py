@@ -1445,10 +1445,30 @@ def main() -> int:
         nb = json.loads(raw)
         src = "".join(nb["cells"][1]["source"])
         blob = "".join(_re.findall(r"'([A-Za-z0-9+/=]{4,})'", src))
-        lib_b64 = base64.b64encode(LIB.read_bytes()).decode("ascii")
+        # D-62 appends a build stamp to the bytes before encoding, so the
+        # round-trip must be checked against the STAMPED bytes. Comparing
+        # against the raw source file made this fail on a correct build --
+        # a check that cries wolf is the thing this project keeps paying for.
+        _lb = LIB.read_bytes()
+        _sha = hashlib.sha256(_lb).hexdigest()[:12]
+        _stamped = _lb + f'\n__MSC_BUILD__ = "{_sha}"\n'.encode()
+        lib_b64 = base64.b64encode(_stamped).decode("ascii")
         ok = blob.startswith(lib_b64)
         print(f"\n  base64 round-trip: {'byte-identical' if ok else 'MISMATCH'}")
         if not ok:
+            # Decode what is actually embedded and say how it differs, rather
+            # than only that it does.
+            import base64 as _b64
+            try:
+                got = _b64.b64decode(blob[:len(lib_b64)] + "===")
+                print(f"    embedded {len(got):,} bytes, expected "
+                      f"{len(_stamped):,}")
+                for i, (x, y) in enumerate(zip(got, _stamped)):
+                    if x != y:
+                        print(f"    first difference at byte {i:,}")
+                        break
+            except Exception as _e:                              # noqa: BLE001
+                print(f"    could not decode the embedded blob: {_e}")
             return 1
 
     print("\n  validating column names and repo paths")
