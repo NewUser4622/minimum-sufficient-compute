@@ -458,6 +458,16 @@ def environment_report() -> Dict[str, Any]:
             "cuda_version": torch.version.cuda,
             "cudnn": (torch.backends.cudnn.version()
                       if torch.backends.cudnn.is_available() else None),
+            # D-58. The cuDNN VERSION was recorded; whether autotuning was ON
+            # was not. Diagnosing an 8x convolution slowdown then required
+            # reading source to guess at flags the run could have written down.
+            # A backend setting that moves throughput by multiples is
+            # provenance, not trivia.
+            "cudnn_benchmark": bool(getattr(torch.backends.cudnn, "benchmark", False)),
+            "cudnn_deterministic": bool(getattr(torch.backends.cudnn, "deterministic", False)),
+            "cudnn_enabled": bool(getattr(torch.backends.cudnn, "enabled", True)),
+            "tf32_matmul": bool(getattr(torch.backends.cuda.matmul, "allow_tf32", False)),
+            "tf32_cudnn": bool(getattr(torch.backends.cudnn, "allow_tf32", False)),
             "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
             "gpu_names": [torch.cuda.get_device_properties(i).name
                           for i in range(torch.cuda.device_count())]
