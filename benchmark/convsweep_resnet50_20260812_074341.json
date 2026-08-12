@@ -1,0 +1,44 @@
+{
+  "current  (chlast+amp+bench, bs64)": {
+    "img_s": 81.59212092622197,
+    "ms_per_batch": 784.3894640007056,
+    "peak_mb": 4241,
+    "batch": 64
+  },
+  "no channels_last": {
+    "img_s": 550.271497079642,
+    "ms_per_batch": 116.30622399970889,
+    "peak_mb": 4232,
+    "batch": 64
+  },
+  "no cudnn.benchmark": {
+    "img_s": 81.6973077268924,
+    "ms_per_batch": 783.3795480011031,
+    "peak_mb": 2999,
+    "batch": 64
+  },
+  "no AMP (fp32)": {
+    "img_s": 56.51165505558558,
+    "ms_per_batch": 1132.5097439996898,
+    "peak_mb": 7845,
+    "batch": 64
+  },
+  "plain torchvision (no wrapper)": {
+    "img_s": 81.05034479129752,
+    "ms_per_batch": 789.6326680015773,
+    "peak_mb": 4241,
+    "batch": 64
+  },
+  "batch 128": {
+    "img_s": 66.89843378180777,
+    "ms_per_batch": 1913.3482320001349,
+    "peak_mb": 7226,
+    "batch": 128
+  },
+  "batch 256": {
+    "img_s": 58.9776811332584,
+    "ms_per_batch": 4340.6250480003655,
+    "peak_mb": 11189,
+    "batch": 256
+  }
+}

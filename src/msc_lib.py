@@ -2988,7 +2988,11 @@ if _TORCH_OK:
                      mean: Sequence[float], std: Sequence[float],
                      train: bool = False, scale=(0.35, 1.0),
                      ratio=(3.0 / 4.0, 4.0 / 3.0), hflip: bool = True,
-                     seed: int = 0):
+                     seed: int = 0, channels_last: bool = False):
+            # D-59. This used to force channels_last unconditionally while the
+            # config carried a `channels_last` flag that only the model ever
+            # read. The flag now reaches the one line that was ignoring it.
+            self.channels_last = bool(channels_last)
             self.loader = loader
             self.device = device
             self.out_res = int(out_res)
@@ -3129,7 +3133,8 @@ if _TORCH_OK:
                 x = F.grid_sample(x, grid, mode="bilinear",
                                   padding_mode="reflection", align_corners=False)
                 x = (x - self._mean) / self._std
-                x = x.contiguous(memory_format=torch.channels_last)
+                x = (x.contiguous(memory_format=torch.channels_last)
+                     if self.channels_last else x.contiguous())
                 yb = y.to(self.device, non_blocking=True)
 
                 if measure:
@@ -3286,7 +3291,8 @@ def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
 
     mk = lambda raw, train, sd: GPUBatchLoader(
         raw, dev, res, tr.stored_res, spec["mean"], spec["std"],
-        train=train, scale=tuple(cfg.get("rrc_scale", (0.35, 1.0))), seed=sd)
+        train=train, scale=tuple(cfg.get("rrc_scale", (0.35, 1.0))), seed=sd,
+        channels_last=bool(cfg.get("channels_last", False)))
 
     return (mk(raw_tr, True, seed), mk(raw_va, False, 0), mk(raw_ho, False, 0),
             tr.class_names, va.order_hash)
@@ -5256,24 +5262,33 @@ IN100_REF_BATCH = 256       # LR is scaled linearly from this reference
 # Per DC-11 these refine DISPLAYED estimates only. They must never reach
 # `assign_workers`, or ownership stops being deterministic (D-12).
 IN100_MEASURED_IMG_S: Dict[str, float] = {
-    "resnet18":        413.0,
-    "shufflenetv2_in": 640.4,
-    "swin_tiny":       327.1,
-    "convnext_tiny":   272.2,
-    "vgg16":            56.3,
-    "resnet50":         82.3,        # pending: expect ~180 with cudnn.benchmark
-    # vit_small_p16 and deit_small failed to BUILD in that run (D-42) and have
-    # never been measured. The figure below is inferred from `swin_tiny`, whose
-    # FLOPs are within 2%, and is a placeholder carrying no measurement.
-    "vit_small_p16":   380.0,        # ESTIMATE, not measured
-    "deit_small":      380.0,        # ESTIMATE, not measured
+    # D-59 invalidated every convolutional entry here. All of them were taken
+    # under channels_last, which measured 6.7x SLOWER than contiguous on this
+    # card. The numbers were real; the configuration was wrong.
+    #
+    # PRODUCTION (100 epochs on real data, C:\msc_results):
+    "vit_small_p16":   604.0,        # 203 s/epoch, 2 runs agreeing to 0.2%
+    # CONV SWEEP (synthetic, contiguous, bs64 -- excludes ~1% augmentation):
+    "resnet50":        550.3,        # was 82.3 under channels_last
+    # NOT RE-MEASURED SINCE D-59. Every figure below is from the slow layout
+    # and understates the truth, probably by a large factor. Budgets built on
+    # them are wrong in the pessimistic direction -- which is the safe
+    # direction, but it is not a measurement.
+    "resnet18":        413.0,        # STALE: channels_last
+    "shufflenetv2_in": 640.4,        # STALE: channels_last
+    "swin_tiny":       327.1,        # STALE: channels_last
+    "convnext_tiny":   272.2,        # STALE: channels_last
+    "vgg16":            56.3,        # STALE: channels_last
+    "deit_small":      604.0,        # from vit_small_p16: same builder, same args
 }
 IN100_MEASURED_PEAK_GB: Dict[str, float] = {
     "resnet18": 0.88, "shufflenetv2_in": 0.72, "resnet50": 2.93,
     "vgg16": 4.39, "swin_tiny": 4.53, "convnext_tiny": 5.13,
 }
 IN100_UNMEASURED = ("vit_small_p16", "deit_small")
-IN100_PENDING_REMEASURE = ("resnet50", "vgg16")
+# D-59: everything still carrying a channels_last measurement.
+IN100_PENDING_REMEASURE = ("resnet18", "shufflenetv2_in", "swin_tiny",
+                          "convnext_tiny", "vgg16")
 
 
 def in100_estimate(archs: Sequence[str], seeds: int = 3,
@@ -5347,7 +5362,18 @@ def _imagenet_config(arch: str, dataset: str, seed: int, phase: str,
         "amp_enabled": True,
         "gradient_accumulation_steps": 1,
         "deterministic": False,
-        "channels_last": True,
+
+        # D-59. MEASURED on this hardware, not assumed. tools/conv_sweep.py,
+        # ResNet-50 @224 bs64, RTX 4000 Ada / cuDNN 9.1 / driver 581.42:
+        #
+        #   channels_last     81.6 img/s    784 ms/batch
+        #   contiguous       550.3 img/s    116 ms/batch     6.7x FASTER
+        #
+        # The textbook advice is the opposite, and on most NVIDIA parts it is
+        # right. It is not right here, and "usually true" is how this cost
+        # 41.5 h per ResNet-50 run instead of 6. Re-run conv_sweep.py on any
+        # new machine rather than inheriting this number.
+        "channels_last": False,
 
         # Performance only -- excluded from config_hash, so these can change
         # between sessions without orphaning a checkpoint (D-56).
@@ -5482,6 +5508,13 @@ _HASH_EXCLUDE = {"config_hash", "output_root", "data_root", "force_rerun",
                  # strategy. `batch_size` is deliberately NOT here: it scales
                  # the learning rate and IS the recipe.
                  "ram_cache", "ram_headroom_gb", "num_workers",
+                 # D-59. Memory format changes floating-point summation order
+                 # and nothing else -- the same forfeit AMP already makes, far
+                 # below seed-to-seed variance. Hashing it would orphan
+                 # resnet50 s1+s2 (100 epochs each) and vit s2 (73) the moment
+                 # the measurement said to flip it: 90 hours discarded over a
+                 # stride.
+                 "channels_last",
                  "prefetch_batches"}
 
 
@@ -11570,6 +11603,28 @@ def _selftest() -> bool:
                 encoding="utf-8")
         except Exception:                                        # noqa: BLE001
             return ""
+
+    # -- D-59: the layout flag is honoured, and does not orphan a run --------
+    _c59 = {"arch": "resnet50", "seed": 1, "batch_size": 64, "lr": 0.025}
+    check("D-59: flipping channels_last does not change config_hash",
+          config_hash(dict(_c59, channels_last=True))
+          == config_hash(dict(_c59, channels_last=False)),
+          "90 h of finished runs stay resumable")
+
+    _ic = base_config("resnet50", "imagenet100")
+    check("D-59: imagenet100 defaults to contiguous (measured 6.7x)",
+          _ic.get("channels_last") is False,
+          f"channels_last={_ic.get('channels_last')}")
+
+    # The loader must READ the flag. It ignored it for the project's whole
+    # life, forcing channels_last while the config carried a setting that only
+    # the model consulted -- so the two could never disagree visibly.
+    _gsrc = _src_of_module()
+    _i = _gsrc.find("class GPUBatchLoader")
+    _seg = _gsrc[_i:_i + 12000] if _i >= 0 else ""
+    check("D-59: GPUBatchLoader honours channels_last instead of forcing it",
+          ("if self.channels_last else" in _seg) and ("self.channels_last = " in _seg),
+          "the flag reaches the line that was ignoring it")
 
     # -- D-56: performance knobs must not orphan a checkpoint ----------------
     _c_old = {"arch": "resnet50", "seed": 1, "batch_size": 64, "lr": 0.025}

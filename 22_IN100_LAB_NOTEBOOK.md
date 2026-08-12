@@ -1696,3 +1696,81 @@ rule, and I broke it twice.
 
 **Open.** Everything. The cause is not yet known and this entry does not claim
 one. The next entry gets written from the bisection output, not before it.
+
+---
+
+## D-59 — channels_last was 6.7x SLOWER, and D-55 enforced it
+
+**Measured**, `tools/conv_sweep.py`, ResNet-50 @224 bs64, RTX 4000 Ada /
+cuDNN 9.1 / driver 581.42:
+
+| configuration | img/s | ms/batch |
+|---|---|---|
+| current (channels_last + AMP + benchmark) | 81.6 | 784 |
+| **no channels_last** | **550.3** | **116** |
+| no cudnn.benchmark | 81.7 | 783 |
+| no AMP (fp32) | 56.5 | 1133 |
+| plain torchvision, no `StagedBackbone` | 81.1 | 790 |
+| batch 128 | 66.9 | 1913 |
+| batch 256 | 59.0 | 4341 |
+
+One variable. **6.7x.** ResNet-50 for three seeds goes from 122 h to 18 h.
+
+The controls matter as much as the answer. `plain torchvision` at 81.1 clears
+`StagedBackbone` — had that row been fast, every cuDNN theory would have been
+irrelevant and I would have kept tuning the wrong layer. `no cudnn.benchmark`
+at 81.7 retires the D-43 hypothesis I had been carrying since the first
+benchmark. And batch 128/256 getting *worse* under the bad layout shows how a
+sweep on one axis misleads when a different axis is broken: a batch-size study
+run yesterday would have concluded "bigger batches hurt on this card", which is
+false.
+
+**Root cause.** `GPUBatchLoader` ended every batch with
+
+```python
+x = x.contiguous(memory_format=torch.channels_last)
+```
+
+unconditionally — since the first ImageNet-100 commit. The config carried a
+`channels_last` flag that **only the model ever read**, so the two could never
+visibly disagree and the flag could never turn the behaviour off.
+
+**And this is where D-55 goes badly wrong.** I found sixteen model sites, one
+of which applied the format, and concluded the fifteen were wrong. The
+alternative reading — that the *one* was wrong, and the loader with it — never
+got considered, because channels_last is standard advice for convnets under
+AMP and I treated "usually true" as "true here". So I wrote `place_model`,
+routed thirteen sites through it, and added `assert_layout_match` to *raise* if
+anything ever disagreed. I built a mechanism to enforce a choice nobody had
+measured, and made the slow path harder to escape.
+
+Rule 2 says never hardcode a value; ask. I asked the config, and the config was
+repeating my assumption back to me.
+
+The mechanism was still right. `place_model` and `assert_layout_match` are what
+make `channels_last: False` land at all thirteen sites at once and stay
+consistent. Only the direction was wrong, and it took a measurement — not an
+argument — to find that out.
+
+**Fix.**
+
+1. `GPUBatchLoader` takes `channels_last` and honours it. The flag now reaches
+   the line that was ignoring it.
+2. `base_config` defaults ImageNet-100 to `channels_last: False`, with the
+   measurement in the comment and an instruction to re-run `conv_sweep.py` on
+   any new machine rather than inherit the number.
+3. `channels_last` joins `_HASH_EXCLUDE`. Memory format changes floating-point
+   summation order and nothing else — the forfeit AMP already makes, far below
+   seed-to-seed variance. Hashing it would have orphaned resnet50 s1+s2 (100
+   epochs each) and vit s2 (73) the instant the measurement said to flip:
+   **90 hours discarded over a stride.**
+4. `IN100_MEASURED_IMG_S` is corrected. Every convolutional entry was taken
+   under the slow layout and is now marked STALE with `IN100_PENDING_REMEASURE`
+   widened from two architectures to five. The numbers were real; the
+   configuration was wrong, which is a worse failure than a missing number
+   because it looks like data.
+
+**Contamination.** None of the finished runs is invalidated — resnet50 s1
+(82.62%) and s2 (82.12%) are numerically valid and stay comparable to seed 3
+run under the new layout. What was lost is time: roughly 35 h per ResNet-50
+seed, twice.
