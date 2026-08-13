@@ -1285,12 +1285,20 @@ RUN_ARTIFACTS_REQUIRED = (
     "config_hash.txt",
     "summary.json",
     "metrics/epochs.csv",
-    "metrics/final.csv",
     "checkpoints/ckpt_last.pt",
     "checkpoints/ckpt_best.pt",
     "env/environment.json",
 )
 RUN_ARTIFACTS_MEASURED = (
+    # D-64. `final.csv` sat in REQUIRED, which is checked after TRAINING, but
+    # only `run_oracle` writes it -- `final_evaluation` is called from there
+    # and from nowhere else. So every correctly-finished training run verified
+    # as INCOMPLETE, on all four Phase-0 runs at once.
+    #
+    # Nothing was lost: the file arrives when NB3 runs. But a verifier that
+    # reports healthy runs as broken is the failure this project keeps paying
+    # for -- it trains you to skim the output, and the next alarm is real.
+    "metrics/final.csv",
     "per_sample/test.parquet",
     "per_sample/train_holdout.parquet",
     "per_sample/meta.json",
@@ -1306,6 +1314,66 @@ RUN_ARTIFACTS_EXPECTED = (
     "telemetry/step_traces.jsonl",
     "per_sample/train_dynamics.parquet",
 )
+
+
+def phases_present(work) -> Dict[str, Dict[str, int]]:
+    """`{phase: {"runs": n, "completed": n}}` read straight off disk.
+
+    Filesystem only -- no Session, no ledger, no data directory. It has to work
+    before anything is configured, because its job is to tell you what to
+    configure.
+    """
+    out: Dict[str, Dict[str, int]] = {}
+    root = Path(work) / "runs"
+    if not root.exists():
+        return out
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        try:
+            ph = parse_run_id(d.name)["phase"]
+        except Exception:                                        # noqa: BLE001
+            continue
+        rec = out.setdefault(ph, {"runs": 0, "completed": 0})
+        rec["runs"] += 1
+        st = read_json(d / "STATUS.json", {}) or {}
+        if str(st.get("state", "")) == "completed":
+            rec["completed"] += 1
+    return out
+
+
+def detect_phase(work, prefer: Optional[str] = None) -> str:
+    """Which phase should this notebook operate on?
+
+    **D-65.** NB3, NB4 and NB5 each hardcoded `PHASE = 'p1'` while NB2 trains
+    `p0`. Run them in order, unedited, and NB3 finds zero `p1` runs, prints
+    `0 trained run(s), 0 still to measure`, calls `run_all([])` and exits
+    successfully. Nothing failed. Nothing happened either, and the next
+    notebook then has nothing to analyse -- for a reason three notebooks back.
+
+    A default that is wrong for the documented order is not a default, it is a
+    trap, and "silently does nothing" is the worst way to spring it.
+
+    `prefer` wins if it has runs. Otherwise the phase with the most completed
+    runs. Raises -- listing what IS on disk -- rather than returning a phase
+    with no work in it.
+    """
+    seen = phases_present(work)
+    if prefer and seen.get(prefer, {}).get("completed", 0) > 0:
+        return prefer
+    live = {k: v for k, v in seen.items() if v["completed"] > 0}
+    if not live:
+        raise RuntimeError(
+            f"no completed runs under {work}.\n"
+            f"  phases with any runs at all: "
+            f"{ {k: v['runs'] for k, v in seen.items()} or 'none'}\n"
+            f"  Run NB2 first, or point MSC_ROOT at the right results folder.")
+    best = max(live, key=lambda k: live[k]["completed"])
+    if prefer and prefer != best:
+        log(f"phase {prefer!r} has no completed runs; using {best!r} "
+            f"({live[best]['completed']} completed). Set PHASE explicitly to "
+            f"override (D-65).", "PHASE")
+    return best
 
 
 def verify_run_artifacts(work, run_id: str, measured: bool = False,
@@ -11854,6 +11922,51 @@ def _selftest() -> bool:
     _ok60, _why60 = hash_compatible(_c60, _stored_v1)
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
+
+    # -- D-64: the artifact spec must agree with the code that writes ---------
+    #
+    # `final.csv` was listed as REQUIRED (checked after training) while only
+    # `run_oracle` writes it, so four healthy runs verified as incomplete. The
+    # list and the writers are two spellings of one truth (D-16), so this reads
+    # the writers out of this module's own source rather than trusting either.
+    def _scratch_run_root():
+        import tempfile as _t
+        return Path(_t.mkdtemp(prefix="msc_d64_"))
+
+    def _artifact_writers():
+        import ast as _a
+        try:
+            tree = _a.parse(_src_of_module())
+        except Exception:                                        # noqa: BLE001
+            return {}
+        out = {}
+        for fn in tree.body:
+            if not isinstance(fn, (_a.FunctionDef, _a.AsyncFunctionDef)):
+                continue
+            for nd in _a.walk(fn):
+                if isinstance(nd, _a.Constant) and isinstance(nd.value, str):
+                    v = nd.value
+                    if v.endswith((".csv", ".parquet", ".json", ".pt", ".jsonl")):
+                        out.setdefault(v, set()).add(fn.name)
+        return out
+
+    _writers = _artifact_writers()
+    _oracle_only = []
+    for _art in RUN_ARTIFACTS_REQUIRED:
+        _fns = _writers.get(_art.split("/")[-1], set())
+        if _fns and _fns <= {"run_oracle"}:
+            _oracle_only.append(f"{_art} <- only run_oracle")
+    check("D-64: no train-stage REQUIRED artifact is written only by the oracle",
+          not _oracle_only,
+          "OK" if not _oracle_only else "; ".join(_oracle_only))
+
+    check("D-64 canary: the writer map can see run_oracle's outputs",
+          "run_oracle" in _writers.get("test.parquet", set()),
+          "otherwise the check above proves nothing")
+
+    _vrep = verify_run_artifacts(_scratch_run_root(), "nonexistent-run")
+    check("D-64: verify_run_artifacts reports a missing run rather than raising",
+          isinstance(_vrep, dict) and not _vrep.get("ok"))
 
     # D-63. The D-60 tests all used a CLEAN config, which is the one shape the
     # runtime never has. `load_checkpoint` sees a dict that has since gained

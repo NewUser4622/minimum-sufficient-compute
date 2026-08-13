@@ -2016,3 +2016,58 @@ drifted config still fails, which is precisely what happened on your machine.
 **The error message now names what changed.** Three rounds were spent guessing
 at a dict the program was holding and could have printed. It says
 `batch_size: 64 -> 128`, or that only runtime keys were added.
+
+---
+
+## D-64 — the artifact spec disagreed with the code that writes
+
+`verify_run_artifacts(measured=False)` reported **all four** completed Phase-0
+runs as incomplete: `missing_required: ['metrics/final.csv']`.
+
+`metrics/final.csv` sat in `RUN_ARTIFACTS_REQUIRED`, which is checked after
+**training**. But `final_evaluation()` is the only thing that writes it, and it
+is called from exactly one place — inside `run_oracle`, the **measurement**
+stage. So the file cannot exist until NB3 runs, and every healthy training run
+verified as broken.
+
+Nothing was lost; the file arrives with NB3. The cost is the one this project
+keeps paying: a verifier that flags healthy runs trains you to skim its output,
+and the next alarm is the real one. That is D-17 and D-20's lesson, and D-61's,
+in a third place.
+
+**Fix.** `final.csv` moved to `RUN_ARTIFACTS_MEASURED`. And because the list
+and the writers are two spellings of one truth (D-16), a self-test now parses
+this module's own source, maps every artifact filename to the functions that
+write it, and fails if anything in the train-stage REQUIRED list is written
+only by `run_oracle`. Its canary asserts the map can see `run_oracle`'s outputs
+at all, without which the check would pass by seeing nothing.
+
+---
+
+## D-65 — three notebooks hardcoded a phase the pilot never writes
+
+NB2 trains `p0`. NB3, NB4 and NB5 each opened with `PHASE = 'p1'`.
+
+Run them in the documented order, unedited, and NB3 finds zero `p1` runs,
+prints `0 trained run(s), 0 still to measure`, calls `run_all([])`, and **exits
+successfully**. Nothing failed. Nothing happened. NB4 then has nothing to
+analyse, for a reason three notebooks upstream, and the only symptom anywhere
+is a line saying zero — which reads like "already done".
+
+A default that is wrong for the documented order is not a default, it is a
+trap. Silence is the worst way to spring one: every other defect in this log
+announced itself with a traceback.
+
+**Fix.** `detect_phase(work, prefer=)` reads the phases actually on disk and
+returns the one with completed runs, logging when it overrides the preference
+and **raising** — listing what is present — rather than returning a phase with
+no work in it. Notebooks that *create* runs still name their phase; notebooks
+that *consume* runs detect it, via the shared `paths_cell`, so the three cannot
+drift apart again. `phases_present()` is filesystem-only: no Session, no
+ledger, no data directory, because its job is to tell you what to configure.
+
+Verified against the real results root: `prefer='p1'` resolves to `p0`, with
+`[PHASE] phase 'p1' has no completed runs; using 'p0' (4 completed)`.
+
+**Contamination.** None — NB3 had not been run yet. Had it been, it would have
+appeared to succeed.

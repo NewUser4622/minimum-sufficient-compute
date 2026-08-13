@@ -250,6 +250,24 @@ def atomic_save_torch(path, obj) -> None:
     _atomic_replace(tmp, path)
 
 
+def read_yaml(path, default=None):
+    """Counterpart to `atomic_write_yaml`. There was a writer and no reader.
+
+    D-63: I reached for `read_yaml` while fixing a defect caused by not
+    reading the config record, and it did not exist -- the config.yaml every
+    run writes had never once been read back by this library. Falls back to
+    the .json sibling, matching what `atomic_write_yaml` does when PyYAML is
+    unavailable.
+    """
+    p = Path(path)
+    if yaml is not None and p.exists():
+        try:
+            return yaml.safe_load(p.read_text(encoding="utf-8")) or default
+        except Exception:                                        # noqa: BLE001
+            return default
+    return read_json(p.with_suffix(".json"), default)
+
+
 def read_json(path, default=None):
     p = Path(path)
     if not p.exists():
@@ -5571,49 +5589,105 @@ def config_hash(cfg: Dict[str, Any],
                           if k not in ex})
 
 
-def hash_compatible(cfg: Dict[str, Any], stored: str) -> Tuple[bool, str]:
-    """Is `stored` this config's hash under some EARLIER hashing rule?
+def hashed_key_diff(a: Dict[str, Any], b: Dict[str, Any],
+                    exclude: Optional[Iterable[str]] = None
+                    ) -> List[Tuple[str, Any, Any]]:
+    """Keys that PARTICIPATE in the hash and differ. The message D-60 owed you.
 
-    D-60. Answers "did the RECIPE change, or only the RULE?" -- the question
-    the mismatch error should have been asking all along.
+    "The config changed since this run started" never said WHAT changed, so
+    three rounds were spent guessing at a dict the code was holding and could
+    simply have printed.
+    """
+    ex = _HASH_EXCLUDE if exclude is None else set(exclude)
+    ka = {k: v for k, v in a.items() if k not in ex}
+    kb = {k: v for k, v in b.items() if k not in ex}
+    out = []
+    for k in sorted(set(ka) | set(kb)):
+        va, vb = ka.get(k, "<absent>"), kb.get(k, "<absent>")
+        if sha256_of_obj({k: va}) != sha256_of_obj({k: vb}):
+            out.append((k, va, vb))
+    return out
 
-    For each historical exclusion set, the keys excluded NOW but hashed THEN
-    are re-included and every plausible past value is tried (for a boolean,
-    True and False). If any assignment reproduces `stored`, everything else in
-    the hash is byte-identical and the difference is confined to keys this
-    project has since declared performance-only.
 
-    This cannot launder a real change. `lr`, `batch_size`, `num_epochs`,
-    `arch` and `seed` are never excluded, so no substitution of a performance
-    key can reproduce a hash that differs in a recipe key. A match is proof.
+def hash_compatible(cfg: Dict[str, Any], stored: str,
+                    run_dir: Optional[Path] = None) -> Tuple[bool, str]:
+    """Is `stored` this run's hash under some earlier hashing rule?
+
+    D-60 asked "did the RECIPE change, or only the RULE?". D-63 is about what
+    it asked the question OF.
+
+    The first version probed the live `cfg` alone. By the time
+    `load_checkpoint` runs, that dict has picked up keys that were not present
+    when its hash was taken, so `config_hash(cfg)` and `cfg["config_hash"]` are
+    two different numbers and every probe built on it misses. The function
+    returned True in every test I wrote -- all of which used a clean config --
+    and False on the machine. That is the most expensive shape a bug can have:
+    the tests agree with the author instead of with the program.
+
+    `runs/<id>/config.yaml` is written from the config at claim time and is the
+    authoritative record of what this run IS. So:
+
+      1. probe the live config (fast path, covers a clean resume);
+      2. probe the record; if the record reproduces `stored`, this checkpoint
+         provably belongs to this run;
+      3. then require the live config not to CHANGE any key the record has.
+         Keys the live config merely ADDS were in no hash and cannot alter a
+         result. A changed value is a genuine edit and is still refused.
     """
     if not stored:
         return False, "no stored hash"
     if config_hash(cfg) == stored:
         return True, "current rule"
-    for vi, ex in enumerate(_HASH_EXCLUDE_HISTORY[1:], start=1):
-        moved = sorted(set(_HASH_EXCLUDE) - set(ex))
-        if not moved:
-            continue
-        choices = []
-        for k in moved:
-            cur = cfg.get(k)
-            vals = [cur, not cur] if isinstance(cur, bool) else [cur]
-            choices.append([(k, v) for v in vals])
-        combos = 1
-        for c in choices:
-            combos *= len(c)
-        if combos > 64:                      # bounded; never a search space
-            continue
-        for assign in itertools.product(*choices):
-            probe = dict(cfg)
-            probe.update(dict(assign))
-            if config_hash(probe, exclude=ex) == stored:
-                shown = ", ".join(f"{k}={v!r}" for k, v in assign)
-                return True, (f"rule v{vi}, before these became "
-                              f"performance-only: {shown}")
-    return False, "no historical rule reproduces it"
 
+    def _probe(d: Dict[str, Any]) -> Tuple[Optional[int], str]:
+        for vi, ex in enumerate(_HASH_EXCLUDE_HISTORY[1:], start=1):
+            moved = sorted(set(_HASH_EXCLUDE) - set(ex))
+            if not moved:
+                continue
+            choices = []
+            for k in moved:
+                cur = d.get(k)
+                vals = [cur, not cur] if isinstance(cur, bool) else [cur]
+                choices.append([(k, v) for v in vals])
+            combos = 1
+            for c in choices:
+                combos *= len(c)
+            if combos > 64:                  # bounded; never a search space
+                continue
+            for assign in itertools.product(*choices):
+                probe = dict(d)
+                probe.update(dict(assign))
+                if config_hash(probe, exclude=ex) == stored:
+                    return vi, ", ".join(f"{k}={v!r}" for k, v in assign)
+        return None, ""
+
+    vi, shown = _probe(cfg)
+    if vi is not None:
+        return True, f"rule v{vi}, before these became performance-only: {shown}"
+
+    if run_dir is not None:
+        try:
+            rec = read_yaml(Path(run_dir) / "config.yaml")
+        except Exception:                                        # noqa: BLE001
+            rec = None
+        if rec:
+            vi, shown = _probe(rec)
+            if vi is None and config_hash(rec) == stored:
+                vi, shown = 0, "unchanged"
+            if vi is not None:
+                changed = [(k, a, b) for k, a, b in hashed_key_diff(rec, cfg)
+                           if k in rec and k in cfg]
+                if not changed:
+                    added = [k for k, a, _ in hashed_key_diff(rec, cfg)
+                             if a == "<absent>"]
+                    extra = (f"; the live config only ADDS {len(added)} runtime "
+                             f"key(s): {', '.join(added[:4])}") if added else ""
+                    return True, (f"rule v{vi} via config.yaml, before these "
+                                  f"became performance-only: {shown}{extra}")
+                return False, ("the recipe genuinely changed since this run "
+                               "started -- " + ", ".join(
+                                   f"{k}: {a!r} -> {b!r}" for k, a, b in changed[:6]))
+    return False, "no historical rule reproduces it"
 
 def phase0_configs(dataset: str = "cifar100") -> List[Dict[str, Any]]:
     """The four runs of 01_PHASE0_GO_NOGO.md 2.
@@ -7368,7 +7442,8 @@ def load_checkpoint(path, cfg, model, optimizer, scheduler, scaler,
         # hashing RULE. Adding a key to _HASH_EXCLUDE to protect finished runs
         # is exactly what orphans them, and throwing away 73 good epochs over
         # a memory-layout flag is the outcome this check exists to prevent.
-        _ok, _why = hash_compatible(cfg, str(ck.get("config_hash") or ""))
+        _ok, _why = hash_compatible(cfg, str(ck.get("config_hash") or ""),
+                                    run_dir=p.parent.parent)
         if _ok:
             log(f"{msg}\n  ACCEPTED -- the recipe is unchanged. This checkpoint "
                 f"was hashed under {_why}. Everything hashed under both rules "
@@ -7379,7 +7454,8 @@ def load_checkpoint(path, cfg, model, optimizer, scheduler, scaler,
             # under a config that has been edited since it started, and nobody
             # ever notices until the numbers do not reproduce.
             raise RuntimeError(
-                msg + "\nThe config changed since this run started. Either restore "
+                msg + f"\n  why: {_why}"
+                    + "\nThe config changed since this run started. Either restore "
                       "the original config, or set force_rerun=True to discard the "
                       "checkpoint and retrain from scratch.")
         else:
@@ -11779,6 +11855,32 @@ def _selftest() -> bool:
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
 
+    # D-63. The D-60 tests all used a CLEAN config, which is the one shape the
+    # runtime never has. `load_checkpoint` sees a dict that has since gained
+    # keys, so config_hash(cfg) and cfg["config_hash"] disagree and every probe
+    # built on it misses. The tests agreed with me instead of with the program.
+    import tempfile as _tf
+    _dir = Path(_tf.mkdtemp(prefix="msc_d63_"))
+    _rec = dict(_c60)
+    atomic_write_yaml(_dir / "config.yaml", _rec)
+    _stored63 = config_hash(dict(_rec, channels_last=True),
+                            exclude=_HASH_EXCLUDE_V1)
+
+    _drift = dict(_rec, _added_at_runtime="by train_backbone", _also=123)
+    _ok63, _w63 = hash_compatible(_drift, _stored63, run_dir=_dir)
+    check("D-63: a config that GAINED runtime keys still resumes", _ok63, _w63)
+
+    _ok63b, _ = hash_compatible(_drift, _stored63)          # no record
+    check("D-63 canary: without the record the drifted config FAILS",
+          not _ok63b, "which is exactly what happened on the machine")
+
+    for _k, _v in (("batch_size", 128), ("num_epochs", 60), ("seed", 99)):
+        _bad63, _wb = hash_compatible(dict(_drift, **{_k: _v}), _stored63,
+                                      run_dir=_dir)
+        check(f"D-63: a changed {_k} is still REFUSED", not _bad63,
+              _wb[:70])
+    shutil.rmtree(_dir, ignore_errors=True)
+
     check("D-60 canary: the OLD hash really does differ from the new one",
           _stored_v1 != config_hash(_c60),
           "otherwise this test proves nothing")
@@ -13867,4 +13969,4 @@ if __name__ == "__main__":
         sys.exit(0 if _selftest() else 1)
     print(f"msc_lib v{__version__} -- run with --selftest for the offline checks")
 
-__MSC_BUILD__ = "87c16f6986cc"
+__MSC_BUILD__ = "0a9bdbbf7fa0"

@@ -344,6 +344,8 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | Low VRAM use, GPU idle, `img/s` flat and far below the card's capability | one random 192 KiB read per image from a 24 GiB memmap, 64 per batch, plus Windows IPC (~15 MiB/s) | D-56 — `ram_cache: True` loads the pack resident and `RAMBatchLoader` gathers whole batches. Measure with `tools/verify_loader.py --data-dir <pack>`. |
 | A convnet is many times slower than a transformer of similar FLOPs on the same loader | `channels_last` measured 6.7x SLOWER on RTX 4000 Ada / cuDNN 9.1 -- the opposite of the usual advice | D-59 — `channels_last: False` (already the default). Re-run `python tools/conv_sweep.py` on new hardware; do not inherit the number. |
 | A fix is verified and regenerated, but the notebook reproduces the OLD error exactly | the kernel is running a previous import; an object built from it (e.g. `sess`) keeps the old functions | D-62 — cell 1 now asserts the build stamp and `run_all` refuses a stale Session. If either fires: Kernel -> Restart, then Run All. |
+| `verify_run_artifacts` says a finished run is missing `metrics/final.csv` | that file is written by the MEASURE stage, not train | D-64 — expected until NB3 runs. It is in `RUN_ARTIFACTS_MEASURED` now. |
+| NB3 prints `0 trained run(s), 0 still to measure` and does nothing | the notebook was pinned to a phase NB2 never wrote | D-65 — `PHASE` is detected now. Check the `phase:` line it prints on start. |
 
 ### Reading the self-test after any change
 

@@ -182,7 +182,26 @@ else:
 """
 
 
-def paths_cell(phase="p1", extra="") -> str:
+def _phase_block_for(phase: str, detect: bool) -> str:
+    """The PHASE line. D-65.
+
+    Notebooks that CREATE runs name their phase. Notebooks that CONSUME runs
+    detect it, because a consumer hardcoded to a phase the producer did not
+    write finds nothing and says so quietly -- NB3 printed
+    `0 trained run(s), 0 still to measure`, called `run_all([])` and exited 0.
+    """
+    if not detect:
+        return f"PHASE = '{phase}'"
+    return (
+        "# None of the analysis notebooks may hardcode a phase: whichever one\n"
+        "# NB2 actually trained is the one to read (D-65). Set PHASE by hand\n"
+        "# below to override.\n"
+        f"PHASE = M.detect_phase(MSC_ROOT, prefer='{phase}')\n"
+        "print(f'phase: {PHASE}   on disk: {M.phases_present(MSC_ROOT)}')")
+
+
+def paths_cell(phase="p1", extra="", detect=False) -> str:
+    _phase_block = _phase_block_for(phase, detect)
     return f"""\
 # ============================================================================
 # CELL 2 -- WHERE EVERYTHING LIVES
@@ -221,7 +240,8 @@ MSC_ROOT = _paths['results_root']
 os.environ['MSC_IN100_DIR'] = DATA_DIR
 os.environ['MSC_SCRATCH'] = MSC_ROOT
 
-sess = M.Session(account='local', phase='{phase}', dataset='{DATASET}',
+{_phase_block}
+sess = M.Session(account='local', phase=PHASE, dataset='{DATASET}',
                  work_root=MSC_ROOT, session_limit_h=0.0,
                  worker_id=0, num_workers=1)
 {extra}
@@ -864,12 +884,10 @@ while every document said 15. A noise ceiling needs **two** measured seeds
 minimum.
 """),
         code(bootstrap()),
-        code(paths_cell(phase="p1")),
+        code(paths_cell(phase="p1", detect=True)),
         code(f"""
-PHASE = 'p1'          # 'p0' after the pilot, 'p1' for the atlas
-
-sess = M.Session(account='local', phase=PHASE, dataset='{DATASET}',
-                 work_root=MSC_ROOT, session_limit_h=0.0)
+# PHASE and `sess` come from the paths cell above, which DETECTS the phase
+# that actually has runs rather than naming one (D-65).
 sess.repair_ledger()
 
 trained = [r['run_id'] for r in sess.completed_runs(phase=PHASE)]
@@ -987,7 +1005,7 @@ of what dataset scale alone does, with architecture held exactly fixed. It
 calibrates every other comparison in the table.
 """),
         code(bootstrap()),
-        code(paths_cell(phase="p1")),
+        code(paths_cell(phase="p1", detect=True)),
         md("""
 ---
 ## Q1 · Noise ceiling — ρ_seed per architecture
@@ -1164,7 +1182,7 @@ tables.mkdir(parents=True, exist_ok=True)
 
 # Table 1 -- the atlas: what was trained, and did it converge.
 rows = []
-for r in sess.completed_runs(phase='p1'):
+for r in sess.completed_runs(phase=PHASE):
     s = M.read_json(M.run_layout(sess.work, r['run_id'])['base'] / 'summary.json', {})
     if not s:
         continue
@@ -1330,7 +1348,7 @@ time, and one of those rounds recreated it *inside the dry run written to catch
 it*.
 """),
         code(bootstrap()),
-        code(paths_cell(phase="p3")),
+        code(paths_cell(phase="p3", detect=False)),
         code(f"""
 TEACHER  = 'resnet50'
 STUDENTS = ['resnet18', 'shufflenetv2_in', 'deit_small']
@@ -1340,7 +1358,8 @@ ARMS     = [True, False]          # control FIRST, so a null result stops you ea
 sess = M.Session(account='local', phase='p3', dataset='{DATASET}',
                  work_root=MSC_ROOT, session_limit_h=0.0)
 
-t_runs = [r['run_id'] for r in sess.completed_runs(phase='p1')
+TEACHER_PHASE = M.detect_phase(MSC_ROOT, prefer='p1')
+t_runs = [r['run_id'] for r in sess.completed_runs(phase=TEACHER_PHASE)
           if M.parse_run_id(r['run_id'])['arch'] == TEACHER
           and sess.measured(r['run_id'])]
 if not t_runs:
