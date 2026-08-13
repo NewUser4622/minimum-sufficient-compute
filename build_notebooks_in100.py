@@ -168,7 +168,37 @@ if _got != _want:
         f"  Restart the kernel (Kernel -> Restart) and run all cells. Objects "
         f"created before a reimport keep the OLD code even after this cell "
         f"rewrites the file (D-62).")
-print(f'msc_lib build {{_got}} verified')
+# D-68. Is this NOTEBOOK current with the repository?
+#
+# The check above proves the module matches the notebook. It CANNOT catch a
+# stale notebook, because both sides come from the same .ipynb -- they always
+# agree with each other and can be arbitrarily old together.
+#
+# Jupyter saves an open notebook on run. So regenerating NB3 on disk while it
+# sits open in a tab means the tab's copy wins the moment you run it: the fixed
+# notebook is silently replaced by the one that was open, and the fix appears
+# not to have been applied. That happened here -- NB3 was regenerated with
+# `done_fn=sess.measured, stage='measure'`, and the version that ran had
+# neither.
+#
+# The repository source is the authority. If it has moved on, this notebook is
+# stale and must be reopened, not re-run.
+_repo = WORK.parent / 'src' / 'msc_lib.py'
+if _repo.exists():
+    import hashlib as _h
+    _repo_sha = _h.sha256(_repo.read_bytes()).hexdigest()[:12]
+    if _repo_sha != _want:
+        raise RuntimeError(
+            f"STALE NOTEBOOK: this file embeds msc_lib {{_want}}, but "
+            f"src/msc_lib.py is {{_repo_sha}}.\n"
+            f"  You are running an older copy of this notebook. Jupyter saves "
+            f"an open notebook when you run it, so an open tab silently "
+            f"overwrites a regenerated file.\n"
+            f"  FIX: close this notebook WITHOUT saving, run "
+            f"`python build_notebooks_in100.py`, then reopen it (D-68).")
+    print(f'msc_lib build {{_got}} verified, and current with src/')
+else:
+    print(f'msc_lib build {{_got}} verified (repo source not visible)')
 
 print(f'msc_lib {{M.__version__}}   torch {{torch.__version__}}')
 print(f'CUDA available: {{torch.cuda.is_available()}}')

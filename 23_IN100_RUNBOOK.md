@@ -348,6 +348,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | NB3 prints `0 trained run(s), 0 still to measure` and does nothing | the notebook was pinned to a phase NB2 never wrote | D-65 — `PHASE` is detected now. Check the `phase:` line it prints on start. |
 | NB3 prints a plan then `MY REMAINING WORK: 0` and measures nothing | `run_all(fn=sess.oracle)` planned with the default `stage='train'`, so trained runs count as done | D-67 — needs `done_fn=sess.measured, stage='measure'`. `run_all` now raises instead. |
 | NB4 `KeyError: 'rho_seed_tau0.1'` (or any analysis column) | the analysis frame is EMPTY -- no rows means no columns; usually NB3 has not measured | D-66 — analysis phase is resolved now and `_require_runs` says which stage is missing. |
+| A regenerated notebook behaves exactly as it did before the fix | Jupyter saved the open tab over the regenerated file on run -- the editor's copy wins | D-68 — cell 1 compares the embedded build against `src/msc_lib.py` and refuses. Close the notebook WITHOUT saving, rerun `python build_notebooks_in100.py`, reopen. |
 
 ### Reading the self-test after any change
 

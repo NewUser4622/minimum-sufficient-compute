@@ -2144,3 +2144,44 @@ measurement.
 **Contamination.** No data lost — nothing had been computed. `analysis/
 q1_seed_ceilings_all.csv` on disk is an empty artifact written from the empty
 frame before the KeyError, and is overwritten on the next run.
+
+---
+
+## D-68 — Jupyter saved the stale notebook over the fixed one
+
+**Symptom.** NB3 was regenerated with `done_fn=sess.measured, stage='measure'`
+(D-67). It was re-run. It measured nothing again, and the plan on disk said
+`n_todo: 0`.
+
+**Not a code defect.** The file timestamps tell the whole story:
+
+```
+13:43:53   registry/plans/...json   NB3 ran -> todo=0   (no done_fn, no stage)
+13:46:22   notebooks_in100/msc_lib.py   rewritten, current
+13:50:15   notebooks_in100/NB3_Measure.ipynb   SAVED
+```
+
+The notebook was **saved after it ran**. Jupyter writes an open notebook to
+disk on execution, so the copy sitting in the tab — opened before the
+regeneration — overwrote the fixed file. NB3 on disk then embedded build
+`7624d306be9c` while `src/msc_lib.py` had moved to `4a0d5f870b7b`.
+
+Regenerating a notebook that is open in an editor does not change what runs.
+The editor's copy wins, silently, at the moment of running.
+
+**Why D-62 could not catch it.** That check compares the imported module
+against the notebook's own embedded stamp. Both sides come from the same
+`.ipynb`, so they always agree — and can be arbitrarily old together. It
+verifies internal consistency, which is not currency.
+
+That is rule 5 one level up. D-62 asked "is the module I loaded the module this
+notebook ships?" It never asked "is this notebook the current notebook?"
+
+**Fix.** Cell 1 now hashes `../src/msc_lib.py` — the repository source, the
+actual authority — and refuses to run if it differs from the embedded build,
+naming both hashes and the remedy: close without saving, rebuild, reopen.
+
+**Operationally.** Regenerating a notebook the user has open is not enough, and
+"re-run it" is the wrong instruction. The notebook must be **closed without
+saving and reopened**. Every previous "still failing" report in this session is
+consistent with this mechanism, and D-62 was only half of it.
