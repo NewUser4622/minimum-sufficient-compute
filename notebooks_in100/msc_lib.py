@@ -250,6 +250,33 @@ def atomic_save_torch(path, obj) -> None:
     _atomic_replace(tmp, path)
 
 
+def to_numpy(v, dtype=None) -> np.ndarray:
+    """A numpy array from a tensor on ANY device, or from anything array-like.
+
+    **D-70.** The sweep did `np.asarray(y)` on the label tensor. On CIFAR the
+    raw `DataLoader` hands back CPU tensors and that works. On ImageNet-100 the
+    batch comes through `GPUBatchLoader`, which ends with
+    `yb = y.to(self.device)` -- so `y` is on cuda:0 and numpy refuses:
+
+        TypeError: can't convert cuda:0 device type tensor to numpy.
+                   Use Tensor.cpu() to copy the tensor to host memory first.
+
+    It failed 40 minutes into the first run, after exit-head training and the
+    final evaluation had both succeeded -- the most expensive place for a
+    one-line conversion bug to sit.
+
+    The port's premise was one library parameterised by dataset rather than
+    forked. That premise holds only where the two datasets present the SAME
+    interface, and here they did not: one loader yields CPU labels, the other
+    device labels. Three call sites each assumed the CIFAR shape. This is the
+    single conversion they all now go through.
+    """
+    if _TORCH_OK and isinstance(v, torch.Tensor):
+        v = v.detach().cpu().numpy()
+    arr = np.asarray(v)
+    return arr.astype(dtype) if dtype is not None else arr
+
+
 def read_yaml(path, default=None):
     """Counterpart to `atomic_write_yaml`. There was a writer and no reader.
 
@@ -8536,8 +8563,8 @@ def sweep_all_axes(cfg: Dict[str, Any], multi_exit, loader, device,
             chunks_p.append(top2.indices[:, :, 0].cpu().numpy().astype(np.int16))
             chunks_1.append(top2.values[:, :, 0].cpu().numpy().astype(np.float32))
             chunks_2.append(top2.values[:, :, 1].cpu().numpy().astype(np.float32))
-            chunks_i.append(np.asarray(idx).astype(np.int64))
-            chunks_l.append(np.asarray(y).astype(np.int64))
+            chunks_i.append(to_numpy(idx, np.int64))
+            chunks_l.append(to_numpy(y, np.int64))
         P = np.concatenate(chunks_p); T1 = np.concatenate(chunks_1)
         T2 = np.concatenate(chunks_2); idxs = np.concatenate(chunks_i)
         labs = np.concatenate(chunks_l)
@@ -8632,7 +8659,7 @@ def difficulty_battery(backbone, loader, device, amp: bool = True) -> Dict[str, 
         margin.append((t2.values[:, 0] - t2.values[:, 1]).cpu().numpy())
         ent.append((-(p * torch.log(p.clamp_min(1e-12))).sum(1)).cpu().numpy())
         ce.append(F.cross_entropy(logits.float(), y, reduction="none").cpu().numpy())
-        idxs.append(np.asarray(idx).astype(np.int64))
+        idxs.append(to_numpy(idx, np.int64))
     order = np.argsort(np.concatenate(idxs), kind="stable")
     return {"msp": np.concatenate(msp)[order].astype(np.float32),
             "margin": np.concatenate(margin)[order].astype(np.float32),
@@ -10666,7 +10693,7 @@ def evaluate_routing_methods(student, val_loader, device, rho: Sequence[float],
             logits, suff, _ = student(x)
         all_logits.append(torch.stack([l.float() for l in logits], 1).cpu().numpy())
         all_suff.append(suff.float().cpu().numpy())
-        all_y.append(np.asarray(y))
+        all_y.append(to_numpy(y))
     L = np.concatenate(all_logits)            # (N, K, C)
     S = np.concatenate(all_suff)              # (N, K)
     Y = np.concatenate(all_y)                 # (N,)
@@ -12024,6 +12051,45 @@ def _selftest() -> bool:
     _ok60, _why60 = hash_compatible(_c60, _stored_v1)
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
+
+    # -- D-70: device tensors must survive the numpy boundary -----------------
+    #
+    # GPUBatchLoader yields labels on the DEVICE; CIFAR's DataLoader yields
+    # them on the host. Three sweep call sites assumed the CIFAR shape and
+    # died 40 minutes into the first measurement.
+    check("D-70: to_numpy handles a list", to_numpy([1, 2, 3]).tolist() == [1, 2, 3])
+    check("D-70: to_numpy applies a dtype",
+          to_numpy([1.7, 2.9], np.int64).dtype == np.int64)
+    if _TORCH_OK:
+        _t = torch.tensor([3, 1, 2])
+        check("D-70: to_numpy handles a CPU tensor",
+              to_numpy(_t, np.int64).tolist() == [3, 1, 2])
+        check("D-70 canary: bare np.asarray still works on CPU (so the CIFAR "
+              "path never exposed this)",
+              np.asarray(_t).tolist() == [3, 1, 2])
+    else:
+        check("D-70: to_numpy tensor paths (torch unavailable)", True, "SKIP")
+
+    # No `np.asarray` may remain on a value taken straight from a batch.
+    _bad70 = []
+    try:
+        import ast as _a70
+        _t70 = _a70.parse(_src_of_module())
+        for _nd in _a70.walk(_t70):
+            if (isinstance(_nd, _a70.Call)
+                    and isinstance(_nd.func, _a70.Attribute)
+                    and _nd.func.attr in ("asarray", "array")
+                    and isinstance(_nd.func.value, _a70.Name)
+                    and _nd.func.value.id == "np"
+                    and _nd.args
+                    and isinstance(_nd.args[0], _a70.Name)
+                    and _nd.args[0].id in ("y", "idx", "yb", "labels_t")):
+                _bad70.append(f"line {_nd.lineno}: np.{_nd.func.attr}"
+                              f"({_nd.args[0].id}) -- use to_numpy()")
+    except Exception:                                            # noqa: BLE001
+        pass
+    check("D-70: no batch tensor reaches np.asarray directly",
+          not _bad70, "OK" if not _bad70 else "; ".join(_bad70))
 
     # -- D-69: an artifact must be joined to the directory it lives in --------
     #
@@ -14270,4 +14336,4 @@ if __name__ == "__main__":
         sys.exit(0 if _selftest() else 1)
     print(f"msc_lib v{__version__} -- run with --selftest for the offline checks")
 
-__MSC_BUILD__ = "df12d523fefe"
+__MSC_BUILD__ = "e8ee82e9d521"

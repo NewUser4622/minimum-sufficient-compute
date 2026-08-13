@@ -29,10 +29,40 @@ above it means anything.
 ```
 NB1 Setup     ██████████ done    data packed, 129,395 images, fingerprint 2b6269ef…
 NB2 Train     ██████████ done    4/4 runs, 100 epochs each
-NB3 Measure   ██▒▒▒▒▒▒▒▒ RUNNING first attempt reached the sweep, hit D-70, fixed
-NB4 Analysis  ▒▒▒▒▒▒▒▒▒▒ blocked  needs NB3
-NB5 Method    ▒▒▒▒▒▒▒▒▒▒ blocked  needs NB3 (and trains 18 NEW runs)
+NB3 Measure   ██████████ done    4/4 measured, per-sample tables written
+NB4 Analysis  ██████▒▒▒▒ Q1 + Q2 done · Q3/Q4 unblocked by D-71
+NB5 Method    ▒▒▒▒▒▒▒▒▒▒ blocked  needs NB4 (and trains 18 NEW runs)
 ```
+
+## FIRST RESULT — the question, answered for the pilot
+
+**ρ_seed at τ=0.1** (the noise ceiling: Spearman between two seeds of the same
+architecture; the denominator of every transfer claim)
+
+| architecture | CIFAR-100 | **ImageNet-100** | change |
+|---|---|---|---|
+| CNN (`resnet50`) | 0.62–0.73 | **0.822** | up |
+| ViT (`vit_small_p16`) | 0.547 | **0.649** | up |
+| **gap (CNN − ViT)** | ~0.10 | **0.173** | **wider** |
+
+Read carefully, because it cuts both ways:
+
+- **The ordering survives.** ViT is still measurably less seed-reliable than
+  the CNN at 40× the data and 49× the pixels. The CIFAR finding was not purely
+  a small-data artifact.
+- **But both rose**, and ViT's 0.649 at ImageNet scale now sits *inside* the
+  range CNNs occupied on CIFAR (0.62–0.73). "ViT is unreliable" is not
+  scale-invariant; "ViT is less reliable *than a CNN trained alongside it*" is
+  what held.
+- **The gap widened rather than closed** (0.10 → 0.17), which is the opposite
+  of the small-data-artifact hypothesis.
+
+Jaccard@top-10 tells the same story more starkly: 0.62 (resnet50) vs 0.28
+(vit) — the two ViT seeds barely agree on *which* samples are expensive.
+
+**Do not write this up yet.** n=2 seeds means one pair per architecture and no
+error bar (§6.1), and the ViT arm has a 38-point train/val gap (§6.2). Both are
+reasons this number could move. Two architectures is a pilot, not the atlas.
 
 **Phase 0 is a 2-architecture pilot, not the study.** The 8-architecture
 atlas is phase `p1` and has not been started.
@@ -41,10 +71,10 @@ atlas is phase `p1` and has not been started.
 
 | run | state | epochs | best top-1 | img/s | GPU-h | train artifacts | measured |
 |---|---|---|---|---|---|---|---|
-| `resnet50-s1` | completed | 100 | **82.62%** | 80 | 41.5 | OK | no |
-| `resnet50-s2` | completed | 100 | **82.12%** | 80 | 41.5 | OK | no |
-| `vit_small_p16-s1` | completed | 100 | **60.56%** | 603 | 5.7 | OK | no |
-| `vit_small_p16-s2` | completed | 100 | **61.01%** | 595 | 5.7 | OK | no |
+| `resnet50-s1` | completed | 100 | **82.62%** | 80 | 41.5 | OK | **yes** |
+| `resnet50-s2` | completed | 100 | **82.12%** | 80 | 41.5 | OK | **yes** |
+| `vit_small_p16-s1` | completed | 100 | **60.56%** | 603 | 5.7 | OK | **yes** |
+| `vit_small_p16-s2` | completed | 100 | **61.01%** | 595 | 5.7 | OK | **yes** |
 
 Seed pairs agree to 0.50 (resnet50) and 0.45 (vit) points.
 
@@ -74,10 +104,10 @@ NB1 → NB2 → NB3 → NB4 → NB5
              ^you are here
 ```
 
-**No, NB5 is not safe yet.** It needs a *measured* teacher — it reads the
-`resnet50` per-sample MSC table to build its distillation targets. Right now
-zero runs are measured, so NB5 would fail (or worse, silently do nothing, which
-is what NB3 did twice before D-67).
+**NB3 is done** — all four runs measured, per-sample tables on disk. NB5 is
+now *technically* unblocked (it needs a measured `resnet50` teacher, which
+exists). Finish NB4 first: it is minutes, and Q3/Q4 tell you whether the
+per-sample tables are sound before you spend days distilling from them.
 
 NB5 also **trains 18 new runs** (3 students × 3 seeds × 2 arms). Two of those
 architectures have never been timed at the corrected `channels_last` setting,
@@ -137,6 +167,7 @@ Full analysis in `22_IN100_LAB_NOTEBOOK.md`. Fixed unless marked.
 
 | # | one line | cost |
 |---|---|---|
+| D-71 | `require` matched a run id against an arch-keyed dict → Q3/Q4 silently empty | `KeyError: 'passed'` |
 | D-70 | `np.asarray(y)` on a CUDA tensor — CIFAR yields CPU labels, IN-100 device labels | failed 40 min into the sweep |
 | D-69 | checkpoint path joined to the run root; correct spelling was in dead HF code | 4 failed measurements |
 | D-68 | Jupyter saved a stale notebook over the regenerated one | ~2 rounds |
@@ -167,10 +198,12 @@ Full analysis in `22_IN100_LAB_NOTEBOOK.md`. Fixed unless marked.
 
 ## 8. Next actions
 
-1. Close NB3 without saving → rebuild → reopen → Run All. Expect **real GPU
-   minutes per run**, not seconds.
-2. Confirm `per_sample/test.parquet` exists for all 4 runs.
-3. NB4 → first look at ρ_seed for `resnet50` vs `vit_small_p16`. **This is the
-   first real answer to the project's question.**
-4. Decide the two scientific questions in §6 before NB5.
-5. `conv_sweep --arch deit_small` before committing to NB5's 18 runs.
+1. **Finish NB4** (close without saving → rebuild → reopen → Run All). Q1 and
+   Q2 already produced results; D-71 unblocks Q3 and Q4.
+2. Check `metrics/exit_metrics.csv` — it is **0 bytes** on all four runs. Not
+   yet diagnosed; it is in `RUN_ARTIFACTS_EXPECTED`, so it costs a column
+   rather than the run, but it should not be empty.
+3. Decide §6.1 (2 seeds vs 3) and §6.2 (the ViT overfitting arm) **before**
+   NB5 — both change what NB5 is worth doing.
+4. `conv_sweep --arch deit_small` before committing to NB5's 18 runs.
+5. Then either NB5 (method) or start the `p1` atlas (the actual study).

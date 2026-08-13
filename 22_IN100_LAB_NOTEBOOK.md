@@ -2310,3 +2310,64 @@ path never exposed this.
 **Contamination.** None — the sweep writes nothing until it completes. Two
 prior stages (exit heads, final evaluation) had already written correctly and
 are reused on the next run.
+
+---
+
+## D-71 — a membership test across two identifier spaces emptied Q3 and Q4
+
+**Symptom.** NB4: `KeyError: 'passed'` on `ctrl[~ctrl['passed']]`, with
+`q3_shuffled_control.csv` **2 bytes** on disk. Q1 and Q2 had produced real
+results in the same run.
+
+**Cause.**
+
+```python
+if require is not None and rid not in require:      # rid is a RUN ID
+```
+
+`require` is only ever given `_ceilings(...)`, which is keyed by
+**architecture** (`resnet50`). `rid` is a **run id**
+(`p0-resnet50-imagenet100-base-s1`). No run id is ever a member, so every run
+was skipped, `cand` stayed empty, `reps` came back `{}` — and every caller that
+passed `require` got nothing.
+
+Three analyses at once: Q3 axis structure, Q3 shuffled control, Q4 difficulty.
+Q2 was unaffected **only because it passes no `require`**, which is why the
+notebook produced two good tables and then failed — the most confusing possible
+presentation of a single upstream fault.
+
+The docstring was correct: *"an ARCHITECTURE is only represented by a run that
+appears in it"*. The prose described one identifier space and the code tested
+the other. This is D-49 and D-56b again — `sample_idx` vs split position,
+`PackedImageDataset.indices` vs `Subset.indices` — a third pair of identifier
+spaces where one is silently accepted in place of the other.
+
+**The existing self-test asserted the bug.** D-18's fixture built
+
+```python
+_ceil = {"p1-vgg8-cifar100-base-s2", ...}     # a set of RUN IDS
+```
+
+so it exercised the buggy semantics and passed, for as long as that test has
+existed. Every real caller passes an arch-keyed dict. That is D-63's lesson a
+second time: **the fixture had the shape I imagined, not the shape the program
+receives.** A test whose fixture is wrong in the same direction as the code
+cannot fail.
+
+**Fix.**
+
+1. Test `arch not in require`, after `arch` is resolved.
+2. `representative_runs` **raises** if `require` excludes every run while runs
+   exist — printing both key spaces so the mismatch is visible in the message.
+   Silently returning `{}` is what let this reach the notebook.
+3. `analyse_q3_all` and `analyse_q3_shuffled_control_all` raise on zero pairs
+   instead of returning an empty frame, naming how many architectures have a
+   ceiling and that two are needed.
+4. The D-18 fixture is now arch-keyed, plus three D-71 checks: a run-id-keyed
+   `require` must raise, the arch-keyed one must still return both
+   architectures, and an genuinely empty `runs` must not be mistaken for a
+   key-space error.
+
+**Contamination.** Q1 and Q2 are unaffected and their published numbers stand.
+Q3 and Q4 produced nothing, so nothing wrong was recorded. `q3_shuffled_control
+.csv` on disk is a 2-byte artifact of the failed run and is overwritten.
