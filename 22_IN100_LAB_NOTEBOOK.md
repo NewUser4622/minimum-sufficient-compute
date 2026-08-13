@@ -2257,3 +2257,56 @@ and `run_dir / "summary.json"`, which legitimately lives at the run root.
 **Contamination.** No data lost. Four measurement attempts wasted, and the
 error text actively misdirected — it told the user to retrain models that were
 already trained.
+
+---
+
+## D-70 — one loader yields CPU labels, the other device labels
+
+**Symptom.** NB3 got further than ever: exit heads trained
+(`d1=0.2504 … d5=0.8257`), final evaluation written
+(`top1=0.8262`, matching the trained value exactly), sweep started — then, at
+the first batch of the depth axis:
+
+```
+TypeError: can't convert cuda:0 device type tensor to numpy.
+           Use Tensor.cpu() to copy the tensor to host memory first.
+  chunks_l.append(np.asarray(y).astype(np.int64))
+```
+
+Roughly 40 minutes in, after two expensive stages had succeeded. The most
+costly place a one-line conversion bug can sit.
+
+**Cause.** `sweep_all_axes._collect` does `np.asarray(y)` on the label tensor.
+
+- **CIFAR**: `build_loaders` returns raw `DataLoader`s → `y` is on the host →
+  works.
+- **ImageNet-100**: the batch comes through `GPUBatchLoader`, which ends with
+  `yb = y.to(self.device)` → `y` is on cuda:0 → numpy refuses.
+
+**This is the port's central premise failing at a seam.** The design was one
+library parameterised by dataset rather than forked — good, and it is why the
+zoo, the training loop, the resume machinery and the analysis are all shared.
+But it holds only where the two datasets present the **same interface**, and
+here they do not: one loader hands back host labels, the other device labels.
+Three call sites had quietly encoded the CIFAR shape.
+
+A parameterised library needs its parameterisation to be *total*. Where a
+difference remains, it has to be absorbed at one boundary — which is exactly
+what `GPUBatchLoader` was supposed to be, and where the augmentation D-40
+correctly put. The labels were left half-converted.
+
+**Fix.** `to_numpy(v, dtype=None)` — accepts a tensor on any device or anything
+array-like, and is the single conversion all three sites now go through. A
+self-test asserts a `np.asarray` on a value named `y`/`idx`/`yb` cannot
+reappear anywhere in the module, and its canary confirms that bare
+`np.asarray` *does* work on a CPU tensor — which is precisely why the CIFAR
+path never exposed this.
+
+**Also visible in that output, and expected:**
+`[WARN] checkpoint config_hash differs from the current config` is the D-59
+`channels_last` flip being correctly recognised as performance-only by D-60's
+`hash_compatible`, and recorded rather than ignored.
+
+**Contamination.** None — the sweep writes nothing until it completes. Two
+prior stages (exit heads, final evaluation) had already written correctly and
+are reused on the next run.
