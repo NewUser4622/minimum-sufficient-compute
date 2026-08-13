@@ -1409,13 +1409,33 @@ teacher_run = sorted(t_runs)[0]
 print(f'teacher: {{teacher_run}}')
 
 cfgs = []
-for shuffled in ARMS:
+# D-75. SEED-major, with the two arms ADJACENT.
+#
+# The old order was arm-major: all nine shuffled runs, then all nine real ones.
+# The comment on ARMS said "control FIRST, so a null result stops you early",
+# but a control arm ALONE cannot produce a null result -- the claim is
+# real-vs-control, so neither arm means anything without the other. Half the
+# budget would have been spent before the first comparison was possible, which
+# is the opposite of stopping early.
+#
+# Seed-major puts a COMPLETE n=1 comparison -- all three students, both arms --
+# in the first six runs, at a third of the cost. If the shuffled arm matches
+# the real one there, L_MSC is a regulariser, the mechanism claim is dead, and
+# you stop having spent a third rather than half.
+for s in SEEDS:
     for a in STUDENTS:
-        for s in SEEDS:
+        for shuffled in ARMS:              # control first WITHIN each pair
             method = ('mscKDshuffrom' if shuffled else 'mscKDfrom') + TEACHER
             cfgs.append(sess.config(a, seed=s, method=method,
                                     teacher_run=teacher_run))
+_first = len(STUDENTS) * len(ARMS)
 print(f'{{len(cfgs)}} student run(s): {{len(STUDENTS)}} arch x {{len(SEEDS)}} seeds x 2 arms')
+print(f'order: seed-major, arms adjacent -- a full comparison lands after '
+      f'{{_first}} runs, not {{len(cfgs)}}')
+print()
+print(f'CHECKPOINT after run {{_first}}: rerun NB4 and compare the arms.')
+print('  If SHUFFLED matches real, stop -- the mechanism claim is wrong and')
+print(f'  the remaining {{len(cfgs) - _first}} runs cannot rescue it.')
 """),
                 md("""
 ---

@@ -49,7 +49,8 @@ NB1 Setup     ██████████ done    data packed, 129,395 images
 NB2 Train     ██████████ done    4/4 runs, 100 epochs each
 NB3 Measure   ██████████ done    4/4 measured, per-sample tables written
 NB4 Analysis  ██████████ done    Q1 Q2 Q3 Q4 all written to analysis/
-NB5 Method    ░░░░░░░░░░ ready   gated on CONFIRM · 18 runs · ~112 h before re-measuring
+NB5 Method    ░░░░░░░░░░ ready   CONFIRM gate clean · 18 runs, seed-major
+                                 first comparison after 6 runs, not 18 (D-75)
 ```
 
 ## FIRST RESULT — the question, answered for the pilot

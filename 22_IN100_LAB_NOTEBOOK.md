@@ -2494,3 +2494,52 @@ depth_fraction, rho, flops, stage_cut, feature_dim for all five exits. It was
 reported as "0K" by my own status check, which rounded 269 bytes to zero KB. A
 display bug in the reporting, not a gap in the data. Corrected in
 `24_IN100_STATUS.md`.
+
+---
+
+## D-75 — "control first, so a null result stops you early" did the opposite
+
+NB5 built its 18 configs arm-major:
+
+```python
+for shuffled in ARMS:          # [True, False]
+    for a in STUDENTS:
+        for s in SEEDS:
+```
+
+All nine SHUFFLED runs, then all nine real ones. The comment above `ARMS` read
+*"control FIRST, so a null result stops you early"* — and I wrote D-54b's fix
+directly beneath it without noticing it is wrong.
+
+**A control arm alone cannot produce a null result.** The claim is
+real-versus-control; neither arm means anything without the other. So the order
+that was supposed to enable early stopping guaranteed that **no comparison was
+possible until run 10**, after roughly half the budget. The stated intent and
+the actual effect were opposites, and the intent was written down, which is
+what made it invisible.
+
+**Fix — seed-major, arms adjacent:**
+
+```python
+for s in SEEDS:
+    for a in STUDENTS:
+        for shuffled in ARMS:      # control first WITHIN each pair
+```
+
+After **6 runs** you have all three students in both arms at seed 1 — a
+complete n=1 comparison at a third of the cost. If the shuffled arm matches the
+real one there, `L_MSC` is a regulariser, the mechanism claim is dead, and the
+remaining twelve runs cannot rescue it. The notebook now prints that checkpoint
+explicitly.
+
+Nothing about the runs changes — same eighteen `run_id`s, same configs, same
+hashes. Only the order in which they are executed, and therefore how early the
+experiment can be abandoned.
+
+**The general shape.** This is the third time in this log that a comment
+asserted a property the code did not have (rule 7: an invariant in a comment is
+not a mechanism). D-55 was `channels_last: True` enforced at one site of
+sixteen; D-71 was a docstring describing architecture-keyed membership over
+code testing run ids. Here the comment described a stopping rule the loop order
+made impossible. In each case the prose was the *thing I checked against*,
+which is exactly why it did not catch the code.
