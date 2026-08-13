@@ -10711,15 +10711,52 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     rho_list = t_budgets["axes"]["depth"]["rho"]
     r = core.compute_msc(sweep["depth"]["preds"], sweep["depth"]["top1p"],
                          sweep["depth"]["top2p"], rho_list, tau=tau, axis="depth")
-    order = np.argsort(sweep["sample_idx"])
-    msc_train = r.msc[order].astype(np.float32)
-    irr_train = r.irreducible[order].astype(bool)
+    # D-77. These are indexed later as `msc_t[idx]`, where `idx` is the GLOBAL
+    # pack index the loader emits -- 0..129,394 for ImageNet-100. Sorting the
+    # sweep positionally gives a vector of length 119,395 (the train split), so
+    # every index above that is out of bounds.
+    #
+    # On CPU that is an IndexError. On CUDA it is a device-side assert:
+    #
+    #   IndexKernel.cu:93: Assertion `-sizes[i] <= index && index < sizes[i]`
+    #
+    # which aborts the process. The kernel died with exit code 3221226505 and
+    # no Python traceback, before a single epoch began.
+    #
+    # This is D-49 exactly -- `sample_idx` is a global pack index, so anything
+    # indexed BY it must be sized for the whole index space, not the split.
+    # D-49 fixed `TrainingDynamics`; `train_msc_kd` has carried the same defect
+    # since the port, and only fires here because it is the one place that
+    # indexes a dense array by sample_idx on the GPU.
+    _sweep_idx = np.asarray(sweep["sample_idx"], dtype=np.int64)
+    _ds = train_loader.dataset
+    _space = int(getattr(_ds, "index_space", 0) or 0) or int(_sweep_idx.max() + 1)
+    if _sweep_idx.max() >= _space:
+        raise RuntimeError(
+            f"sample_idx reaches {_sweep_idx.max()} but index_space is "
+            f"{_space} -- the dataset is mis-declaring its index space (D-49).")
+
+    _msc_c = r.msc.astype(np.float32)
+    _irr_c = r.irreducible.astype(bool)
     if shuffle_targets:
         log("SHUFFLED-TARGET ABLATION: MSC targets permuted within the dataset",
             "ABLATE")
-        msc_train = shuffle_msc_targets(msc_train, seed=int(cfg["seed"]))
-    log(f"teacher MSC on train: mean={np.nanmean(msc_train):.3f}  "
-        f"irreducible={irr_train.mean()*100:.1f}%", "MSCKD")
+        # Permute the COMPACT vector, before scattering. Permuting the sparse
+        # index-space array would move NaN padding into real samples and
+        # silently weaken the control.
+        _msc_c = shuffle_msc_targets(_msc_c, seed=int(cfg["seed"]))
+
+    # Scatter BY sample_idx, so position == global index and `msc_t[idx]` is
+    # correct by construction rather than by a sort that has to stay in step.
+    msc_train = np.full(_space, np.nan, dtype=np.float32)
+    irr_train = np.zeros(_space, dtype=bool)
+    msc_train[_sweep_idx] = _msc_c
+    irr_train[_sweep_idx] = _irr_c
+
+    log(f"teacher MSC on train: mean={np.nanmean(_msc_c):.3f}  "
+        f"irreducible={_irr_c.mean()*100:.1f}%  "
+        f"({len(_sweep_idx):,} samples over an index space of {_space:,})",
+        "MSCKD")
 
     msc_t = torch.from_numpy(msc_train).to(device)
     irr_t = torch.from_numpy(irr_train).to(device)
@@ -10769,6 +10806,7 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     st = load_checkpoint(ckpt_last, cfg, student, optimizer, scheduler, scaler,
                          None, device, strict_hash=not cfg.get("force_rerun"))
     start_epoch, best = st["start_epoch"], st["best_metric"]
+    _bounds_checked = False          # D-77, once per run
     cum_time, cum_energy = st["wall_seconds"], st["energy_joules"]
     if st["resumed"]:
         _truncate_history(history_path, start_epoch)
@@ -10814,6 +10852,21 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                           leave=False, dynamic_ncols=True, mininterval=2.0)
             for batch in it:
                 x, y, idx = batch
+                if not _bounds_checked:
+                    # D-77. Check on the HOST, before the GPU sees it. An
+                    # out-of-range gather on CUDA aborts the process with a
+                    # device-side assert and no traceback; the same check here
+                    # raises something readable. `idx` is still on the CPU at
+                    # this point, so this costs a reduction over one batch,
+                    # once per run.
+                    _bounds_checked = True
+                    _mx = int(idx.max())
+                    if _mx >= msc_t.numel():
+                        raise IndexError(
+                            f"sample_idx {_mx} >= MSC target array "
+                            f"{msc_t.numel()}. Indexing this on the GPU would "
+                            f"kill the kernel with a device-side assert and no "
+                            f"traceback (D-77/D-49).")
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 idx = idx.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
@@ -12295,6 +12348,46 @@ def _selftest() -> bool:
     _ok60, _why60 = hash_compatible(_c60, _stored_v1)
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
+
+    # -- D-77: a dense array indexed BY sample_idx must span the index space --
+    #
+    # Reproduces the shape that killed the kernel: ImageNet-100 has 129,395
+    # images, of which 119,395 are train. The teacher sweep returns those
+    # 119,395 with their GLOBAL sample_idx, and the training loop gathers
+    # msc_t[idx] with idx up to 129,394.
+    _N_SPACE, _N_TRAIN = 129395, 119395
+    _rng77 = np.random.default_rng(0)
+    _sidx = np.sort(_rng77.choice(_N_SPACE, size=_N_TRAIN, replace=False))
+    _vals = _rng77.random(_N_TRAIN).astype(np.float32)
+
+    # the OLD construction: sort positionally -> length 119,395
+    _old = _vals[np.argsort(_sidx)]
+    check("D-77: the old positional build is too short for a global index",
+          _old.shape[0] < int(_sidx.max()) + 1,
+          f"len {_old.shape[0]} vs max sample_idx {int(_sidx.max())}")
+
+    # the NEW construction: scatter by sample_idx
+    _new = np.full(_N_SPACE, np.nan, dtype=np.float32)
+    _new[_sidx] = _vals
+    check("D-77: the scattered build spans the whole index space",
+          _new.shape[0] == _N_SPACE)
+    check("D-77: and every sample lands at its own global index",
+          bool(np.allclose(_new[_sidx], _vals)),
+          "position == sample_idx, so msc_t[idx] is correct by construction")
+    check("D-77: positions outside the split stay NaN",
+          bool(np.isnan(_new[np.setdiff1d(np.arange(_N_SPACE), _sidx)]).all()),
+          "the train loader never gathers them")
+
+    # the ablation must permute the COMPACT vector, not the padded one
+    _shuf_compact = shuffle_msc_targets(_vals.copy(), seed=1)
+    _packed = np.full(_N_SPACE, np.nan, dtype=np.float32)
+    _packed[_sidx] = _shuf_compact
+    check("D-77: shuffling before the scatter keeps every real sample real",
+          int(np.isnan(_packed[_sidx]).sum()) == 0,
+          "permuting the padded array would move NaNs into real samples")
+    check("D-77: and it is a genuine permutation of the same values",
+          bool(np.allclose(np.sort(_shuf_compact), np.sort(_vals)))
+          and not bool(np.allclose(_shuf_compact, _vals)))
 
     # -- D-76: a measurement loader must produce MODEL INPUT ------------------
     # The EXACT batch that failed on the user's machine: [256, 256, 256, 3]

@@ -1654,6 +1654,17 @@ def main() -> int:
     # `feature_version` pins the target: the machine that runs these is on
     # Python 3.10, and syntax accepted here but not there is the same defect
     # with a longer feedback loop.
+    # D-77. Syntax is not enough: a name that exists in one function and not
+    # another parses cleanly and raises NameError when the branch is taken.
+    print("\n  checking src/msc_lib.py for undefined names")
+    _cn = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "check_names.py"), str(LIB)],
+        capture_output=True, text=True)
+    print(_cn.stdout.rstrip() or _cn.stderr.rstrip())
+    if _cn.returncode != 0:
+        print("  Generation refused -- fix the names above.")
+        return 1
+
     print("\n  parsing every emitted code cell as Python 3.10")
     _syn = 0
     for _nb in sorted(OUT.glob("NB*.ipynb")):

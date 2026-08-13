@@ -2621,3 +2621,76 @@ fast and total rather than slow and partial, which is the good kind. Had D-75's
 reordering not landed first, this would still have been the first run to fail —
 but the point of that change was that the *cheapest* informative thing happens
 first, and a total failure at run 1 is exactly that.
+
+---
+
+## D-77 — a global index into a split-sized array killed the kernel
+
+**Symptom.** The kernel died before epoch 1. No Python traceback, only:
+
+```
+IndexKernel.cu:93: Assertion `-sizes[i] <= index && index < sizes[i]
+                              && "index out of bounds"` failed.
+ExitCode: 3221226505
+```
+
+**Cause.** `train_msc_kd` built the teacher's MSC targets positionally:
+
+```python
+order = np.argsort(sweep["sample_idx"])
+msc_train = r.msc[order]              # length 119,395 -- the TRAIN split
+...
+targets = sufficiency_targets(msc_t[idx], rho_t)   # idx is the GLOBAL index
+```
+
+`sample_idx` is the **global pack index**, 0…129,394. The array has 119,395
+entries. Every index past the end is out of bounds.
+
+**This is D-49, in a function D-49 never touched.** D-49 was the identical
+confusion in `TrainingDynamics` — `IndexError: index 121978 out of bounds for
+size 119395` — and its fix introduced `index_space` so that anything indexed
+*by* `sample_idx` is sized for the whole space. `train_msc_kd` has carried the
+same defect since the port and only fires now because it is the one place that
+gathers a dense array by `sample_idx` **on the GPU**.
+
+**And that is why it was so much worse.** On CPU this is an `IndexError` with a
+traceback naming the line. On CUDA it is a device-side assert: the process
+aborts, the kernel dies, and the user gets `ExitCode: 3221226505` and a wall of
+identical thread messages. Same defect, no diagnosis. The lesson is not about
+indexing — it is that **the same bug is far more expensive on the device**, so
+bounds that depend on a data convention must be checked on the host.
+
+**Fix.**
+
+1. Scatter by `sample_idx` into an `index_space`-sized array, so position *is*
+   the global index and `msc_t[idx]` is correct by construction rather than by
+   a sort that has to stay in step with a convention.
+2. The shuffled-target ablation permutes the **compact** vector *before* the
+   scatter. Permuting the padded array would move NaN padding into real
+   samples and silently weaken the control — the arm whose whole job is to be
+   a fair null.
+3. A host-side bounds check on the first batch, raising a readable `IndexError`
+   instead of letting CUDA abort.
+
+Reproduced in the self-test at the real sizes (129,395 / 119,395): the old
+positional build is provably too short, the scattered build puts every sample
+at its own global index, padding stays NaN, and the shuffle-before-scatter
+leaves no NaN in a real sample.
+
+**And the fix's first draft had a `NameError`.** The host-side check said
+`if step == 0` — `step` exists in `train_backbone`'s loop, not this one. It
+parses, it imports, the self-test passes, and it raises on the first batch of
+an 18-run job. Python resolves names at call time, so a typo in an unexercised
+branch survives every check this project had.
+
+`tools/check_names.py` now reports any name loaded in a function and bound
+nowhere, and the build refuses on failure. Narrow on purpose: its first draft
+flagged `__file__` and nine conditional module-level definitions, and a checker
+that fires on healthy code is one this project has already paid for three times.
+Verified against both a file containing the exact `step` mistake and one using
+comprehensions, `with`, `except as`, conditional module definitions and
+dunders — caught the first, silent on the second.
+
+**Contamination.** None. The abort happened during target construction, before
+any optimiser step. The 18 `p3-*` directories still hold only `config.yaml` and
+`config_hash.txt`.
