@@ -355,6 +355,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | NB5 raises `SystemExit: Set CONFIRM = True` | deliberate. Read the gate table and cost estimate above it first | D-72 — 18 training runs is not a thing to start by accident. |
 | NB5 shows `SystemExit` with a traceback and a 'To exit: use quit' warning | that was the CONFIRM gate doing its job -- now a plain banner, no exception | D-74 — set `CONFIRM = True` and re-run from that cell. |
 | NB5 still says STALE after you ran `conv_sweep` | the sweep result was written and never read | D-74 — `measured_img_s()` now prefers `benchmark/convsweep_<arch>_*.json`. |
+| `expected input[N, 256, 256, 3] to have 3 channels, but got 256` in a sweep | a measurement loader was rebuilt from `.dataset`, dropping GPUBatchLoader (permute/cast/normalise/crop) | D-76 — build measurement views with `M.eval_view_of(loader, cfg)`. The first batch of every sweep is now checked. |
 
 ### Reading the self-test after any change
 

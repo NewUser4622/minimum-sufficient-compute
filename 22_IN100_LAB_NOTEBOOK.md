@@ -2543,3 +2543,73 @@ sixteen; D-71 was a docstring describing architecture-keyed membership over
 code testing run ids. Here the comment described a stopping rule the loop order
 made impossible. In each case the prose was the *thing I checked against*,
 which is exactly why it did not catch the code.
+
+---
+
+## D-76 — the MSC-KD teacher sweep rebuilt its loader and dropped the conversion layer
+
+**Symptom.** All 18 MSC-KD runs failed identically, ~16 s in:
+
+```
+RuntimeError: Given groups=1, weight of size [64, 3, 7, 7],
+  expected input[256, 256, 256, 3] to have 3 channels, but got 256 channels
+```
+
+`[256, 256, 256, 3]` is `(B, H, W, C)` uint8 at 256 px — raw pack output. No
+permute, no float cast, no normalisation, no 256→224 crop.
+
+**Cause.** `train_msc_kd`, sweeping the teacher to build MSC targets:
+
+```python
+train_eval = DataLoader(train_loader.dataset, batch_size=..., ...)
+train_eval.dataset.augment = False
+```
+
+`train_loader` is a `GPUBatchLoader`, and `.dataset` delegates through to the
+raw `PackedImageDataset`. Rebuilding a `DataLoader` from it **discards the
+conversion layer**, which is where every transformation lives.
+
+**Both lines are correct on CIFAR and wrong on ImageNet-100**, for the same
+reason:
+
+- `CIFARTensor.__getitem__` returns finished NCHW float tensors; the packed
+  dataset returns raw NHWC uint8 and `GPUBatchLoader` finishes it.
+- `CIFARTensor` owns a real `augment` flag; `PackedImageDataset` has none, so
+  `train_eval.dataset.augment = False` created an attribute nothing reads —
+  inside a bare `except: pass`. The stated intent, *"augmentation off while
+  measuring: MSC of an augmented view is not MSC of the sample"*, silently did
+  nothing. Had the shape error not fired first, the MSC targets — the entire
+  input to the method — would have been measured through an unspecified view.
+
+That second failure is the more dangerous one. The first stops the run; the
+second would have produced numbers.
+
+This is D-70's seam a second time, and the wider lesson stands: a library
+parameterised by dataset holds only where both datasets present the **same
+interface**. Two places now assumed the CIFAR shape.
+
+**Fix.**
+
+1. `eval_view_of(loader, cfg)` returns an ordered, augmentation-free view built
+   the way the backend requires — a dataset flag on CIFAR, `train=False` on
+   `GPUBatchLoader` for ImageNet-100 — so no caller needs to know which backend
+   it holds. It **raises** rather than guessing if it can turn augmentation off
+   by neither route.
+2. `_assert_model_ready` runs on the first batch of every sweep and rejects a
+   batch that is not model input, naming what is missing: NHWC, wrong
+   resolution, non-float. The torch error blamed a convolution's channel count;
+   the fault was three layers up in loader construction, and nothing in that
+   message pointed there.
+
+**The guard's own logic is tested without torch.** `_model_input_problems` is a
+pure function over `(shape, is_float, want_res)`, so the sandbox can exercise
+it — including the exact `(256, 256, 256, 3)` uint8 batch that failed here, and
+three canaries proving a **correct** batch is not refused. A guard that raises
+is only as safe as its false-positive rate, and one I could only exercise on
+the user's GPU would be a guard shipped unverified. That is precisely the shape
+D-63 punished.
+
+**Contamination.** None. No `p3-*` run wrote anything; each failed during the
+teacher sweep, before any student step. Phase 0 is untouched. The cost was
+~5 minutes, not 4.7 days — the failure was fast and total rather than slow and
+partial, which is the good kind.

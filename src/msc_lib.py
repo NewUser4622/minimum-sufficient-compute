@@ -3412,6 +3412,130 @@ def _in100_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
             tr.class_names, va.order_hash)
 
 
+def _model_input_problems(shape: Tuple[int, ...], is_float: bool,
+                          want_res: int, dtype_name: str = "?") -> List[str]:
+    """The decision behind `_assert_model_ready`, as plain data.
+
+    Split out so it can be tested WITHOUT torch. A guard that raises is only
+    as safe as its false-positive rate: one that rejects a valid batch would
+    break every sweep, and the version that could only be exercised on the
+    user's GPU was a guard I could not check before shipping. That is the
+    shape D-63 punished -- a test that never sees the program's real input.
+    """
+    problems: List[str] = []
+    if len(shape) != 4:
+        problems.append(f"rank {len(shape)}, expected 4 (B,C,H,W)")
+    elif shape[1] != 3:
+        problems.append(
+            f"shape {shape} -- channel dim is {shape[1]}, not 3"
+            + (" (this looks like NHWC: the permute never happened)"
+               if shape[-1] == 3 else ""))
+    elif want_res and shape[-1] != want_res:
+        problems.append(f"{shape[-1]}px, expected {want_res}px "
+                        f"(the crop never happened)")
+    if not is_float:
+        problems.append(f"dtype {dtype_name}, expected float "
+                        f"(the cast/normalise never happened)")
+    return problems
+
+
+def _assert_model_ready(x, cfg: Dict[str, Any], where: str = "") -> None:
+    """Is this batch actually model-input, or raw loader output?
+
+    **D-76.** A loader that skipped `GPUBatchLoader` handed the model
+    `[256, 256, 256, 3]` uint8 and torch reported
+
+        Given groups=1, weight of size [64, 3, 7, 7], expected
+        input[256, 256, 256, 3] to have 3 channels, but got 256 channels
+
+    which names a convolution's weights and blames the channel count. The
+    actual fault is three layers up -- an eval view built without the
+    conversion layer -- and nothing in that message points there.
+
+    Checked once per sweep, on the first batch. Microseconds, and it turns a
+    misleading error into the one sentence that identifies the cause.
+    """
+    if not _TORCH_OK or not isinstance(x, torch.Tensor):
+        return
+    problems = _model_input_problems(
+        tuple(x.shape),
+        x.dtype in (torch.float32, torch.float16, torch.bfloat16),
+        int(cfg.get("input_res", 0) or 0),
+        str(x.dtype))
+    if problems:
+        raise RuntimeError(
+            f"[{where}] this loader is not producing model input: "
+            + "; ".join(problems)
+            + ".\n  A loader for measurement must be built with "
+              "`eval_view_of(loader, cfg)`. Rebuilding a DataLoader from "
+              "`some_loader.dataset` drops GPUBatchLoader, which is where the "
+              "permute, cast, normalise and crop live (D-76).")
+
+
+def eval_view_of(loader, cfg: Dict[str, Any], batch_size: Optional[int] = None):
+    """The same samples, in order, with augmentation off — for BOTH backends.
+
+    **D-76.** `train_msc_kd` needed to sweep the teacher over the training set
+    to build MSC targets, and wrote:
+
+        train_eval = DataLoader(train_loader.dataset, batch_size=..., ...)
+        train_eval.dataset.augment = False
+
+    Both lines are correct on CIFAR and wrong on ImageNet-100.
+
+      * `train_loader` is a `GPUBatchLoader`; `.dataset` delegates through to
+        the raw `PackedImageDataset`. Rebuilding a `DataLoader` from it
+        DISCARDS the conversion layer -- the permute, the float cast, the
+        normalise, and the 256->224 crop all live in `GPUBatchLoader`. The
+        model received `[256, 256, 256, 3]` uint8 and said so:
+        "expected input to have 3 channels, but got 256".
+      * `PackedImageDataset` has no `augment` attribute. That assignment
+        created an unread one inside a bare `except: pass`, so the intent
+        "augmentation off while measuring" silently did nothing. Had the shape
+        error not fired first, MSC targets would have been measured through
+        whatever view the loader happened to produce.
+
+    On CIFAR both worked because `CIFARTensor.__getitem__` returns finished
+    NCHW tensors and carries a real `augment` flag. Same seam as D-70: the
+    library is parameterised by dataset, and that only holds where both
+    datasets present the same interface.
+
+    This returns an eval-mode view built the way the backend requires, so no
+    caller has to know which backend it has.
+    """
+    bs = int(batch_size or cfg.get("eval_batch_size", 256))
+    if _TORCH_OK and isinstance(loader, GPUBatchLoader):
+        inner = loader.loader
+        ds = inner.dataset
+        if isinstance(inner, RAMBatchLoader):
+            raw = RAMBatchLoader(ds, inner.arr, bs, shuffle=False, seed=0,
+                                 pin=inner.pin)
+        else:
+            raw = DataLoader(ds, batch_size=bs, shuffle=False,
+                             num_workers=0, pin_memory=True)
+        spec = dataset_spec(str(cfg.get("dataset_name", "imagenet100")))
+        # train=False is what turns augmentation off here -- a centre crop
+        # instead of a random resized crop, and no flip.
+        return GPUBatchLoader(raw, loader.device, loader.out_res,
+                              loader.stored_res, spec["mean"], spec["std"],
+                              train=False, seed=0,
+                              channels_last=loader.channels_last)
+
+    # CIFAR-style: a plain DataLoader over a dataset that owns its own flag.
+    ds = getattr(loader, "dataset", loader)
+    out = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=0,
+                     pin_memory=True)
+    if hasattr(ds, "augment"):
+        ds.augment = False
+    else:
+        raise TypeError(
+            f"{type(ds).__name__} has no `augment` flag and this loader is not "
+            f"a GPUBatchLoader, so augmentation cannot be turned off for "
+            f"measurement. Refusing to measure MSC through an unknown view "
+            f"(D-76).")
+    return out
+
+
 def build_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
     """train / val(test) / train-holdout loaders.
 
@@ -8551,8 +8675,10 @@ def sweep_all_axes(cfg: Dict[str, Any], multi_exit, loader, device,
                           dynamic_ncols=True, mininterval=2.0)
         except Exception:
             pass
-        for batch in it:
+        for _bi, batch in enumerate(it):
             x = batch[0].to(device, non_blocking=True)
+            if _bi == 0:
+                _assert_model_ready(x, cfg, where=f"sweep {tag}")
             y = batch[1]
             idx = batch[2] if len(batch) > 2 else torch.arange(y.numel())
             with torch.amp.autocast(device_type=device.type,
@@ -10572,20 +10698,14 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                                 hub, t_dir, show_progress)
 
     log("sweeping teacher over the training set for MSC targets", "MSCKD")
-    train_eval = DataLoader(train_loader.dataset, batch_size=int(cfg.get("eval_batch_size", 512)),
-                            shuffle=False, num_workers=0, pin_memory=True)
     # Augmentation off while measuring: MSC of an augmented view is not MSC of
-    # the sample.
-    was_aug = getattr(train_eval.dataset, "augment", False)
-    try:
-        train_eval.dataset.augment = False
-    except Exception:
-        pass
-    sweep = sweep_all_axes(cfg, t_me, train_eval, device, show_progress=show_progress)
-    try:
-        train_eval.dataset.augment = was_aug
-    except Exception:
-        pass
+    # the sample. `eval_view_of` knows how each backend expresses that -- a
+    # dataset flag on CIFAR, `train=False` on the GPU loader for ImageNet-100
+    # -- so this no longer guesses, and no longer silently guesses wrong
+    # inside a bare `except` (D-76).
+    train_eval = eval_view_of(train_loader, cfg)
+    sweep = sweep_all_axes(cfg, t_me, train_eval, device,
+                           show_progress=show_progress)
 
     core = _import_msc_core()
     rho_list = t_budgets["axes"]["depth"]["rho"]
@@ -12175,6 +12295,31 @@ def _selftest() -> bool:
     _ok60, _why60 = hash_compatible(_c60, _stored_v1)
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
+
+    # -- D-76: a measurement loader must produce MODEL INPUT ------------------
+    # The EXACT batch that failed on the user's machine: [256, 256, 256, 3]
+    # uint8, straight off the packed dataset with no conversion layer.
+    _p76 = _model_input_problems((256, 256, 256, 3), False, 224, "torch.uint8")
+    check("D-76: the exact failing batch is refused", bool(_p76), "; ".join(_p76))
+    check("D-76: and the message identifies it as NHWC",
+          any("NHWC" in m for m in _p76), "; ".join(_p76))
+    check("D-76: and names the missing float cast",
+          any("expected float" in m for m in _p76))
+
+    check("D-76: a 256px float batch is refused when the config says 224",
+          bool(_model_input_problems((2, 3, 256, 256), True, 224)))
+    check("D-76: a rank-3 batch is refused",
+          bool(_model_input_problems((2, 3, 224), True, 224)))
+
+    # The canary that matters most: a guard which rejects valid input would
+    # break every sweep, including the ones that currently work.
+    check("D-76 canary: a CORRECT batch is not refused",
+          not _model_input_problems((64, 3, 224, 224), True, 224),
+          "NB3 already passes through this path")
+    check("D-76 canary: correct at another resolution is not refused",
+          not _model_input_problems((64, 3, 160, 160), True, 160))
+    check("D-76 canary: no res in cfg means no res complaint",
+          not _model_input_problems((64, 3, 96, 96), True, 0))
 
     # -- D-70: device tensors must survive the numpy boundary -----------------
     #
