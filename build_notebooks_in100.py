@@ -30,6 +30,7 @@ import ast
 import base64
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1656,9 +1657,10 @@ def main() -> int:
     # with a longer feedback loop.
     # D-77. Syntax is not enough: a name that exists in one function and not
     # another parses cleanly and raises NameError when the branch is taken.
-    print("\n  checking src/msc_lib.py for undefined names")
+    print("\n  checking src/msc_lib.py and this generator for undefined names")
     _cn = subprocess.run(
-        [sys.executable, str(ROOT / "tools" / "check_names.py"), str(LIB)],
+        [sys.executable, str(ROOT / "tools" / "check_names.py"), str(LIB),
+         str(Path(__file__).resolve())],          # the generator too (D-77)
         capture_output=True, text=True)
     print(_cn.stdout.rstrip() or _cn.stderr.rstrip())
     if _cn.returncode != 0:

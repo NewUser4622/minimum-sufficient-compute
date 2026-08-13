@@ -2691,6 +2691,18 @@ Verified against both a file containing the exact `step` mistake and one using
 comprehensions, `with`, `except as`, conditional module definitions and
 dunders — caught the first, silent on the second.
 
+**And then it caught me twice more, immediately.** Wiring it into the build
+introduced `NameError: name 'subprocess' is not defined` — my guarded insert
+(`if "\nimport subprocess" not in s`) matched an `import subprocess` that lives
+inside a *generated notebook cell*, three hundred lines down, so the
+module-level import was never added. The build failed on its own new check.
+The checker also only inspected `src/msc_lib.py`; it now inspects the generator
+as well, which is where that defect was.
+
+Two rounds of the same mistake in the space of adding one guard is a fair
+measure of how easy this class is, and of why it needed a mechanism rather than
+more care.
+
 **Contamination.** None. The abort happened during target construction, before
 any optimiser step. The 18 `p3-*` directories still hold only `config.yaml` and
 `config_hash.txt`.
