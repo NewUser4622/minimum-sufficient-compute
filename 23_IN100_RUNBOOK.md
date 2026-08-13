@@ -353,6 +353,8 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | `TypeError: can't convert cuda:0 device type tensor to numpy` during the oracle sweep | `GPUBatchLoader` yields labels on the DEVICE; the CIFAR DataLoader yields them on the host | D-70 — all conversions go through `M.to_numpy()`. |
 | `SyntaxError: unterminated string literal` in cell 1 of every notebook | `\n` emitted where `\\n` was needed; the validator skips unparseable cells silently | D-73 — the build now parses every cell as Python 3.10 and refuses on failure. |
 | NB5 raises `SystemExit: Set CONFIRM = True` | deliberate. Read the gate table and cost estimate above it first | D-72 — 18 training runs is not a thing to start by accident. |
+| NB5 shows `SystemExit` with a traceback and a 'To exit: use quit' warning | that was the CONFIRM gate doing its job -- now a plain banner, no exception | D-74 — set `CONFIRM = True` and re-run from that cell. |
+| NB5 still says STALE after you ran `conv_sweep` | the sweep result was written and never read | D-74 — `measured_img_s()` now prefers `benchmark/convsweep_<arch>_*.json`. |
 
 ### Reading the self-test after any change
 

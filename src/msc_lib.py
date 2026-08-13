@@ -10287,6 +10287,39 @@ def load_analysis(data_dir, name: str, default=None):
     return default if df.empty else df
 
 
+def measured_img_s(arch: str, repo_root=None) -> Tuple[float, str]:
+    """Throughput for `arch`: the freshest MEASUREMENT, and where it came from.
+
+    D-74. `IN100_MEASURED_IMG_S` still carries figures taken under the slow
+    `channels_last` layout (D-59) for five architectures. `tools/conv_sweep.py`
+    writes a corrected number to `benchmark/convsweep_<arch>_*.json`, and
+    nothing read it -- so a user who ran the sweep, as instructed, still saw
+    "STALE" and a wrong estimate. A fourth writer with no reader (D-63, D-72).
+
+    Returns `(img_s, basis)`. The sweep result wins when present, because it
+    was taken on this machine in the configuration that now runs.
+    """
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent.parent
+    best, when = None, None
+    for f in sorted((root / "benchmark").glob(f"convsweep_{arch}_*.json")):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:                                        # noqa: BLE001
+            continue
+        vals = [v.get("img_s") for v in d.values()
+                if isinstance(v, dict) and v.get("img_s")]
+        if vals:
+            best, when = max(vals), f.name
+    if best is not None:
+        return float(best), f"conv_sweep ({when})"
+    v = IN100_MEASURED_IMG_S.get(arch)
+    if v is None:
+        return float("nan"), "NOT MEASURED"
+    if arch in IN100_PENDING_REMEASURE:
+        return float(v), "STALE -- channels_last; run tools/conv_sweep.py --arch " + arch
+    return float(v), "measured"
+
+
 def gate_report(data_dir) -> Dict[str, Any]:
     """Q1-Q4 against their pre-registered gates, as data rather than eyeballs.
 

@@ -1461,24 +1461,43 @@ print(f"this notebook trains {n_runs} runs "
 print(f"{'student':18s} {'img/s':>8s} {'h/run':>7s} {'h total':>8s}  basis")
 total = 0.0
 for _a in STUDENTS:
-    _ips = M.IN100_MEASURED_IMG_S.get(_a)
-    _stale = _a in M.IN100_PENDING_REMEASURE
+    # Prefers a conv_sweep result on THIS machine over the stale table (D-74).
+    _ips, _basis = M.measured_img_s(_a, repo_root=Path.cwd().parent)
     _h = (119395 * int(M.base_config(_a, 'imagenet100')['num_epochs'])
-          / _ips / 3600) if _ips else float('nan')
+          / _ips / 3600) if _ips == _ips and _ips else float('nan')
     _sub = _h * len(SEEDS) * len(ARMS)
     total += 0.0 if _sub != _sub else _sub
-    _basis = ('STALE -- taken under channels_last; run tools/conv_sweep.py'
-              if _stale else 'measured')
     print(f"{_a:18s} {_ips:>8.0f} {_h:>7.1f} {_sub:>8.1f}  {_basis}")
+_stale_now = [a for a in STUDENTS
+              if M.measured_img_s(a, repo_root=Path.cwd().parent)[1].startswith('STALE')]
 print(f"{'':18s} {'':>8s} {'':>7s} {total:>8.1f}  = {total/24:.1f} days")
 print()
 print('MSC-KD students also carry the teacher forward pass, so the true cost')
 print('is above these numbers, not below them.')
 
-if not CONFIRM:
-    raise SystemExit(
-        'Set CONFIRM = True in the cell above once you have read the gate '
-        'table and the cost estimate. Nothing has been trained.')
+if _stale_now:
+    print()
+    print(f"{len(_stale_now)} student(s) still priced from the slow layout: "
+          f"{', '.join(_stale_now)}")
+    print("  the real cost is LOWER than shown. To find out by how much:")
+    for _a in _stale_now:
+        print(f"    python tools/conv_sweep.py --arch {_a}")
+    print("  this notebook picks the new numbers up automatically.")
+
+# D-74. NOT SystemExit. In Jupyter that prints a traceback and a
+# "To exit: use 'exit', 'quit', or Ctrl-D" warning, so a deliberate,
+# correct stop is indistinguishable from a crash -- in a project where
+# telling those apart has already cost days. The next cell simply does
+# nothing while CONFIRM is False.
+print()
+print('=' * 68)
+if CONFIRM:
+    print('CONFIRM = True -- the next cell will train.')
+else:
+    print('CONFIRM is False, so nothing will be trained.')
+    print('Read the gate table and the cost above, then set CONFIRM = True')
+    print('in the cell above and re-run from there.')
+print('=' * 68)
 """),
 code("""
 # train_msc_kd needs the teacher as well, so it goes through a closure --
@@ -1497,9 +1516,13 @@ def _train_student(cfg):
                           data_root_out=sess.data_dir,
                           shuffle_targets='shuff' in cfg['method'])
 
-results = sess.run_all(cfgs, fn=_train_student, done_fn=sess.msckd_valid,
-                       title='MSC-KD students')
-real = [r for r in results if 'shuff' not in r['run_id']]
+if not CONFIRM:
+    results = []
+    print('skipped: CONFIRM is False (see the gate cell above)')
+else:
+    results = sess.run_all(cfgs, fn=_train_student, done_fn=sess.msckd_valid,
+                           title='MSC-KD students')
+real = [r for r in results if 'shuff' not in r.get('run_id', '')]
 print(f"\\n{len([r for r in real if r.get('status') != 'skipped'])}/"
       f"{len(real)} REAL-method students trained -- the comparison needs all of them")
 """),

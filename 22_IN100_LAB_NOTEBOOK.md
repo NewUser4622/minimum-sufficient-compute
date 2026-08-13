@@ -2442,3 +2442,55 @@ loop.
 The check found all seven failing cells on its first run, and the last two only
 after the first fixes moved the error line — which is itself the argument for
 having it in the build rather than running it by hand.
+
+---
+
+## D-74 — a correct stop that looked like a crash, and a sweep nobody read
+
+The D-72 gate cell worked: it printed the gate table, showed 18 runs at 112.2 h
+= 4.7 days, and stopped before training. Two things were wrong with *how*.
+
+**1. `SystemExit` in a notebook is indistinguishable from a failure.**
+
+```
+An exception has occurred, use %tb to see the full traceback.
+SystemExit: Set CONFIRM = True ...
+UserWarning: To exit: use 'exit', 'quit', or Ctrl-D.
+```
+
+A red traceback and a warning about how to quit Python, for a deliberate,
+correct, expected stop. In this project specifically that is a bad choice:
+distinguishing "it failed" from "it did the right thing" has already cost
+several rounds, and I added a mechanism that makes them look the same.
+
+The gate cell now prints a plain banner, and the training cell simply does
+nothing while `CONFIRM` is `False`. No exception for an expected control flow.
+
+**2. The cost table said STALE at a user who had been told to fix it.**
+
+`tools/conv_sweep.py` writes a corrected throughput to
+`benchmark/convsweep_<arch>_*.json`. Nothing read it. So running the sweep — as
+the notebook instructs, in the very next line — changed nothing the notebook
+showed. **A fourth writer with no reader**, after `atomic_write_yaml` (D-63),
+`config.yaml` as a record (D-63), and `save_analysis` (D-72).
+
+That is now a pattern rather than three coincidences: this library has
+repeatedly produced artifacts nothing consumes. The write is the visible half
+of the work and the read is the half that makes it matter, and I have shipped
+the first without the second four times.
+
+`measured_img_s(arch)` returns `(img_s, basis)` and prefers a `conv_sweep`
+result on this machine over the stale table. Verified: with a sweep file
+present, `resnet18` moves from 413 img/s "STALE" to the swept figure and the
+budget for 3 seeds × 2 arms drops accordingly — 48.2 h to 10.8 h on a
+simulated 1840 img/s. The notebook picks it up with no edit.
+
+NB5 also now prints the exact commands for whichever students are still stale,
+and says plainly that the true cost is **lower** than shown, so the number
+cannot be read as pessimism about the method.
+
+**Not a defect.** `metrics/exit_metrics.csv` is 269 bytes and correct — exit,
+depth_fraction, rho, flops, stage_cut, feature_dim for all five exits. It was
+reported as "0K" by my own status check, which rounded 269 bytes to zero KB. A
+display bug in the reporting, not a gap in the data. Corrected in
+`24_IN100_STATUS.md`.

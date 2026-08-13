@@ -49,7 +49,7 @@ NB1 Setup     ██████████ done    data packed, 129,395 images
 NB2 Train     ██████████ done    4/4 runs, 100 epochs each
 NB3 Measure   ██████████ done    4/4 measured, per-sample tables written
 NB4 Analysis  ██████████ done    Q1 Q2 Q3 Q4 all written to analysis/
-NB5 Method    ░░░░░░░░░░ ready   gated on CONFIRM · trains 18 NEW runs
+NB5 Method    ░░░░░░░░░░ ready   gated on CONFIRM · 18 runs · ~112 h before re-measuring
 ```
 
 ## FIRST RESULT — the question, answered for the pilot
@@ -218,9 +218,9 @@ Full analysis in `22_IN100_LAB_NOTEBOOK.md`. Fixed unless marked.
 
 1. **Finish NB4** (close without saving → rebuild → reopen → Run All). Q1 and
    Q2 already produced results; D-71 unblocks Q3 and Q4.
-2. Check `metrics/exit_metrics.csv` — it is **0 bytes** on all four runs. Not
-   yet diagnosed; it is in `RUN_ARTIFACTS_EXPECTED`, so it costs a column
-   rather than the run, but it should not be empty.
+2. ~~`exit_metrics.csv` is 0 bytes~~ — **false alarm, my error.** It is 269
+   bytes and correct (exit, depth_fraction, rho, flops, stage_cut,
+   feature_dim × 5 exits). My status check rounded 269 B to "0K".
 3. Decide §6.1 (2 seeds vs 3) and §6.2 (the ViT overfitting arm) **before**
    NB5 — both change what NB5 is worth doing.
 4. `conv_sweep --arch deit_small` before committing to NB5's 18 runs.
