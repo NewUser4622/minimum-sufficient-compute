@@ -2609,7 +2609,15 @@ is only as safe as its false-positive rate, and one I could only exercise on
 the user's GPU would be a guard shipped unverified. That is precisely the shape
 D-63 punished.
 
-**Contamination.** None. No `p3-*` run wrote anything; each failed during the
-teacher sweep, before any student step. Phase 0 is untouched. The cost was
-~5 minutes, not 4.7 days — the failure was fast and total rather than slow and
-partial, which is the good kind.
+**Contamination.** None of consequence, and I checked rather than assumed:
+all 18 `p3-*` directories exist, each holding exactly two files — `config.yaml`
+and `config_hash.txt`, written at claim time — for **288 KB total**. No
+checkpoint, no `epochs.csv`, no parquet, no `STATUS.json` state. Every run
+failed during the teacher sweep, before the first student step. They are reused
+on the next attempt rather than needing cleanup.
+
+Phase 0 is untouched. The cost was ~5 minutes, not 4.7 days: the failure was
+fast and total rather than slow and partial, which is the good kind. Had D-75's
+reordering not landed first, this would still have been the first run to fail —
+but the point of that change was that the *cheapest* informative thing happens
+first, and a total failure at run 1 is exactly that.
