@@ -2185,3 +2185,75 @@ naming both hashes and the remedy: close without saving, rebuild, reopen.
 "re-run it" is the wrong instruction. The notebook must be **closed without
 saving and reopened**. Every previous "still failing" report in this session is
 consistent with this mechanism, and D-62 was only half of it.
+
+---
+
+## D-69 — the checkpoint was one directory away, and the right path was in dead code
+
+**Symptom.** NB3 planned correctly at last (`stage: measure`, 4 runs), then
+failed on all four:
+
+```
+FileNotFoundError: no ckpt_best.pt for p0-resnet50-imagenet100-base-s1.
+  Train the backbone first (notebook 02).
+```
+
+The backbone *had* been trained. `ckpt_best.pt` was 91 MB, on disk, one
+directory away.
+
+**Cause.**
+
+```python
+ckpt = run_dir / "ckpt_best.pt"          # the run ROOT
+```
+
+Checkpoints live in `checkpoints/`. And the function knew it — three lines
+below, the HuggingFace fallback read
+
+```python
+alt = L["checkpoints"] / "ckpt_best.pt"  # correct
+```
+
+**The correct spelling was already there, in unreachable code.** With HF
+removed for local-only operation, `hub.enabled` is False, that branch never
+runs, and the only surviving spelling was the wrong one. Removing HuggingFace
+did not create this bug; it removed the thing that had been hiding it.
+
+That is a specific hazard worth naming: when a fallback is deleted or disabled,
+any correctness that lived *only* in the fallback goes with it. The primary
+path had presumably never been exercised on a machine where the fallback could
+not save it.
+
+**This is D-16 and D-23 for the third time.** D-16 was a path spelled two ways
+and closed as "cosmetic". D-23 was the same file, `exit_heads.pt`, where writer
+and readers disagreed and every MSC-KD run silently retrained the teacher's
+heads. `exit_heads_path()` was created *specifically* so that path would have
+one spelling — and thirty lines from where it is defined, `run_oracle` was
+still spelling it by hand as `run_dir / "exit_heads.pt"`. Both are now routed
+through the accessors.
+
+Rule 4 says never spell a repo path as a literal; go through one accessor. The
+accessor existed. The rule was written down. Neither is a mechanism.
+
+**Fix.**
+
+1. `ckpt = L["checkpoints"] / "ckpt_best.pt"`; `heads_path =
+   exit_heads_path(work, run_id)`.
+2. The error message now prints the path it looked at, whether `ckpt_last.pt`
+   is present, and that `MSC_ROOT` may be pointing elsewhere — instead of
+   asserting a false cause ("train the backbone first") about a run that had
+   trained for 41 hours.
+3. A self-test walks this module's AST for `run_dir / "<name>"` and fails if
+   `<name>` appears in the artifact lists under a subdirectory. The lists
+   already record where each file belongs, so this compares two existing
+   statements rather than inventing a third.
+
+**The check needed rewriting too.** Its first version used a regex and matched
+its own explanatory comment and its own pattern string — 2 reported problems
+for 1 real one. Rewritten over the AST, with canaries proving it catches
+`run_dir / "ckpt_best.pt"` and accepts both `L["checkpoints"] / "ckpt_best.pt"`
+and `run_dir / "summary.json"`, which legitimately lives at the run root.
+
+**Contamination.** No data lost. Four measurement attempts wasted, and the
+error text actively misdirected — it told the user to retrain models that were
+already trained.

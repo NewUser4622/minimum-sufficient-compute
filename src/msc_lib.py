@@ -8744,16 +8744,28 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     set_seed(int(cfg["seed"]), deterministic=bool(cfg.get("deterministic", False)))
 
     # --- recover the trained backbone -------------------------------------
-    ckpt = run_dir / "ckpt_best.pt"
+    # D-69. This read `run_dir / "ckpt_best.pt"` -- the run ROOT. Checkpoints
+    # live in `checkpoints/`, and the code KNEW that: the HuggingFace fallback
+    # below spelled it `L["checkpoints"] / "ckpt_best.pt"` correctly. With HF
+    # disabled that branch is dead, so the only surviving spelling was the
+    # wrong one and every measurement failed with "Train the backbone first"
+    # while a 91 MB checkpoint sat one directory away.
+    #
+    # Two spellings of one path, one of them wrong, and the correct one three
+    # lines below in unreachable code. That is D-16, and D-23 is the same
+    # defect on `exit_heads.pt` -- which is why `exit_heads_path()` exists and
+    # is now used here rather than re-spelled.
+    ckpt = L["checkpoints"] / "ckpt_best.pt"
     if not ckpt.exists() and hub.enabled:
         log(f"pulling checkpoint for {run_id} from HF", "ORACLE")
         hub.hub.download(work, allow_patterns=[f"runs/{run_id}/**"], quiet=False)
-        alt = L["checkpoints"] / "ckpt_best.pt"
-        if alt.exists():
-            ckpt = alt
     if not ckpt.exists():
+        _last = L["checkpoints"] / "ckpt_last.pt"
         raise FileNotFoundError(
-            f"no ckpt_best.pt for {run_id}. Train the backbone first (notebook 02).")
+            f"no ckpt_best.pt for {run_id} at {ckpt}.\n"
+            f"  ckpt_last.pt present: {_last.exists()}\n"
+            f"  Train the backbone first (NB2), or check MSC_ROOT points at "
+            f"the results folder that holds this run.")
 
     backbone = place_model(build_model(cfg["arch"], cfg["num_classes"]),
                            device, cfg, tag="oracle backbone")
@@ -8767,7 +8779,8 @@ def run_oracle(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     train_loader, val_loader, holdout_loader, classes, order_hash = build_loaders(cfg)
 
     # --- exit heads --------------------------------------------------------
-    heads_path = run_dir / "exit_heads.pt"
+    # THE accessor, not a second spelling (D-23).
+    heads_path = exit_heads_path(work, run_id)
     me = place_model(MultiExitModel(backbone, cfg["num_classes"], freeze=True),
                      device, cfg)
     if heads_path.exists() and not cfg.get("force_rerun"):
@@ -12011,6 +12024,70 @@ def _selftest() -> bool:
     _ok60, _why60 = hash_compatible(_c60, _stored_v1)
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
+
+    # -- D-69: an artifact must be joined to the directory it lives in --------
+    #
+    # `run_dir / "ckpt_best.pt"` -- the run root -- while checkpoints live in
+    # `checkpoints/`. The correct spelling existed three lines below, inside a
+    # HuggingFace branch that is dead in a local-only run, so the only reachable
+    # spelling was wrong and every measurement failed with "Train the backbone
+    # first" beside a 91 MB checkpoint.
+    #
+    # The artifact lists already say where each file belongs, so the check is
+    # a comparison rather than a new opinion (D-16).
+    _in_subdir = {}
+    for _grp in (RUN_ARTIFACTS_REQUIRED, RUN_ARTIFACTS_MEASURED,
+                 RUN_ARTIFACTS_EXPECTED):
+        for _rel in _grp:
+            if "/" in _rel:
+                _in_subdir[_rel.split("/")[-1]] = _rel.split("/")[0]
+    # AST, not regex: the first version matched its own explanatory comment
+    # and its own pattern string, reporting 2 problems where there was 1. A
+    # checker that cries wolf is the thing this project keeps paying for.
+    _misplaced = []
+    try:
+        import ast as _a69
+        _t69 = _a69.parse(_src_of_module())
+        for _nd in _a69.walk(_t69):
+            if not (isinstance(_nd, _a69.BinOp)
+                    and isinstance(_nd.op, _a69.Div)):
+                continue
+            _lhs, _rhs = _nd.left, _nd.right
+            if not (isinstance(_lhs, _a69.Name) and _lhs.id == "run_dir"):
+                continue
+            if not (isinstance(_rhs, _a69.Constant)
+                    and isinstance(_rhs.value, str)):
+                continue
+            if _rhs.value in _in_subdir:
+                _misplaced.append(
+                    f'line {_nd.lineno}: run_dir / "{_rhs.value}" but it '
+                    f'lives in {_in_subdir[_rhs.value]}/')
+    except Exception as _e69:                                    # noqa: BLE001
+        _misplaced.append(f"<could not parse: {_e69}>")
+    check("D-69: no artifact is joined to the run root when it lives in a subdir",
+          not _misplaced,
+          "OK" if not _misplaced else "; ".join(_misplaced))
+
+    check("D-69 canary: the subdir map is populated",
+          _in_subdir.get("ckpt_best.pt") == "checkpoints",
+          f"ckpt_best.pt -> {_in_subdir.get('ckpt_best.pt')}")
+
+    def _d69_finds(src_txt):
+        import ast as _a
+        for _n in _a.walk(_a.parse(src_txt)):
+            if (isinstance(_n, _a.BinOp) and isinstance(_n.op, _a.Div)
+                    and isinstance(_n.left, _a.Name) and _n.left.id == "run_dir"
+                    and isinstance(_n.right, _a.Constant)
+                    and _n.right.value in _in_subdir):
+                return True
+        return False
+
+    check("D-69 canary: the walker catches the exact defective line",
+          _d69_finds('ckpt = run_dir / "ckpt_best.pt"'))
+    check("D-69 canary: it accepts the correct spelling and run-root files",
+          not _d69_finds('ckpt = L["checkpoints"] / "ckpt_best.pt"')
+          and not _d69_finds('p = run_dir / "summary.json"'),
+          "summary.json legitimately lives at the run root")
 
     # -- D-67: measuring must be PLANNED as measuring -------------------------
     _s67 = Session.__new__(Session)
