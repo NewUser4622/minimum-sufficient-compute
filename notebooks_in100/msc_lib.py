@@ -9520,14 +9520,34 @@ def representative_runs(runs: Dict[str, Dict[str, Any]],
     """
     cand: Dict[str, List[Tuple[int, str]]] = {}
     for rid, m in runs.items():
-        if require is not None and rid not in require:
-            continue
         arch = m.get("arch")
         if not arch:
+            continue
+        # D-71. This tested `rid not in require`. `require` is the CEILINGS
+        # dict, keyed by ARCHITECTURE ('resnet50'); `rid` is a run id
+        # ('p0-resnet50-imagenet100-base-s1'). No run id is ever a member, so
+        # every run was skipped, `cand` stayed empty, and every caller that
+        # passed `require` got an empty result -- silently.
+        #
+        # Q3's shuffled control wrote a 2-byte CSV and NB4 raised
+        # `KeyError: 'passed'` on a frame with no columns. Q3's axis structure
+        # returns `pd.DataFrame([])` on no pairs and did not even raise.
+        #
+        # The docstring said "an ARCHITECTURE is only represented by a run
+        # that appears in it". The prose was right and the code tested the
+        # other key. Two identifier spaces, one membership test.
+        if require is not None and arch not in require:
             continue
         seed = m.get("seed")
         cand.setdefault(arch, []).append(
             (10 ** 6 if seed is None else int(seed), rid))
+    if require is not None and runs and not cand:
+        raise KeyError(
+            f"representative_runs: `require` excluded ALL {len(runs)} runs. "
+            f"It is keyed by {sorted(list(require))[:3]}... and is matched "
+            f"against architecture names like "
+            f"{sorted({m.get('arch') for m in runs.values()})[:3]}. "
+            f"An empty result here empties every downstream table (D-71).")
     return {arch: sorted(v)[0][1] for arch, v in cand.items()}
 
 
@@ -9927,7 +9947,13 @@ def analyse_q3_all(session, phase: Optional[str] = None, tau: float = 0.1,
     archs = sorted(a for a in reps if a in ceil)
     pairs = [(reps[a], reps[b]) for i, a in enumerate(archs) for b in archs[i + 1:]]
     if not pairs:
-        return pd.DataFrame([])
+        # D-71. This returned an empty frame in silence, so an upstream
+        # key-space error surfaced as a KeyError on a column three layers away.
+        raise RuntimeError(
+            f"Q3: no architecture PAIRS to compare. {len(runs)} measured run(s) "
+            f"covering {sorted({m['arch'] for m in runs.values()})}, of which "
+            f"{len(archs)} have a seed ceiling at tau={tau}. A transfer needs "
+            f"two architectures with >= 2 measured seeds each.")
     budgets = {reps[a]: session.budgets(a) for a in archs}
     ceil_by_run = {reps[a]: ceil[a] for a in archs}
     df = analyse_q3_transfer(session.data_dir, pairs, ceil_by_run, budgets,
@@ -9957,6 +9983,11 @@ def analyse_q3_shuffled_control_all(session, phase: Optional[str] = None,
                                             ceil_by_run, budgets, tau=tau)
             r.update({"arch_a": a, "arch_b": b})
             rows.append(r)
+    if not rows:
+        raise RuntimeError(
+            f"Q3 shuffled control: no pairs. {len(archs)} architecture(s) have "
+            f"a ceiling at tau={tau}: {archs}. Two are needed. An empty frame "
+            f"here becomes KeyError('passed') in the notebook (D-71).")
     df = pd.DataFrame(rows)
     # D-52. The primitive returns `passed`. This wrapper looked for `ok` to
     # synthesise a `passes` column, so `passes` was never created and NB4's
@@ -13359,8 +13390,11 @@ def _selftest() -> bool:
              "p1-resnet20-cifar100-base-s1": {"arch": "resnet20", "seed": 1},
              "p1-resnet20-cifar100-base-s2": {"arch": "resnet20", "seed": 2},
              "p1-wrn_16_2-cifar100-base-s2": {"arch": "wrn_16_2", "seed": 2}}
-    _ceil = {"p1-vgg8-cifar100-base-s2", "p1-vgg8-cifar100-base-s3",
-             "p1-resnet20-cifar100-base-s1", "p1-resnet20-cifar100-base-s2"}
+    # D-71. This used to be a set of RUN IDS. `require` is only ever given
+    # `_ceilings(...)`, which is keyed by ARCHITECTURE -- so the test asserted
+    # the buggy semantics and passed while every real caller got an empty
+    # result. The fixture is now the shape the callers actually pass.
+    _ceil = {"vgg8": 0.71, "resnet20": 0.66}          # arch -> rho_seed
     rep = representative_runs(_runs, require=_ceil)
     check("D-18: vgg8 is represented even with no seed 1",
           rep.get("vgg8") == "p1-vgg8-cifar100-base-s2", str(rep.get("vgg8")))
@@ -13372,6 +13406,22 @@ def _selftest() -> bool:
           "wrn_16_2" not in rep, str(sorted(rep)))
     check("D-18: without `require`, nothing is excluded",
           "wrn_16_2" in representative_runs(_runs))
+
+    # D-71. A `require` keyed by the WRONG identifier space must be loud.
+    # Silently returning {} emptied Q3-axis, Q3-control and Q4 at once: the
+    # control wrote a 2-byte CSV and NB4 raised KeyError on a frame with no
+    # columns, three layers from the cause.
+    _wrong_space = {"p1-vgg8-cifar100-base-s2", "p1-resnet20-cifar100-base-s1"}
+    check("D-71: a run-id-keyed `require` raises instead of returning {}",
+          _raises(lambda: representative_runs(_runs, require=_wrong_space),
+                  KeyError),
+          "an empty reps dict empties every downstream table")
+    check("D-71: the arch-keyed `require` still returns both architectures",
+          sorted(representative_runs(_runs, require=_ceil)) ==
+          ["resnet20", "vgg8"],
+          str(sorted(representative_runs(_runs, require=_ceil))))
+    check("D-71: an empty runs dict is not mistaken for a key-space error",
+          representative_runs({}, require=_ceil) == {})
 
     _pairs = [("a", "b"), ("a", "c"), ("a", "d"), ("a", "e"),
               ("b", "c"), ("b", "d"), ("x", "y")]
@@ -14336,4 +14386,4 @@ if __name__ == "__main__":
         sys.exit(0 if _selftest() else 1)
     print(f"msc_lib v{__version__} -- run with --selftest for the offline checks")
 
-__MSC_BUILD__ = "e8ee82e9d521"
+__MSC_BUILD__ = "ca266142fb71"

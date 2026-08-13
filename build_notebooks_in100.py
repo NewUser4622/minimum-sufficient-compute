@@ -26,6 +26,7 @@ are GENERATED -- editing the blob does nothing that survives the next rebuild.
 """
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -163,8 +164,8 @@ _got = getattr(M, '__MSC_BUILD__', None)
 if _got != _want:
     raise RuntimeError(
         f"STALE msc_lib: this notebook ships build {{_want}} but the imported "
-        f"module reports {{_got}}.\n"
-        f"  loaded from: {{getattr(M, '__file__', '?')}}\n"
+        f"module reports {{_got}}.\\n"
+        f"  loaded from: {{getattr(M, '__file__', '?')}}\\n"
         f"  Restart the kernel (Kernel -> Restart) and run all cells. Objects "
         f"created before a reimport keep the OLD code even after this cell "
         f"rewrites the file (D-62).")
@@ -190,10 +191,10 @@ if _repo.exists():
     if _repo_sha != _want:
         raise RuntimeError(
             f"STALE NOTEBOOK: this file embeds msc_lib {{_want}}, but "
-            f"src/msc_lib.py is {{_repo_sha}}.\n"
+            f"src/msc_lib.py is {{_repo_sha}}.\\n"
             f"  You are running an older copy of this notebook. Jupyter saves "
             f"an open notebook when you run it, so an open tab silently "
-            f"overwrites a regenerated file.\n"
+            f"overwrites a regenerated file.\\n"
             f"  FIX: close this notebook WITHOUT saving, run "
             f"`python build_notebooks_in100.py`, then reopen it (D-68).")
     print(f'msc_lib build {{_got}} verified, and current with src/')
@@ -793,13 +794,15 @@ sess = M.Session(account='local', phase=PHASE, dataset='imagenet100',
 cfgs = [sess.config(a, seed=s, num_epochs=EPOCHS) for a in ARCHS for s in SEEDS]
 run_ids = [c['run_id'] for c in cfgs]
 
-print(f'{len(cfgs)} run(s), {EPOCHS} epochs each\n')
+print(f'{len(cfgs)} run(s), {EPOCHS} epochs each')
+print()
 print(f"{'run_id':46s} {'opt':>6s} {'lr':>9s} {'bs':>4s} {'mixup':>6s} {'aug':>12s}")
 for c in cfgs:
     print(f"{c['run_id']:46s} {c['optimizer']:>6s} {c['learning_rate']:9.5f} "
           f"{c['batch_size']:4d} {c['mixup_alpha']:6.1f} {str(c['rrc_scale']):>12s}")
 e = M.in100_estimate(ARCHS, len(SEEDS), EPOCHS)
-print(f"\nestimated {e['total_gpu_hours']:.0f} GPU-hours = {e['days']:.1f} days")
+print()
+print(f"estimated {e['total_gpu_hours']:.0f} GPU-hours = {e['days']:.1f} days")
 print('(an estimate; the first cell above lists which entries are measured)')
 """),
         md("""
@@ -1389,6 +1392,10 @@ STUDENTS = ['resnet18', 'shufflenetv2_in', 'deit_small']
 SEEDS    = (1, 2, 3)
 ARMS     = [True, False]          # control FIRST, so a null result stops you early
 
+# D-72. This notebook costs 18 training runs. Nothing below starts until you
+# have looked at what Q1-Q4 actually said and set CONFIRM = True.
+CONFIRM  = False
+
 sess = M.Session(account='local', phase='p3', dataset='{DATASET}',
                  work_root=MSC_ROOT, session_limit_h=0.0)
 
@@ -1410,7 +1417,70 @@ for shuffled in ARMS:
                                     teacher_run=teacher_run))
 print(f'{{len(cfgs)}} student run(s): {{len(STUDENTS)}} arch x {{len(SEEDS)}} seeds x 2 arms')
 """),
+                md("""
+---
+## Read the gate before spending 18 runs
+
+MSC-KD's premise is Q4's: that MSC carries information a conventional
+difficulty battery does not. If Q4 failed, distillation is distilling
+something already available from `msp`, `margin` and `entropy` — and this
+notebook is an expensive way to learn that.
+
+The gates are pre-registered in `00_RESEARCH_PROTOCOL.md`. They are read from
+the analysis outputs here rather than eyeballed, because a gate nobody can
+query is a gate nobody checks.
+"""),
         code("""
+gates = M.gate_report(sess.data_dir)
+print(f"{'gate':24s} {'value':>9s} {'threshold':>10s}   verdict")
+print('-' * 62)
+for _name, _g in gates.items():
+    if not isinstance(_g, dict):
+        continue
+    print(f"{_name:24s} {_g['value']:>9.3f} {_g['threshold']:>10.2f}   "
+          f"{'PASS' if _g['passed'] else '** MISS **'}")
+    if _g.get('detail'):
+        print(f"{'':24s} {_g['detail']}")
+
+print()
+if not gates.get('all_passed'):
+    print('NOT every gate passed. That does not forbid running this notebook,')
+    print('but it changes what a positive result would mean, and it must be')
+    print('stated in the paper rather than discovered by a reviewer.')
+else:
+    print('all gates passed')
+
+# ---- what this will cost -------------------------------------------------
+# Real measurements where they exist, and STALE flags where they do not, so a
+# day-vs-week decision is not made from a number taken under the slow layout
+# (D-59).
+n_runs = len(STUDENTS) * len(SEEDS) * len(ARMS)
+print()
+print(f"this notebook trains {n_runs} runs "
+      f"({len(STUDENTS)} students x {len(SEEDS)} seeds x {len(ARMS)} arms)")
+print(f"{'student':18s} {'img/s':>8s} {'h/run':>7s} {'h total':>8s}  basis")
+total = 0.0
+for _a in STUDENTS:
+    _ips = M.IN100_MEASURED_IMG_S.get(_a)
+    _stale = _a in M.IN100_PENDING_REMEASURE
+    _h = (119395 * int(M.base_config(_a, 'imagenet100')['num_epochs'])
+          / _ips / 3600) if _ips else float('nan')
+    _sub = _h * len(SEEDS) * len(ARMS)
+    total += 0.0 if _sub != _sub else _sub
+    _basis = ('STALE -- taken under channels_last; run tools/conv_sweep.py'
+              if _stale else 'measured')
+    print(f"{_a:18s} {_ips:>8.0f} {_h:>7.1f} {_sub:>8.1f}  {_basis}")
+print(f"{'':18s} {'':>8s} {'':>7s} {total:>8.1f}  = {total/24:.1f} days")
+print()
+print('MSC-KD students also carry the teacher forward pass, so the true cost')
+print('is above these numbers, not below them.')
+
+if not CONFIRM:
+    raise SystemExit(
+        'Set CONFIRM = True in the cell above once you have read the gate '
+        'table and the cost estimate. Nothing has been trained.')
+"""),
+code("""
 # train_msc_kd needs the teacher as well, so it goes through a closure --
 # the same shape Session.train and Session.oracle use internally.
 #
@@ -1523,6 +1593,45 @@ def main() -> int:
             except Exception as _e:                              # noqa: BLE001
                 print(f"    could not decode the embedded blob: {_e}")
             return 1
+
+    # ------------------------------------------------------------------
+    # D-73. Does the emitted Python actually PARSE?
+    #
+    # The validator checked column names, repo paths, library names, call
+    # arity, result keys and stages -- six layers, none of which asked whether
+    # the code it was analysing was syntactically valid. It could not: every
+    # layer starts with `ast.parse` inside a `try`, and a cell that fails to
+    # parse is silently skipped rather than reported.
+    #
+    # So a real newline inside a single-quoted f-string -- `\n` written where
+    # `\\n` was needed, which is easy to do when a generator emits code through
+    # an f-string of its own -- shipped a notebook whose FIRST CELL could not
+    # run, and every check said OK.
+    #
+    # `feature_version` pins the target: the machine that runs these is on
+    # Python 3.10, and syntax accepted here but not there is the same defect
+    # with a longer feedback loop.
+    print("\n  parsing every emitted code cell as Python 3.10")
+    _syn = 0
+    for _nb in sorted(OUT.glob("NB*.ipynb")):
+        for _ci, _c in enumerate(json.loads(
+                _nb.read_text(encoding="utf-8")).get("cells", [])):
+            if _c.get("cell_type") != "code":
+                continue
+            _src = "".join(_c.get("source", []))
+            try:
+                ast.parse(_src, feature_version=(3, 10))
+            except SyntaxError as _e:
+                _syn += 1
+                print(f"  [FAIL] {_nb.name} cell {_ci}: {_e.msg} "
+                      f"(line {_e.lineno})")
+                print(f"         {(_e.text or '').strip()[:88]}")
+    if _syn:
+        print(f"\n  {_syn} cell(s) do not parse. Generation refused -- a "
+              f"notebook that cannot be parsed cannot be run, and every other "
+              f"check skips it silently.")
+        return 1
+    print("  all code cells parse")
 
     print("\n  validating column names and repo paths")
     sys.path.insert(0, str(ROOT / "tools"))

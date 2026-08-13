@@ -351,6 +351,8 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | A regenerated notebook behaves exactly as it did before the fix | Jupyter saved the open tab over the regenerated file on run -- the editor's copy wins | D-68 — cell 1 compares the embedded build against `src/msc_lib.py` and refuses. Close the notebook WITHOUT saving, rerun `python build_notebooks_in100.py`, reopen. |
 | `FileNotFoundError: no ckpt_best.pt ... Train the backbone first` on a run that IS trained | the path was joined to the run root; checkpoints live in `checkpoints/` | D-69 — fixed to `L['checkpoints']`. The message now prints the path it tried. |
 | `TypeError: can't convert cuda:0 device type tensor to numpy` during the oracle sweep | `GPUBatchLoader` yields labels on the DEVICE; the CIFAR DataLoader yields them on the host | D-70 — all conversions go through `M.to_numpy()`. |
+| `SyntaxError: unterminated string literal` in cell 1 of every notebook | `\n` emitted where `\\n` was needed; the validator skips unparseable cells silently | D-73 — the build now parses every cell as Python 3.10 and refuses on failure. |
+| NB5 raises `SystemExit: Set CONFIRM = True` | deliberate. Read the gate table and cost estimate above it first | D-72 — 18 training runs is not a thing to start by accident. |
 
 ### Reading the self-test after any change
 

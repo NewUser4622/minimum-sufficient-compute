@@ -2371,3 +2371,74 @@ cannot fail.
 **Contamination.** Q1 and Q2 are unaffected and their published numbers stand.
 Q3 and Q4 produced nothing, so nothing wrong was recorded. `q3_shuffled_control
 .csv` on disk is a 2-byte artifact of the failed run and is overwritten.
+
+---
+
+## D-72 — NB5 could not read the gate that decides whether to run it
+
+NB4 produced all four analyses. The pre-registered gates:
+
+| gate | measured | verdict |
+|---|---|---|
+| ρ_seed ≥ 0.60 | resnet50 **0.822**, vit **0.649** | PASS |
+| shuffled control, \|z\| < 5 | z = **2.30** (T_shuffled 0.037 vs T 0.640) | PASS |
+| partial ρ ≥ 0.30 | **0.282** | **MISS by 0.018** |
+
+Q4's ΔR² is 0.0411 with CI [0.0352, 0.0468] — excludes zero, so MSC does carry
+information beyond the seven-score difficulty battery. But the partial Spearman
+falls just under its pre-registered threshold.
+
+**That is exactly the number NB5 exists downstream of.** MSC-KD's premise is
+Q4's: that MSC is worth distilling because it is not already available from
+`msp`, `margin`, `entropy`. And NB5 had no way to consult it. `save_analysis`
+had **no reader** — the third writer in this library without one, after
+`atomic_write_yaml` (D-63) and the config record. So every gate in the protocol
+was a thing a human had to remember to eyeball, on the way into an 18-run
+commitment.
+
+**Fix.** `load_analysis()` and `gate_report()` read the gates as data. NB5 now
+opens with a gate table, a cost estimate that flags architectures whose
+throughput is STALE (D-59), and `CONFIRM = False` — it raises rather than
+training until the numbers have been looked at. Missing analyses report as
+`None`, never as a pass: a gate that has not been evaluated is not a gate met.
+
+**A near-miss reported as a near-miss.** 0.282 against 0.30 is the kind of
+result rule 12 exists for — it would be easy to call it "essentially 0.30". It
+is not 0.30. It is recorded as a MISS, and NB5 says so before it spends
+anything.
+
+---
+
+## D-73 — six validation layers, none of which checked the code parses
+
+The build shipped five notebooks whose **first cell was a syntax error**:
+
+```python
+f"module reports {_got}.
+"
+```
+
+A real newline inside a double-quoted f-string. `\n` written where `\\n` was
+needed — trivially easy when a generator emits code through an f-string of its
+own, and I introduced several while writing the D-62 and D-68 guards.
+
+**Every check passed.** Column names, repo paths, library names, call arity,
+result keys, stage predicates — six layers, and the notebook could not run at
+all. They could not catch it, and the reason is worth stating plainly: **every
+layer begins with `ast.parse` inside a `try`, and a cell that fails to parse is
+silently skipped rather than reported.** A malformed cell was invisible to the
+entire validator *by construction*. The more broken the cell, the less it was
+checked.
+
+Ten broken lines across four notebooks, including the cost estimate I had just
+added to NB5 for D-72.
+
+**Fix.** The build now parses every emitted code cell with
+`ast.parse(..., feature_version=(3, 10))` and refuses to generate on failure.
+Pinned to 3.10 because that is what the machine runs; syntax accepted by the
+build host and rejected by the target is the same defect with a longer feedback
+loop.
+
+The check found all seven failing cells on its first run, and the last two only
+after the first fixes moved the error line — which is itself the argument for
+having it in the build rather than running it by hand.

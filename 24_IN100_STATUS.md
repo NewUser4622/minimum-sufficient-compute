@@ -1,6 +1,24 @@
 # ImageNet-100 — LIVE STATUS
 
-**Updated:** 2026-08-13 · library build `src/msc_lib.py` · self-test 420/420
+**Updated:** 2026-08-13 · self-test 423/423 · all notebook cells parse as Python 3.10
+
+## PRE-REGISTERED GATES — measured
+
+| gate | value | threshold | verdict |
+|---|---|---|---|
+| ρ_seed ≥ 0.60 | resnet50 **0.822** · vit **0.649** | 0.60 | **PASS** |
+| shuffled control \|z\| < 5 | **2.30** | 5.0 | **PASS** |
+| Q4 partial ρ ≥ 0.30 | **0.282** | 0.30 | **MISS by 0.018** |
+
+Q4 ΔR² = **0.0411**, CI [0.0352, 0.0468] — excludes zero. MSC *does* add
+information beyond the 7-score difficulty battery; the partial Spearman just
+misses its threshold. This is the gate MSC-KD (NB5) sits downstream of, and it
+must be reported as a miss, not rounded up.
+
+**Q3 transfer, resnet50 ↔ vit_small_p16 (CNN–transformer):**
+ρ_raw 0.468 → **T = 0.640** [0.614, 0.664] after disattenuation.
+Shuffled control gives T = 0.037 — a 17× separation, so the alignment is real.
+Jaccard@top-10 = 0.259.
 
 This is the "where are we" file. One page, updated every session.
 
@@ -30,8 +48,8 @@ above it means anything.
 NB1 Setup     ██████████ done    data packed, 129,395 images, fingerprint 2b6269ef…
 NB2 Train     ██████████ done    4/4 runs, 100 epochs each
 NB3 Measure   ██████████ done    4/4 measured, per-sample tables written
-NB4 Analysis  ██████▒▒▒▒ Q1 + Q2 done · Q3/Q4 unblocked by D-71
-NB5 Method    ▒▒▒▒▒▒▒▒▒▒ blocked  needs NB4 (and trains 18 NEW runs)
+NB4 Analysis  ██████████ done    Q1 Q2 Q3 Q4 all written to analysis/
+NB5 Method    ░░░░░░░░░░ ready   gated on CONFIRM · trains 18 NEW runs
 ```
 
 ## FIRST RESULT — the question, answered for the pilot

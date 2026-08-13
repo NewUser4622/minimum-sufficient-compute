@@ -10268,6 +10268,66 @@ def save_analysis(data_dir, name: str, frame, hub: Optional[MSCHub] = None) -> P
     return p
 
 
+def load_analysis(data_dir, name: str, default=None):
+    """Read back what `save_analysis` wrote. Returns `default` if absent.
+
+    D-72. `save_analysis` had no counterpart -- the third writer in this
+    library with no reader (`atomic_write_yaml`/`read_yaml` was D-63). Analysis
+    outputs are the evidence for whether the next stage is worth running, and
+    nothing could consult them, so every gate in the plan was a thing a human
+    had to remember to eyeball.
+    """
+    p = Path(data_dir) / "analysis" / f"{name}.csv"
+    if not p.exists():
+        return default
+    try:
+        df = pd.read_csv(p)
+    except Exception:                                            # noqa: BLE001
+        return default
+    return default if df.empty else df
+
+
+def gate_report(data_dir) -> Dict[str, Any]:
+    """Q1-Q4 against their pre-registered gates, as data rather than eyeballs.
+
+    D-72. The gates are stated in `00_RESEARCH_PROTOCOL.md` and printed by NB4,
+    but nothing could *read* the answer -- so NB5, which costs 18 training
+    runs, had no way to ask whether its own premise had survived Q4.
+
+    Returns `{gate: {value, threshold, passed}}` plus `all_passed`. Missing
+    analyses are reported as `None`, never as a pass: a gate that has not been
+    evaluated is not a gate that was met.
+    """
+    out: Dict[str, Any] = {}
+
+    q1 = load_analysis(data_dir, "q1_seed_ceilings_all")
+    if q1 is not None and "rho_seed_tau0.1" in q1.columns:
+        worst = float(q1["rho_seed_tau0.1"].min())
+        out["rho_seed >= 0.60"] = {
+            "value": worst, "threshold": 0.60, "passed": worst >= 0.60,
+            "detail": "; ".join(f"{r['arch']}={r['rho_seed_tau0.1']:.3f}"
+                                for _, r in q1.iterrows())}
+
+    ctrl = load_analysis(data_dir, "q3_shuffled_control")
+    if ctrl is not None and "passed" in ctrl.columns:
+        ok = bool(ctrl["passed"].all())
+        out["shuffled control"] = {
+            "value": float(ctrl["z"].abs().max()), "threshold": 5.0,
+            "passed": ok, "detail": f"T_shuffled max "
+            f"{float(ctrl['T_shuffled'].abs().max()):.4f}"}
+
+    q4 = load_analysis(data_dir, "q4_irreducibility_all")
+    if q4 is not None and "partial_spearman" in q4.columns:
+        med = float(q4["partial_spearman"].median())
+        out["partial rho >= 0.30"] = {
+            "value": med, "threshold": 0.30, "passed": med >= 0.30,
+            "detail": f"median delta_R2 {float(q4['delta_r2'].median()):.4f}"}
+
+    out["all_passed"] = bool(out) and all(
+        v["passed"] for k, v in out.items() if isinstance(v, dict))
+    return out
+
+
 def save_figure(fig, data_dir, name: str, hub: Optional[MSCHub] = None) -> Path:
     p = ensure_dir(Path(data_dir) / "paper" / "figures") / f"{name}.png"
     fig.savefig(p, dpi=200, bbox_inches="tight")
