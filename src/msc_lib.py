@@ -9700,8 +9700,32 @@ def analyse_q4_irreducibility(data_dir, run_a: str, run_b: str, budgets_by_run,
 # announce what it skipped and nothing tests a notebook cell. Rule 8: test the
 # thing you wrote. So the selection logic lives here, where the self-checks can
 # reach it, and every one of these functions REPORTS what it excluded.
-def _run_index(session, phase: str = "p1") -> Dict[str, Dict[str, Any]]:
-    """Measured runs, keyed by run_id, with identity parsed from the id."""
+def resolve_analysis_phase(session, phase: Optional[str] = None) -> str:
+    """The phase an analysis should read. D-66.
+
+    Every `analyse_*_all` defaulted to the literal `"p1"`. NB4 called them
+    without an argument, so on a `p0` pilot each one indexed zero runs and
+    returned an EMPTY DataFrame -- no rows, and therefore no columns. The
+    failure surfaced two lines later as
+
+        KeyError: 'rho_seed_tau0.1'
+
+    which names a column, points at the notebook, and says nothing about the
+    phase. D-65 fixed this same default in the notebooks; it was also sitting
+    in the library, one layer down, where the notebook fix could not reach it.
+    """
+    if phase:
+        return phase
+    return detect_phase(session.work)
+
+
+def _run_index(session, phase: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Measured runs, keyed by run_id, with identity parsed from the id.
+
+    One choke point: all five `analyse_*_all` entry points come through here,
+    so the phase is resolved once rather than defaulted five times (D-66).
+    """
+    phase = resolve_analysis_phase(session, phase)
     out = {}
     for r in session.completed_runs(phase=phase):
         rid = r["run_id"]
@@ -9710,7 +9734,40 @@ def _run_index(session, phase: str = "p1") -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def analyse_q1_all(session, phase: str = "p1", axis: str = "depth",
+def _require_runs(session, runs: Dict[str, Any], phase: Optional[str],
+                  what: str) -> None:
+    """Refuse to analyse nothing. D-66.
+
+    An empty index produced an empty DataFrame, which has no columns, which
+    raised `KeyError: 'rho_seed_tau0.1'` in the notebook two lines later. That
+    error names a column and points at the display line -- it says nothing
+    about the phase, the runs, or the measurement stage, which is where all
+    three actual causes live.
+
+    Silence and a misleading error are the two failure modes this log is
+    mostly made of. This is the third place the same shape has appeared
+    (D-18 shortened a table, D-65 measured nothing), so it says which of the
+    three things is missing.
+    """
+    if runs:
+        return
+    ph = resolve_analysis_phase(session, phase)
+    seen = phases_present(session.work)
+    trained = [r["run_id"] for r in session.completed_runs(phase=ph)]
+    unmeasured = [r for r in trained if not session.measured(r)]
+    if not trained:
+        detail = (f"no COMPLETED runs in phase {ph!r}. On disk: {seen}. "
+                  f"Run NB2 first.")
+    elif unmeasured:
+        detail = (f"{len(trained)} trained run(s) in {ph!r} but "
+                  f"{len(unmeasured)} are NOT MEASURED: "
+                  f"{', '.join(unmeasured[:4])}. Run NB3 first.")
+    else:
+        detail = f"{len(trained)} run(s) present and measured, but none usable."
+    raise RuntimeError(f"{what}: nothing to analyse -- {detail}")
+
+
+def analyse_q1_all(session, phase: Optional[str] = None, axis: str = "depth",
                    taus=TAU_GRID) -> "Any":
     """Seed ceiling for every architecture with >= 2 measured seeds.
 
@@ -9721,6 +9778,7 @@ def analyse_q1_all(session, phase: str = "p1", axis: str = "depth",
     argued around in prose afterwards.
     """
     runs = _run_index(session, phase)
+    _require_runs(session, runs, phase, "Q1 seed ceilings")
     by_arch: Dict[str, List[str]] = {}
     for rid, m in runs.items():
         by_arch.setdefault(m["arch"], []).append(rid)
@@ -9773,9 +9831,10 @@ def analyse_q1_all(session, phase: str = "p1", axis: str = "depth",
     return pd.DataFrame(rows)
 
 
-def analyse_q2_all(session, phase: str = "p1", tau: float = 0.1) -> "Any":
+def analyse_q2_all(session, phase: Optional[str] = None, tau: float = 0.1) -> "Any":
     """Axis structure for one representative run per architecture."""
     runs = _run_index(session, phase)
+    _require_runs(session, runs, phase, "Q2 transfer")
     reps = representative_runs(runs)
     rows = []
     for arch, rid in sorted(reps.items()):
@@ -9813,7 +9872,7 @@ def _ceilings(session, q1=None, tau: float = 0.1) -> Dict[str, float]:
             if pd.notna(r.get(col))}
 
 
-def analyse_q3_all(session, phase: str = "p1", tau: float = 0.1,
+def analyse_q3_all(session, phase: Optional[str] = None, tau: float = 0.1,
                    n_boot: int = 1000) -> "Any":
     """Disattenuated transfer over EVERY architecture pair.
 
@@ -9822,6 +9881,7 @@ def analyse_q3_all(session, phase: str = "p1", tau: float = 0.1,
     `sorted()` guarantees it is not (D-18).
     """
     runs = _run_index(session, phase)
+    _require_runs(session, runs, phase, "Q3 axis structure")
     reps = representative_runs(runs, require=_ceilings(session, tau=tau))
     ceil = _ceilings(session, tau=tau)
     archs = sorted(a for a in reps if a in ceil)
@@ -9840,10 +9900,11 @@ def analyse_q3_all(session, phase: str = "p1", tau: float = 0.1,
     return df
 
 
-def analyse_q3_shuffled_control_all(session, phase: str = "p1",
+def analyse_q3_shuffled_control_all(session, phase: Optional[str] = None,
                                     tau: float = 0.1) -> "Any":
     """The alignment control, on EVERY pair -- not the first 25 of them."""
     runs = _run_index(session, phase)
+    _require_runs(session, runs, phase, "Q3 shuffled control")
     ceil = _ceilings(session, tau=tau)
     reps = representative_runs(runs, require=ceil)
     archs = sorted(a for a in reps if a in ceil)
@@ -9869,7 +9930,7 @@ def analyse_q3_shuffled_control_all(session, phase: str = "p1",
     return df
 
 
-def analyse_q4_all(session, phase: str = "p1", tau: float = 0.1,
+def analyse_q4_all(session, phase: Optional[str] = None, tau: float = 0.1,
                    split: str = "train_holdout", n_boot: int = 500) -> "Any":
     """Irreducibility over every pair, on the split that carries all seven
     battery scores.
@@ -9881,6 +9942,7 @@ def analyse_q4_all(session, phase: str = "p1", tau: float = 0.1,
     to be withdrawn (D-11).
     """
     runs = _run_index(session, phase)
+    _require_runs(session, runs, phase, "Q4 difficulty battery")
     reps = representative_runs(runs, require=_ceilings(session, tau=tau))
     archs = sorted(reps)
     budgets = {reps[a]: session.budgets(a) for a in archs}
@@ -11086,6 +11148,33 @@ class Session:
                 f"  Every fix since {_mine} is absent from this object.\n"
                 f"  Restart the kernel and run all cells (D-62).")
 
+        # D-67. The oracle measures; it must be PLANNED as measurement.
+        #
+        # `plan_work` filters out runs already "done" BEFORE `fn` is called,
+        # and "done" means whatever `stage`/`done_fn` say. NB3 called
+        #     run_all(cfgs, fn=sess.oracle, title='measurement')
+        # with the default stage='train'. All four runs were trained, so all
+        # four were filtered as complete: "MY REMAINING WORK: 0". The notebook
+        # printed success and measured nothing, and NB4 then failed on an empty
+        # table two notebooks later.
+        #
+        # This is D-31 exactly -- a completion predicate that answers a
+        # different question from the work being requested -- and the
+        # `msckd_valid` docstring three screens up describes it. Documenting a
+        # trap is not the same as removing it, so this raises.
+        if fn is not None and getattr(fn, "__func__", None) is Session.oracle:
+            if stage != "measure":
+                raise ValueError(
+                    "run_all(fn=sess.oracle) with stage=%r would ask 'is it "
+                    "TRAINED?' to decide whether to MEASURE it, so every "
+                    "trained run is skipped and nothing happens.\n"
+                    "  Use: sess.run_all(cfgs, fn=sess.oracle, "
+                    "done_fn=sess.measured, stage='measure')" % stage)
+            if done_fn is None:
+                done_fn = self.measured
+                log("done_fn defaulted to sess.measured for stage='measure'",
+                    "PLAN")
+
         by_id = {c["run_id"]: c for c in cfgs}
         plan = self.plan(list(by_id), steal_stale=steal_stale, title=title,
                          done_fn=done_fn, stage=stage)
@@ -11922,6 +12011,28 @@ def _selftest() -> bool:
     _ok60, _why60 = hash_compatible(_c60, _stored_v1)
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
+
+    # -- D-67: measuring must be PLANNED as measuring -------------------------
+    _s67 = Session.__new__(Session)
+    _orc = Session.oracle.__get__(_s67)
+    _c67 = False
+    try:
+        Session.run_all(_s67, [{"run_id": "x"}], fn=_orc)          # stage='train'
+    except ValueError as _e:
+        _c67 = "would ask 'is it TRAINED?'" in str(_e)
+    except Exception:
+        pass
+    check("D-67: run_all(fn=sess.oracle) without stage='measure' is refused",
+          _c67, "otherwise it skips every trained run and reports success")
+
+    _f67 = False
+    try:
+        Session.run_all(_s67, [{"run_id": "x"}], fn=_orc, stage="measure")
+    except ValueError as _e:
+        _f67 = "would ask" in str(_e)
+    except Exception:
+        pass
+    check("D-67 canary: the correct call is NOT refused", not _f67)
 
     # -- D-64: the artifact spec must agree with the code that writes ---------
     #

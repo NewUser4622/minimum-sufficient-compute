@@ -346,6 +346,8 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | A fix is verified and regenerated, but the notebook reproduces the OLD error exactly | the kernel is running a previous import; an object built from it (e.g. `sess`) keeps the old functions | D-62 — cell 1 now asserts the build stamp and `run_all` refuses a stale Session. If either fires: Kernel -> Restart, then Run All. |
 | `verify_run_artifacts` says a finished run is missing `metrics/final.csv` | that file is written by the MEASURE stage, not train | D-64 — expected until NB3 runs. It is in `RUN_ARTIFACTS_MEASURED` now. |
 | NB3 prints `0 trained run(s), 0 still to measure` and does nothing | the notebook was pinned to a phase NB2 never wrote | D-65 — `PHASE` is detected now. Check the `phase:` line it prints on start. |
+| NB3 prints a plan then `MY REMAINING WORK: 0` and measures nothing | `run_all(fn=sess.oracle)` planned with the default `stage='train'`, so trained runs count as done | D-67 — needs `done_fn=sess.measured, stage='measure'`. `run_all` now raises instead. |
+| NB4 `KeyError: 'rho_seed_tau0.1'` (or any analysis column) | the analysis frame is EMPTY -- no rows means no columns; usually NB3 has not measured | D-66 — analysis phase is resolved now and `_require_runs` says which stage is missing. |
 
 ### Reading the self-test after any change
 

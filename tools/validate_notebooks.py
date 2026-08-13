@@ -542,6 +542,43 @@ def _callback_arity_problems(tree: ast.AST):
 NUMERIC_SPEC = re.compile(r"[.,]?\d*[.]\d+[eEfgG%]|[dfeEgG%]$|^\d*\.\d+f$")
 
 
+# Methods whose string arguments name COLUMNS, not data.
+COLUMN_ARG_METHODS = {"sort_values": 0, "groupby": 0, "set_index": 0,
+                      "drop_duplicates": 0, "dropna": None, "pivot": None}
+
+
+def _column_arg_names(tree: ast.AST):
+    """Column names passed to `sort_values`/`groupby`/`set_index`.
+
+    D-66. `_defined_and_read` only inspects SUBSCRIPTS, so
+
+        q1.sort_values('rho_seed_tau0.1')
+
+    sailed past every layer and died at runtime with
+    `KeyError: 'rho_seed_tau0.1'`. Rule 3 says column names are data and must
+    be validated at build time; the first implementation validated only the
+    places columns are *read by subscript*, which is not the same set.
+
+    Returned for reporting alongside the subscript names, under the same
+    "read, not in schema, never assigned here" test -- so a locally computed
+    column still cannot trip it.
+    """
+    out = []
+    for nd in ast.walk(tree):
+        if not (isinstance(nd, ast.Call) and isinstance(nd.func, ast.Attribute)):
+            continue
+        if nd.func.attr not in COLUMN_ARG_METHODS:
+            continue
+        args = list(nd.args) + [k.value for k in nd.keywords
+                                if k.arg in ("by", "subset", "columns")]
+        for a_ in args:
+            items = a_.elts if isinstance(a_, (ast.List, ast.Tuple)) else [a_]
+            for it in items:
+                if isinstance(it, ast.Constant) and isinstance(it.value, str):
+                    out.append((it.value, getattr(nd, "lineno", 0)))
+    return out
+
+
 def _none_format_problems(tree: ast.AST):
     """An f-string numeric format applied to a value that may be None.
 
@@ -583,6 +620,39 @@ def _none_format_problems(tree: ast.AST):
             bad.append((f"numeric format {spec!r} applied to a {risky} value, "
                         f"which is None for paused/failed/skipped runs -- use "
                         f"M.fmt_metric(...) (D-61)",
+                        getattr(nd, "lineno", 0)))
+    return bad
+
+
+def _stage_problems(tree: ast.AST):
+    """`run_all(fn=sess.oracle)` that is not planned as measurement.
+
+    D-67. `plan_work` filters runs already "done" BEFORE `fn` runs, and "done"
+    is whatever `stage`/`done_fn` mean. Asking "is it trained?" to decide
+    whether to MEASURE skips every trained run, so the notebook reports success
+    and produces nothing -- and the failure lands two notebooks later, on an
+    empty table.
+    """
+    bad = []
+    for nd in ast.walk(tree):
+        if not (isinstance(nd, ast.Call) and isinstance(nd.func, ast.Attribute)
+                and nd.func.attr == "run_all"):
+            continue
+        kw = {k.arg: k.value for k in nd.keywords}
+        fn = kw.get("fn") or (nd.args[1] if len(nd.args) > 1 else None)
+        is_oracle = (isinstance(fn, ast.Attribute) and fn.attr == "oracle")
+        if not is_oracle:
+            continue
+        stage = kw.get("stage")
+        ok_stage = (isinstance(stage, ast.Constant) and stage.value == "measure")
+        if not ok_stage:
+            bad.append(("run_all(fn=sess.oracle) without stage='measure': "
+                        "plan_work will ask 'is it trained?' and skip every "
+                        "run, reporting success having measured nothing (D-67)",
+                        getattr(nd, "lineno", 0)))
+        elif "done_fn" not in kw:
+            bad.append(("run_all(..., stage='measure') without "
+                        "done_fn=sess.measured (D-67)",
                         getattr(nd, "lineno", 0)))
     return bad
 
@@ -726,6 +796,41 @@ def self_test() -> bool:
                   f"notebooks and does not exist")
             ok = False
 
+    # -- the stage check must be able to fail (D-67) ------------------------
+    if not _stage_problems(ast.parse(
+            "sess.run_all(cfgs, fn=sess.oracle, title='measurement')")):
+        print("  [SELFTEST FAIL] the stage check does not catch the exact "
+              "D-67 line")
+        ok = False
+    if _stage_problems(ast.parse(
+            "sess.run_all(cfgs, fn=sess.oracle, done_fn=sess.measured, "
+            "stage='measure')")):
+        print("  [SELFTEST FAIL] the stage check rejects the CORRECT call")
+        ok = False
+    if _stage_problems(ast.parse("sess.run_all(cfgs, title='training')")):
+        print("  [SELFTEST FAIL] the stage check fires on a training call")
+        ok = False
+
+    # -- the column-argument check must be able to fail (D-66) --------------
+    _found = [n for n, _ in _column_arg_names(
+        ast.parse("q1.sort_values('rho_seed_tau0.1', ascending=False)"))]
+    if "rho_seed_tau0.1" not in _found:
+        print("  [SELFTEST FAIL] the column-argument check does not see the "
+              "exact D-66 line, q1.sort_values('rho_seed_tau0.1')")
+        ok = False
+    for src_, want in (("df.groupby('arch')", "arch"),
+                       ("df.sort_values(['a','b'])", "a"),
+                       ("df.set_index('run_id')", "run_id")):
+        if want not in [n for n, _ in _column_arg_names(ast.parse(src_))]:
+            print(f"  [SELFTEST FAIL] column-argument check missed {want!r} "
+                  f"in {src_}")
+            ok = False
+    # ascending=False is a keyword, not a column -- must not be collected
+    if "ascending" in [n for n, _ in _column_arg_names(
+            ast.parse("q1.sort_values('arch', ascending=False)"))]:
+        print("  [SELFTEST FAIL] column-argument check collected a keyword name")
+        ok = False
+
     # -- the None-format check must be able to fail (D-61) ------------------
     if not _none_format_problems(ast.parse(
             "f\"{r.get('best_accuracy', float('nan')):.2f}\"")):
@@ -847,6 +952,10 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
 
         for ci, tree in trees:
             _, reads = _defined_and_read(tree)
+            # D-66: sort_values/groupby arguments name columns too, and were
+            # not being looked at. Same "read, not in schema, never assigned
+            # here" test, so a locally computed column still cannot trip it.
+            reads = list(reads) + _column_arg_names(tree)
             for name, ln in reads:
                 if (not _looks_like_a_column(name) or _known(name)
                         or name in defined):
@@ -867,6 +976,9 @@ def validate(nb_dir: Path, strict_paths: bool = False) -> int:
                 problems.append(
                     f"{nb.name} cell {ci} line {ln}: {kind}.{attr} does not "
                     f"exist" + (f" -- did you mean {near}?" if near else ""))
+
+            for msg, ln in _stage_problems(tree):
+                problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")
 
             for msg, ln in _none_format_problems(tree):
                 problems.append(f"{nb.name} cell {ci} line {ln}: {msg}")

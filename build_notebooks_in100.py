@@ -902,7 +902,11 @@ if not todo and trained:
         code("""
 cfgs = [sess.config(M.parse_run_id(r)['arch'], seed=M.parse_run_id(r)['seed'])
         for r in todo]
-results = sess.run_all(cfgs, fn=sess.oracle, title='measurement')
+# done_fn/stage are NOT optional here. Without them plan_work asks
+# "is it trained?" to decide whether to measure, skips every run, and
+# reports success having done nothing (D-67).
+results = sess.run_all(cfgs, fn=sess.oracle, title='measurement',
+                       done_fn=sess.measured, stage='measure')
 
 for r in results:
     print(f"  {r.get('status','?'):9s} {r['run_id']}")
@@ -1015,7 +1019,7 @@ only at one τ, it is not a conclusion.** The pre-registered operating point is
 τ = 0.1 and the pre-registered gate is ρ_seed ≥ 0.60.
 """),
         code("""
-q1 = M.analyse_q1_all(sess)
+q1 = M.analyse_q1_all(sess, phase=PHASE)
 M.save_analysis(sess.data_dir, 'q1_seed_ceilings_all', q1)
 display(q1.sort_values('rho_seed_tau0.1', ascending=False))
 """),
@@ -1081,7 +1085,7 @@ PC1 ≥ 0.60. On CIFAR **0 of 15** architectures reached it and the highest
 anywhere was 0.532 — not a marginal miss.
 """),
         code("""
-q2 = M.analyse_q2_all(sess)
+q2 = M.analyse_q2_all(sess, phase=PHASE)
 M.save_analysis(sess.data_dir, 'q2_axis_structure_all', q2)
 display(q2.sort_values('pc1', ascending=False))
 print(f"reaching PC1 >= 0.60: {int((q2['pc1'] >= 0.60).sum())} of {len(q2)}")
@@ -1104,7 +1108,7 @@ pairs carrying the headline), and two-sided against a one-sided failure mode. It
 halted the analysis on a perfectly healthy pair.
 """),
         code("""
-ctrl = M.analyse_q3_shuffled_control_all(sess)
+ctrl = M.analyse_q3_shuffled_control_all(sess, phase=PHASE)
 M.save_analysis(sess.data_dir, 'q3_shuffled_control', ctrl)
 bad = ctrl[~ctrl['passed']]
 print(f"{len(ctrl) - len(bad)}/{len(ctrl)} shuffled controls pass  "
@@ -1114,7 +1118,7 @@ if len(bad):
     print('*** Tables may be misaligned. This is a BUG, not a finding.')
 """),
         code("""
-q3 = M.analyse_q3_all(sess)
+q3 = M.analyse_q3_all(sess, phase=PHASE)
 M.save_analysis(sess.data_dir, 'q3_transfer_matrix', q3)
 print(q3.groupby('pair_type')['T'].agg(['count', 'mean', 'std', 'min', 'max']))
 """),
@@ -1131,7 +1135,7 @@ which flatters MSC. On CIFAR that overstated irreducibility by **2.5×** and the
 number had to be withdrawn.
 """),
         code("""
-q4 = M.analyse_q4_all(sess, split='train_holdout')
+q4 = M.analyse_q4_all(sess, phase=PHASE, split='train_holdout')
 M.save_analysis(sess.data_dir, 'q4_irreducibility_all', q4)
 print(f"median delta-R2 {q4['delta_r2'].median():.4f}   "
       f"clearing 0.05: {int((q4['delta_r2'] >= 0.05).sum())}/{len(q4)}")

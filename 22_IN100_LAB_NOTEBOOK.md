@@ -2071,3 +2071,76 @@ Verified against the real results root: `prefer='p1'` resolves to `p0`, with
 
 **Contamination.** None — NB3 had not been run yet. Had it been, it would have
 appeared to succeed.
+
+---
+
+## D-66 / D-67 — NB3 reported success and measured nothing; NB4 died on the empty table
+
+**Symptom.** `KeyError: 'rho_seed_tau0.1'` in NB4, on
+`q1.sort_values('rho_seed_tau0.1')`.
+
+The column name is **correct** — `analyse_q1_all` builds exactly that key. The
+frame was **empty**: no rows, therefore no columns. And it was empty because
+NB3, which the user reported as having "run successfully", had produced nothing
+at all. Every oracle artifact was missing on all four runs:
+`test.parquet`, `train_holdout.parquet`, `exit_heads.pt`, `final.csv`,
+`confusion_matrix.csv`, `per_class.csv`, `exit_metrics.csv`.
+
+**D-67 — the cause.** NB3 called
+
+```python
+sess.run_all(cfgs, fn=sess.oracle, title='measurement')
+```
+
+`plan_work` filters out runs that are already "done" **before** `fn` is ever
+called, and "done" means whatever `stage` and `done_fn` say. The default is
+`stage='train'`. All four runs *were* trained, so all four were filtered as
+complete, `MY REMAINING WORK: 0`, and the notebook exited successfully.
+
+The CIFAR generator has had this right all along:
+
+```python
+sess.run_all(ready, fn=sess.oracle, title='...',
+             done_fn=sess.measured, stage='measure')
+```
+
+**This is D-31, verbatim.** D-31 was a validity check placed downstream of the
+predicate that decides whether to do the work, so it could never fire. Its
+lesson is written in the `msckd_valid` docstring **three screens above the line
+I wrote**: *"A compatibility test has to live in the predicate that decides
+whether to do the work, not in the code that does it."* I read that docstring
+while fixing D-54 and still shipped this. Documenting a trap is not removing
+it.
+
+**D-66 — why the error pointed somewhere else.** Every `analyse_*_all` defaulted
+to `phase="p1"` internally. NB4 called them with no phase argument, so even
+with the notebook-level phase detection from D-65, the *library* still indexed
+`p1` and found nothing. D-65 fixed this default in the notebooks; the same
+default was sitting one layer down where a notebook fix could not reach it.
+
+So two independent causes produced one misleading error, and it named neither:
+a column, in a display line, three notebooks from the phase and two from the
+measurement.
+
+**Fixes.**
+
+1. `run_all` **raises** if `fn` is `sess.oracle` and `stage != 'measure'`,
+   naming the correct call. It also defaults `done_fn` to `sess.measured` when
+   the stage is measurement. Silence is not an option this path gets any more.
+2. `resolve_analysis_phase` — the five `analyse_*_all` entry points take
+   `phase=None` and resolve through `_run_index`, the single choke point they
+   all pass through.
+3. `_require_runs` refuses to analyse an empty index and says **which** of the
+   three causes it is: no completed runs, runs present but unmeasured (naming
+   them), or present but unusable. An empty DataFrame no longer travels two
+   lines to become a `KeyError` about a column.
+4. Build-time: `_stage_problems` rejects any `run_all(fn=sess.oracle)` without
+   `stage='measure'` and `done_fn`; `_column_arg_names` extends the column
+   check to `sort_values`/`groupby`/`set_index` arguments, which
+   `_defined_and_read` never looked at because it only walked subscripts.
+   Both ship with self-tests asserting they catch the exact failing line and
+   accept the correct one.
+
+**Contamination.** No data lost — nothing had been computed. `analysis/
+q1_seed_ceilings_all.csv` on disk is an empty artifact written from the empty
+frame before the KeyError, and is overwritten on the next run.
