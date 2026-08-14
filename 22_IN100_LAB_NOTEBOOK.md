@@ -2706,3 +2706,44 @@ more care.
 **Contamination.** None. The abort happened during target construction, before
 any optimiser step. The 18 `p3-*` directories still hold only `config.yaml` and
 `config_hash.txt`.
+
+---
+
+## D-78 — `shufflenetv2_in` contains "shuff"
+
+Found while inspecting a live NB5 run. The arms were being split by substring:
+
+```python
+real = [r for r in results if 'shuff' not in r['run_id']]
+```
+
+The architecture is named **`shufflenetv2_in`**. Every run_id for it contains
+`shuff`, so both arms classified as the control and the real arm was
+undercounted by a third.
+
+```
+shufflenetv2_in  mscKDshuffromresnet50   'shuff' in run_id=True   truth=True
+shufflenetv2_in  mscKDfromresnet50       'shuff' in run_id=True   truth=False  <-- WRONG
+resnet18         mscKDfromresnet50       'shuff' in run_id=False  truth=False
+```
+
+Rule 2 names this exactly: *a literal that is right for 13 of 15 architectures
+is the worst kind.* Two of the three MSC-KD students classify correctly by
+accident, and the third is indistinguishable from them at a glance.
+
+**The training was never wrong.** Both training call sites test
+`cfg['method']`, where `mscKDfromresnet50` genuinely lacks the substring. Only
+the *reporting* was wrong — which is its own hazard, and arguably a worse one:
+the numbers on disk are correct while the label attached to them is not, so the
+error survives inspection of the data.
+
+**Fix.** `is_control_arm(run_id_or_cfg)` decides on `method`, accepts either a
+run_id or a config, and **raises** on anything it cannot parse rather than
+falling back to a guess. Both sites use it. The self-test asserts all five arms
+classify correctly *and* — the canary that matters — that the naive substring
+test really is wrong on `shufflenetv2_in`, without which the test would prove
+nothing.
+
+**Contamination.** None to the runs. `analyse_msckd`'s `arm` column already
+tested `method` and was correct. The only wrong output was NB5's printed
+`N/M REAL-method students trained` line, which is regenerated on the next run.

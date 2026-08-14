@@ -5422,6 +5422,39 @@ def make_run_id(phase: str, arch: str, dataset: str, method: str, seed: int) -> 
     return f"{safe(phase)}-{safe(arch)}-{safe(dataset)}-{safe(method)}-s{int(seed)}"
 
 
+def is_control_arm(run_id_or_cfg) -> bool:
+    """Is this the SHUFFLED-target control? Decided on `method`, never on the id.
+
+    **D-78.** NB5 split the arms with
+
+        real = [r for r in results if 'shuff' not in r['run_id']]
+
+    and the architecture `shufflenetv2_in` contains the substring `shuff`. So
+    every shufflenetv2 run classified as control, including the real one, and
+    the printed summary undercounted the real arm by a third.
+
+    The method field is unambiguous — `mscKDshuffromresnet50` versus
+    `mscKDfromresnet50` — and `parse_run_id` already extracts it. A substring
+    test over a whole run_id searches the architecture name too, and rule 2
+    names this exact hazard: a literal that is right for most values is the
+    worst kind, because the ones it is wrong for look identical.
+
+    The training path was never affected — it tested `cfg['method']` and so was
+    correct. Only the reporting was wrong, which is its own hazard: the numbers
+    were right and the label on them was not.
+    """
+    if isinstance(run_id_or_cfg, dict):
+        method = str(run_id_or_cfg.get("method", ""))
+    else:
+        try:
+            method = str(parse_run_id(str(run_id_or_cfg))["method"])
+        except Exception:                                        # noqa: BLE001
+            raise ValueError(
+                f"cannot determine the arm of {run_id_or_cfg!r}: no parseable "
+                f"method. Refusing to guess from a substring (D-78).")
+    return method.startswith("mscKDshuf")
+
+
 def parse_run_id(run_id: str) -> Dict[str, Any]:
     """Recover a run's identity from its id, which is authoritative by design.
 
@@ -10180,7 +10213,8 @@ def compare_routing_methods(session, run_ids: Sequence[str],
         m = parse_run_id(rid)
         rows.append({
             "run_id": rid, "student": m["arch"], "seed": m["seed"],
-            "arm": "scrambled" if "shuff" in str(m["method"]) else "real",
+            # method, not run_id -- `shufflenetv2_in` contains "shuff" (D-78)
+            "arm": "scrambled" if is_control_arm(m) else "real",
             **{k: s.get(k) for k in
                ("best_accuracy", "b1_static", "b2_confidence", "b10_msckd",
                 "b11_oracle", "avg_flops_ratio", "gamma", "ltt_epsilon")},
@@ -12348,6 +12382,32 @@ def _selftest() -> bool:
     _ok60, _why60 = hash_compatible(_c60, _stored_v1)
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
+
+    # -- D-78: the arm is decided by `method`, never by a run_id substring ----
+    _arms = [
+        ("p3-shufflenetv2_in-imagenet100-mscKDshuffromresnet50-s1", True),
+        ("p3-shufflenetv2_in-imagenet100-mscKDfromresnet50-s1",     False),
+        ("p3-resnet18-imagenet100-mscKDshuffromresnet50-s2",        True),
+        ("p3-resnet18-imagenet100-mscKDfromresnet50-s2",            False),
+        ("p3-deit_small-imagenet100-mscKDfromresnet50-s3",          False),
+    ]
+    _bad78 = [r for r, want in _arms if is_control_arm(r) != want]
+    check("D-78: every arm is classified correctly, shufflenetv2 included",
+          not _bad78, "OK" if not _bad78 else "WRONG: " + "; ".join(_bad78))
+
+    # The canary: the naive substring test must actually be wrong here, or the
+    # check above proves nothing.
+    _naive_wrong = [r for r, want in _arms if ("shuff" in r) != want]
+    check("D-78 canary: the substring test IS wrong on shufflenetv2",
+          bool(_naive_wrong),
+          f"{len(_naive_wrong)} misclassified: "
+          + "; ".join(x.split('-')[1] + '/' + x.split('-')[3] for x in _naive_wrong))
+
+    check("D-78: a cfg dict works as well as a run_id",
+          is_control_arm({"method": "mscKDshuffromresnet50"}) is True
+          and is_control_arm({"method": "mscKDfromresnet50"}) is False)
+    check("D-78: an unparseable id raises rather than guessing",
+          _raises(lambda: is_control_arm("not-a-run-id"), ValueError))
 
     # -- D-77: a dense array indexed BY sample_idx must span the index space --
     #

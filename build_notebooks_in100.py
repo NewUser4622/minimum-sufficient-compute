@@ -1535,7 +1535,7 @@ def _train_student(cfg):
     return M.train_msc_kd(cfg, sess.hub, sess.registry, teacher_run,
                           TEACHER, work_root=sess.work,
                           data_root_out=sess.data_dir,
-                          shuffle_targets='shuff' in cfg['method'])
+                          shuffle_targets=M.is_control_arm(cfg))
 
 if not CONFIRM:
     results = []
@@ -1543,7 +1543,10 @@ if not CONFIRM:
 else:
     results = sess.run_all(cfgs, fn=_train_student, done_fn=sess.msckd_valid,
                            title='MSC-KD students')
-real = [r for r in results if 'shuff' not in r.get('run_id', '')]
+# M.is_control_arm, NOT a substring of the run_id: the architecture
+# `shufflenetv2_in` contains "shuff", so `'shuff' in run_id` classified every
+# shufflenetv2 run as the control -- including the real one (D-78).
+real = [r for r in results if not M.is_control_arm(r.get('run_id', ''))]
 print(f"\\n{len([r for r in real if r.get('status') != 'skipped'])}/"
       f"{len(real)} REAL-method students trained -- the comparison needs all of them")
 """),

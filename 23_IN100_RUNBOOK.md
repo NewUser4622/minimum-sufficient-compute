@@ -357,6 +357,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | NB5 still says STALE after you ran `conv_sweep` | the sweep result was written and never read | D-74 — `measured_img_s()` now prefers `benchmark/convsweep_<arch>_*.json`. |
 | `expected input[N, 256, 256, 3] to have 3 channels, but got 256` in a sweep | a measurement loader was rebuilt from `.dataset`, dropping GPUBatchLoader (permute/cast/normalise/crop) | D-76 — build measurement views with `M.eval_view_of(loader, cfg)`. The first batch of every sweep is now checked. |
 | Kernel dies with `IndexKernel.cu:93 ... index out of bounds` / `ExitCode: 3221226505`, no traceback | a dense array indexed by the GLOBAL `sample_idx` but sized for the split; on CUDA this aborts the process | D-77 — arrays indexed by `sample_idx` are sized by `index_space`. Host-side bounds check added. |
+| MSC-KD real-arm counts look a third short, or shufflenetv2 appears twice as 'shuffled' | the arch name `shufflenetv2_in` contains "shuff", so a run_id substring test misclassifies both its arms | D-78 — use `M.is_control_arm(run_id_or_cfg)`, which decides on `method`. |
 
 ### Reading the self-test after any change
 
