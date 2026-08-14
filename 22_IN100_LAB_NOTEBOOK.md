@@ -2747,3 +2747,12 @@ nothing.
 **Contamination.** None to the runs. `analyse_msckd`'s `arm` column already
 tested `method` and was correct. The only wrong output was NB5's printed
 `N/M REAL-method students trained` line, which is regenerated on the next run.
+
+**The guard's first version did not guard.** It wrapped `parse_run_id` in a
+`try/except` and raised in the handler — but `parse_run_id` does not raise on a
+malformed id, it returns `method: None`. So `str(None).startswith(...)` gave
+`False`, and a function whose docstring says it *refuses to guess* quietly
+guessed "real". Relying on an exception that never comes is exactly how that
+happens. The `None` is now checked directly, and the self-test that caught it
+was the one asserting a bad id raises — which failed on first run, as it
+should have.

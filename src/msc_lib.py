@@ -5444,15 +5444,18 @@ def is_control_arm(run_id_or_cfg) -> bool:
     were right and the label on them was not.
     """
     if isinstance(run_id_or_cfg, dict):
-        method = str(run_id_or_cfg.get("method", ""))
+        method = run_id_or_cfg.get("method")
     else:
-        try:
-            method = str(parse_run_id(str(run_id_or_cfg))["method"])
-        except Exception:                                        # noqa: BLE001
-            raise ValueError(
-                f"cannot determine the arm of {run_id_or_cfg!r}: no parseable "
-                f"method. Refusing to guess from a substring (D-78).")
-    return method.startswith("mscKDshuf")
+        # parse_run_id does NOT raise on a malformed id -- it returns
+        # `method: None`. Relying on an exception that never comes is how a
+        # "refuses to guess" guard silently guesses anyway, so the None is
+        # checked directly.
+        method = parse_run_id(str(run_id_or_cfg)).get("method")
+    if not method:
+        raise ValueError(
+            f"cannot determine the arm of {run_id_or_cfg!r}: no method in the "
+            f"run_id. Refusing to fall back to a substring test (D-78).")
+    return str(method).startswith("mscKDshuf")
 
 
 def parse_run_id(run_id: str) -> Dict[str, Any]:
@@ -12406,8 +12409,6 @@ def _selftest() -> bool:
     check("D-78: a cfg dict works as well as a run_id",
           is_control_arm({"method": "mscKDshuffromresnet50"}) is True
           and is_control_arm({"method": "mscKDfromresnet50"}) is False)
-    check("D-78: an unparseable id raises rather than guessing",
-          _raises(lambda: is_control_arm("not-a-run-id"), ValueError))
 
     # -- D-77: a dense array indexed BY sample_idx must span the index space --
     #
@@ -12858,6 +12859,12 @@ def _selftest() -> bool:
         except Exception:                                       # noqa: BLE001
             return False
         return False
+
+    # D-78, placed here because `_raises` is defined above this point and not
+    # above the rest of the D-78 block. Inserting a check before the helper it
+    # uses is the same ordering mistake D-69 made with `_src_of_module`.
+    check("D-78: an unparseable id raises rather than guessing",
+          _raises(lambda: is_control_arm("not-a-run-id"), ValueError))
 
     print("utils")
     tmp = Path(SCRATCH_ROOT) / "msc_selftest"
