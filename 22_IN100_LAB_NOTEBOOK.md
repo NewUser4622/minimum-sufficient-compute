@@ -2876,3 +2876,77 @@ pack — declined at 17 GiB free, falling back to memmap. It now passes
 with `results == []`, because `CONFIRM` was False on that pass so nothing
 trained. It verified an empty list because it was handed one. All 18 runs,
 their 100-epoch histories and their checkpoints (4.4 GiB) are intact.
+
+---
+
+## D-80 — the gap ratio divided by noise, and NB5's tables read the wrong list
+
+The backfill succeeded: all 18 students now carry B1/B2/B10/B11. Then it
+printed `closed=26.0`, `closed=-47.9`, `closed=83.6`.
+
+**Cause.** `fraction_of_B2_to_B11_gap_closed = (B10 - B2) / (B11 - B2)`, guarded
+by `abs(gap_total) > 1e-9`. That is a formality, not a guard. Measured across
+all 18 runs:
+
+```
+B11 - B2  =  +0.00007   (sd 0.00036)   <- the denominator
+B10 - B2  =  -0.00880   (sd 0.00683)   <- the numerator
+```
+
+Dividing a real difference by a denominator four orders of magnitude smaller
+than itself gives 26, -48, 84. The ratio is **undefined**, not large.
+
+A ratio is only meaningful when its denominator exceeds the noise on the
+quantities it is built from. At n = 10,000 the binomial 2 SE on an accuracy
+difference is **0.0141**; the measured gap is 0.00007. It now reports `NaN`
+plus `gap_verdict` naming the reason, and records `B2_to_B11_gap` and
+`B2_to_B11_gap_noise_2se` so the reader sees the size of both.
+
+**D-80b.** `compare_routing_methods` and `confirm_on_disk` were called with
+`[r['run_id'] for r in results]`. On a re-run where everything is already
+trained, `run_all` returns `[]`, so both got an empty list — the comparison
+table printed `Empty DataFrame` and the verifier printed
+`0 run(s) on local disk` beside 4.4 GiB of runs. That is D-65's silent-no-op
+shape a third time. Both now read every completed run in the phase.
+
+---
+
+## Q5 RESULT — MSC-KD does not beat confidence routing, and the oracle says why
+
+Not a defect. This is the finding, and it is worth stating precisely because
+the control that makes it interpretable is the one thing that nearly did not
+get computed.
+
+At a matched operating point of **ρ = 0.806** (a real 19% compute reduction,
+not a degenerate ρ≈1), across 18 students:
+
+| router | mean accuracy vs B2 | in how many of 18 runs |
+|---|---|---|
+| **B1** full compute, no routing | ≈ B2 | — |
+| **B2** confidence thresholding | baseline | — |
+| **B11** oracle: the student's own true post-hoc MSC | **+0.00007** (sd 0.00036) | headroom in 0 |
+| **B10** MSC-KD | **−0.00880** (sd 0.00683) | worse in **18 / 18** |
+
+Three things follow, and the third is the one that matters:
+
+1. **Confidence thresholding already reaches full-compute accuracy at 80%
+   compute.** B1 ≈ B2 everywhere.
+2. **MSC-KD is consistently below it** — about 0.9 accuracy points, in every
+   single run, both arms.
+3. **The oracle ceiling offers no headroom either.** B11 — routing by the
+   student's *own true* post-hoc MSC, the best any MSC-based router could
+   possibly do — matches B2 to within 0.00007.
+
+Point 3 is the result. Without B11 this reads as *"our distillation failed"*.
+With B11 it reads as **"MSC-based routing has nothing to offer over confidence
+at this operating point, and the failure is in the premise rather than in the
+student"**. That is a much stronger, much more useful negative, and it is
+exactly the claim the B11 baseline exists to license. The method section can be
+written honestly around it.
+
+It also sits consistently with Q4, which missed its gate at partial ρ = 0.282:
+MSC carries *some* information beyond a difficulty battery (ΔR² = 0.041, CI
+excludes zero), but not enough to route better than confidence does.
+
+**None of this touches Q1–Q3.** The seed-reliability result, the multi-axis
+result and the disattenuated transfer result stand exactly as they were.

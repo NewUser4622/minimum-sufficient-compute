@@ -1595,12 +1595,17 @@ distribution-free guarantee holds at **ε = 0.01** — CIFAR had only 5,000 and 
 to settle for ε = 0.03 and say so in its limitations.
 """),
         code("""
-cmp_ = M.compare_routing_methods(sess, run_ids=[r['run_id'] for r in results])
+# D-80b. NOT `results`. On a re-run where everything is already trained,
+# `run_all` returns [] and this table came back empty -- the same silent
+# no-op shape as D-65. The comparison is over every completed run in the
+# phase, whether this session trained it or not.
+_all_ids = [r['run_id'] for r in sess.completed_runs(phase=PHASE)]
+cmp_ = M.compare_routing_methods(sess, run_ids=_all_ids)
 M.save_analysis(sess.data_dir, 'q5_method_comparison', cmp_)
 display(cmp_)
 """),
         code("""
-status = sess.confirm_on_disk([r['run_id'] for r in results])
+status = sess.confirm_on_disk(_all_ids)
 print()
 print('Then NB4 for the final tables, and check that the SCRAMBLED arm is')
 print('clearly worse than the real one. If it is not, L_MSC is a regulariser')

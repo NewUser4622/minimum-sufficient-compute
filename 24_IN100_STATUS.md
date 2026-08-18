@@ -33,7 +33,7 @@ Jaccard@top-10 = 0.259.
 | **Q2 multi-axis** | **PROVEN** | PC1 explains 0.547 / 0.522 — MSC is not one axis in disguise |
 | **Q3 transfer** | **PROVEN** | T = **0.640** [0.614, 0.664]; shuffled control T = 0.037, a 17× separation |
 | **Q4 irreducibility** | **PARTIAL** | ΔR² = 0.0411, CI [0.0352, 0.0468] excludes zero — but partial ρ **0.282 < 0.30 gate** |
-| **Q5 MSC-KD** | **COMPUTABLE, ~15 min** | 18 students trained; routing baselines need the backfill cell |
+| **Q5 MSC-KD** | **COMPLETE — NEGATIVE** | at ρ=0.806: B10 is **−0.0088** vs B2 in **18/18** runs; B11 oracle offers **+0.00007** headroom |
 
 **The paper's thesis is Q1–Q3, and it is already provable.** The headline —
 *ViT's low seed-reliability survives at ImageNet scale, and the CNN/ViT gap
@@ -52,8 +52,12 @@ training.
 2. **Q4 missed its gate** by 0.018. Report it as a miss.
 3. **2 architectures, not 8.** The `p1` atlas has not been run. No CNN-vs-ViT
    claim can rest on one of each.
-4. **MSC-KD accuracy is null**: +0.0020 mean over 9 pairs, t = +1.02. The
-   routing comparison may still separate; accuracy does not.
+4. **MSC-KD is a negative result, and a clean one.** Accuracy real-vs-control
+   +0.0020 (t = +1.02, null). At matched FLOPs (ρ = 0.806) MSC-KD is 0.0088
+   *below* confidence routing in 18/18 runs — and the **B11 oracle ceiling is
+   only +0.00007 above confidence**, so routing by the student's own true MSC
+   would not help either. The limitation is the premise, not the distillation.
+   That is publishable as a negative, and it is why the B11 baseline exists.
 
 ### Whose fault, concretely
 
@@ -97,8 +101,8 @@ NB1 Setup     ██████████ done    data packed, 129,395 images
 NB2 Train     ██████████ done    4/4 runs, 100 epochs each
 NB3 Measure   ██████████ done    4/4 measured, per-sample tables written
 NB4 Analysis  ██████████ done    Q1 Q2 Q3 Q4 all written to analysis/
-NB5 Method    ████████░░ 18/18 TRAINED · routing baselines pending backfill
-                                 accuracy real-vs-control: +0.0020, t=+1.02 (null)
+NB5 Method    ██████████ done    18/18 trained · routing baselines computed
+                                 NEGATIVE result, and the B11 oracle explains it
 ```
 
 ## FIRST RESULT — the question, answered for the pilot
