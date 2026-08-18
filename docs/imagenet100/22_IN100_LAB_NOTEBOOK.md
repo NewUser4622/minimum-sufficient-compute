@@ -3059,3 +3059,48 @@ column, and flagging it punished exactly the accessor rule 4 asks for.
 `LAYOUT_KEYS` is accepted, with a canary asserting an invented column name is
 still rejected — widening a checker without proving it can still fail is how a
 checker quietly stops checking.
+
+---
+
+## D-82 — NB6 shipped without the two cells every notebook opens with
+
+```
+Cell In[2], line 3
+----> 3 ROOT = Path(MSC_ROOT)
+NameError: name 'MSC_ROOT' is not defined
+```
+
+`nb1` through `nb5` all begin with `code(bootstrap())` and
+`code(paths_cell(...))` — the cells that unpack the library, bind `M`, resolve
+storage and set `MSC_ROOT`. I wrote `nb6` starting from its own markdown and
+never added them, so `M` and `MSC_ROOT` did not exist and the notebook failed
+on its first real line.
+
+**Every validation layer passed it.** Column names, repo paths, library names,
+call arity, result keys, stage predicates, and — since D-73 — that every cell
+parses as Python 3.10. Seven layers. None of them asked the most basic question
+you can ask about a notebook: **does each cell only use names that something
+earlier defines?**
+
+`check_names.py` already answered exactly that question for `.py` files, and
+had done since D-77. Extending it to notebooks was about thirty lines. I built
+the tool, wired it to the library and the generator, and did not point it at
+the artifacts the generator produces.
+
+**Fix.** `check_names.py` now takes `.ipynb` files, walks cells in order with
+bindings accumulating — which is what a kernel does on Run All — and reports
+any load with no earlier binding. The build runs it over every emitted notebook
+and refuses on failure.
+
+Verified against the real artifacts: pointed at the broken NB6 from the previous
+commit it reports `MSC_ROOT` and `M` at the exact cells and lines; pointed at
+the fixed one it is silent. A checker that cannot demonstrate both is not
+evidence of anything.
+
+**The pattern this makes eight of.** D-55 (dry run vs trainer), D-63 (test used
+a clean config the runtime never has), D-71 (fixture keyed by run id, callers
+key by arch), D-76/D-77/D-79c (torch paths shipped unexecuted), D-79 (reader
+with no writer), and now a checker never aimed at the thing it exists to check.
+Every one is the same shape: **the verification and the artifact were not the
+same object.** Writing the check is the easy half; pointing it at what actually
+ships is the half I keep missing.

@@ -142,12 +142,73 @@ def check(path: Path) -> int:
     return len(seen)
 
 
+def check_notebook(path: Path) -> int:
+    """Names a notebook cell LOADS that no earlier cell BINDS.
+
+    D-82. `NB6_Publish` was generated without `bootstrap()` and `paths_cell()`,
+    the two cells every other notebook opens with. So `M` and `MSC_ROOT` were
+    never defined and the notebook failed on its first real cell with
+
+        NameError: name 'MSC_ROOT' is not defined
+
+    Six validation layers passed it. They check column names, repo paths,
+    library names, call arity, result keys, stage predicates, and -- since
+    D-73 -- that every cell parses. None asked the most basic question about a
+    notebook: **does each cell only use names something earlier defined?**
+
+    Cells are walked in order and bindings accumulate, which is what a kernel
+    does on Run All. A name is reported only if no earlier cell binds it, this
+    cell does not bind it, and it is not a builtin -- so a genuinely
+    out-of-order notebook is caught and a correct one is silent.
+    """
+    import json
+    nb = json.loads(path.read_text(encoding="utf-8"))
+    bound = set(dir(builtins)) | MODULE_DUNDERS | {"get_ipython", "display", "In", "Out"}
+    problems = []
+    for ci, cell in enumerate(nb.get("cells", [])):
+        if cell.get("cell_type") != "code":
+            continue
+        src = "".join(cell.get("source", []))
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue                      # the D-73 gate reports these
+        loads, binds = [], set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name):
+                (binds.add(n.id) if isinstance(n.ctx, ast.Store)
+                 else loads.append((n.id, n.lineno)))
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                binds.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for al in n.names:
+                    binds.add((al.asname or al.name).split(".")[0])
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                binds.add(n.name)
+            elif isinstance(n, ast.arg):
+                binds.add(n.arg)
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                binds.update(n.names)
+        for name, line in loads:
+            if name not in bound and name not in binds:
+                problems.append((ci, name, line))
+        bound |= binds
+    seen = set()
+    for ci, name, line in problems:
+        if (ci, name) in seen:
+            continue
+        seen.add((ci, name))
+        print(f"  [FAIL] {path.name} cell {ci} line {line}: name '{name}' is "
+              f"used but no earlier cell defines it")
+    return len(seen)
+
+
 def main() -> int:
     files = [Path(a) for a in sys.argv[1:]] or [
         Path(__file__).resolve().parent.parent / "src" / "msc_lib.py"]
     bad = 0
     for f in files:
-        bad += check(f)
+        bad += check_notebook(f) if f.suffix == ".ipynb" else check(f)
     if bad:
         print(f"\n  {bad} undefined name(s). These are NameErrors waiting for "
               f"the branch to be taken.")

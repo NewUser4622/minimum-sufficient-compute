@@ -1662,6 +1662,8 @@ HF allows roughly 120 commits/hour/user. This uploads in **batched commits**
 (one commit per run, not per file) and reports the count before it starts, so a
 push of 22 runs costs ~22 commits rather than ~400.
 """),
+        code(bootstrap()),
+        code(paths_cell(phase="p3", detect=False)),
         code("""
 REPO_ID   = 'Shanmuk4622/msc-imagenet100'
 REPO_TYPE = 'dataset'
@@ -1956,6 +1958,20 @@ def main() -> int:
     print(_cn.stdout.rstrip() or _cn.stderr.rstrip())
     if _cn.returncode != 0:
         print("  Generation refused -- fix the names above.")
+        return 1
+
+    # D-82. Parsing is not enough: NB6 shipped without bootstrap()/paths_cell(),
+    # so every cell parsed and the notebook died on `MSC_ROOT` at the first
+    # real line. Cells are walked in order with bindings accumulating -- what a
+    # kernel does on Run All.
+    print("\n  checking every notebook for names no earlier cell defines")
+    _nn = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "check_names.py")]
+        + [str(f) for f in sorted(OUT.glob("NB*.ipynb"))],
+        capture_output=True, text=True)
+    print(_nn.stdout.rstrip() or _nn.stderr.rstrip())
+    if _nn.returncode != 0:
+        print("  Generation refused -- a cell uses a name nothing defines.")
         return 1
 
     print("\n  parsing every emitted code cell as Python 3.10")

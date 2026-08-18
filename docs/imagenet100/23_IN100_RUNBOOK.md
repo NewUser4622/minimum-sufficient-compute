@@ -362,6 +362,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | MSC-KD runs report `still missing ['config_hash.txt']` | `train_msc_kd` wrote config.yaml but not config_hash.txt | D-79b — fixed; existing runs are cosmetically incomplete only, and the file is rewritten on backfill. |
 | Backfill fails with `AttributeError: 'list' object has no attribute 'float'` | the student was passed to `sweep_all_axes`, which expects a logits list; `MSCStudent` returns a 3-tuple | D-79c — B11 now derives from the evaluator's own forward pass. |
 | `[VERIFY] 0 run(s) on local disk` after a run | `confirm_on_disk(results)` was handed an empty list (nothing trained this pass) | Not data loss. Check `ls C:\\msc_results\\runs` — the runs are there. |
+| `NameError: name 'MSC_ROOT' is not defined` (or `M`) in a notebook | the notebook was generated without `bootstrap()` / `paths_cell()` | D-82 — the build now checks every notebook for names no earlier cell defines. Rebuild. |
 
 ### Reading the self-test after any change
 
