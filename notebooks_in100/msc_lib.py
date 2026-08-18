@@ -5422,6 +5422,42 @@ def make_run_id(phase: str, arch: str, dataset: str, method: str, seed: int) -> 
     return f"{safe(phase)}-{safe(arch)}-{safe(dataset)}-{safe(method)}-s{int(seed)}"
 
 
+def is_control_arm(run_id_or_cfg) -> bool:
+    """Is this the SHUFFLED-target control? Decided on `method`, never on the id.
+
+    **D-78.** NB5 split the arms with
+
+        real = [r for r in results if 'shuff' not in r['run_id']]
+
+    and the architecture `shufflenetv2_in` contains the substring `shuff`. So
+    every shufflenetv2 run classified as control, including the real one, and
+    the printed summary undercounted the real arm by a third.
+
+    The method field is unambiguous — `mscKDshuffromresnet50` versus
+    `mscKDfromresnet50` — and `parse_run_id` already extracts it. A substring
+    test over a whole run_id searches the architecture name too, and rule 2
+    names this exact hazard: a literal that is right for most values is the
+    worst kind, because the ones it is wrong for look identical.
+
+    The training path was never affected — it tested `cfg['method']` and so was
+    correct. Only the reporting was wrong, which is its own hazard: the numbers
+    were right and the label on them was not.
+    """
+    if isinstance(run_id_or_cfg, dict):
+        method = run_id_or_cfg.get("method")
+    else:
+        # parse_run_id does NOT raise on a malformed id -- it returns
+        # `method: None`. Relying on an exception that never comes is how a
+        # "refuses to guess" guard silently guesses anyway, so the None is
+        # checked directly.
+        method = parse_run_id(str(run_id_or_cfg)).get("method")
+    if not method:
+        raise ValueError(
+            f"cannot determine the arm of {run_id_or_cfg!r}: no method in the "
+            f"run_id. Refusing to fall back to a substring test (D-78).")
+    return str(method).startswith("mscKDshuf")
+
+
 def parse_run_id(run_id: str) -> Dict[str, Any]:
     """Recover a run's identity from its id, which is authoritative by design.
 
@@ -10180,7 +10216,8 @@ def compare_routing_methods(session, run_ids: Sequence[str],
         m = parse_run_id(rid)
         rows.append({
             "run_id": rid, "student": m["arch"], "seed": m["seed"],
-            "arm": "scrambled" if "shuff" in str(m["method"]) else "real",
+            # method, not run_id -- `shufflenetv2_in` contains "shuff" (D-78)
+            "arm": "scrambled" if is_control_arm(m) else "real",
             **{k: s.get(k) for k in
                ("best_accuracy", "b1_static", "b2_confidence", "b10_msckd",
                 "b11_oracle", "avg_flops_ratio", "gamma", "ltt_epsilon")},
@@ -10960,7 +10997,24 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                "total_time_sec": cum_time, "total_energy_j": cum_energy,
                "config_hash": cfg["config_hash"], "sample_order_hash": order_hash,
                "status": "completed", "completed_utc": now_iso()}
+    # D-79b. `train_backbone` writes both; this wrote only config.yaml, so all
+    # 18 MSC-KD runs verified as incomplete on a REQUIRED artifact.
+    atomic_write_text(run_dir / "config_hash.txt", cfg["config_hash"])
     atomic_write_json(run_dir / "summary.json", summary)
+
+    # D-79. The routing baselines ARE the method section. Computed here, from
+    # the student that was just trained, so the number exists the moment the
+    # run finishes instead of being discovered missing after 79 GPU-hours.
+    try:
+        _rt = evaluate_msckd_routing(_SelfSession(work, cfg, hub), run_id,
+                                     tau=tau, write=False)
+        summary.update({k: v for k, v in _rt.items() if v is not None})
+        atomic_write_json(run_dir / "summary.json", summary)
+    except Exception as _e:                                      # noqa: BLE001
+        log(f"routing evaluation failed: {type(_e).__name__}: {_e} -- the run "
+            f"is fine, but b2/b10/b11 are missing. Backfill with "
+            f"M.evaluate_msckd_routing(sess, run_id).", "WARN")
+
     registry.finish(run_id, **{k: summary[k] for k in
                                ("arch", "teacher", "method", "seed", "best_accuracy")})
     sync.push_all(heavy=True)
@@ -11054,6 +11108,110 @@ def evaluate_routing_methods(student, val_loader, device, rho: Sequence[float],
             out["matched_flops_comparison"]["fraction_of_B2_to_B11_gap_closed"] = (
                 float((a10 - a2) / gap_total) if abs(gap_total) > 1e-9 else float("nan"))
     return out
+
+
+class _SelfSession:
+    """The two attributes `evaluate_msckd_routing` needs, without a Session.
+
+    `train_msc_kd` has `work` and a config already; constructing a full
+    Session inside it would re-resolve storage and re-open the ledger.
+    """
+
+    def __init__(self, work, cfg, hub=None):
+        self.work = Path(work)
+        self.data_dir = self.work
+        self.dataset = str(cfg.get("dataset_name", "imagenet100"))
+        self.hub = hub
+        self._cfg = cfg
+
+    def budgets(self, arch: str, num_classes: Optional[int] = None):
+        return load_or_build_budgets(arch, self.work, self.dataset,
+                                     num_classes, hub=self.hub)
+
+
+def evaluate_msckd_routing(session, run_id: str, tau: float = 0.1,
+                           amp: bool = True, write: bool = True) -> Dict[str, Any]:
+    """Compute B1/B2/B10/B11 for a TRAINED student and merge them into its summary.
+
+    **D-79.** `evaluate_routing_methods` is documented as "the paper's central
+    figure" and was called from exactly one place: `msckd_dry_run`. The real
+    `train_msc_kd` never called it and its summary dict never carried the keys.
+    So 18 students trained for ~79 GPU-hours, correctly, and the number the
+    method section exists to report was never computed.
+
+    `compare_routing_methods` reads `b2_confidence`, `b10_msckd`, `b11_oracle`
+    and friends out of `summary.json`. Nothing wrote them, so NB5's comparison
+    table came back all `None` -- a reader with no writer, the mirror of the
+    writers-with-no-reader in D-63, D-72 and D-74. Four instances now, in both
+    directions.
+
+    This is recoverable without retraining: everything B1/B2/B10/B11 need comes
+    from ONE forward pass of the saved student over the val set, and the B11
+    ceiling -- the student's own post-hoc MSC -- is computed from that same
+    pass's exit predictions rather than a separate sweep.
+    """
+    L = run_layout(session.work, run_id)
+    cfg = read_yaml(L["base"] / "config.yaml")
+    if not cfg:
+        raise FileNotFoundError(f"no config.yaml for {run_id}")
+    ck = L["checkpoints"] / "ckpt_best.pt"
+    if not ck.exists():
+        raise FileNotFoundError(f"no ckpt_best.pt for {run_id} at {ck}")
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    arch = cfg["arch"]
+    budgets = session.budgets(arch)
+    rho = list(budgets["axes"]["depth"]["rho"])
+    full_flops = float(budgets.get("full_flops") or budgets["axes"]["depth"]["flops"][-1])
+
+    bb = build_model(arch, int(cfg["num_classes"]))
+    student = place_model(MSCStudent(bb, int(cfg["num_classes"]), len(rho)),
+                          device, cfg, tag=f"{arch} student (post-hoc)")
+    blob = torch.load(ck, map_location=device, weights_only=False)
+    student.load_state_dict(blob.get("model", blob), strict=True)
+    student.eval()
+
+    _, val_loader, _, _, _ = build_loaders(cfg)
+
+    # The student's own post-hoc MSC, from its own exits, for the B11 ceiling.
+    core = _import_msc_core()
+    sweep = sweep_all_axes(cfg, student, val_loader, device, show_progress=False,
+                           axes=("depth",)) if _sweep_takes_axes() else \
+        sweep_all_axes(cfg, student, val_loader, device, show_progress=False)
+    r = core.compute_msc(sweep["depth"]["preds"], sweep["depth"]["top1p"],
+                         sweep["depth"]["top2p"], rho, tau=tau, axis="depth")
+    order = np.argsort(np.asarray(sweep["sample_idx"]))
+    oracle_msc = np.asarray(r.msc, float)[order]
+
+    ev = evaluate_routing_methods(student, val_loader, device, rho, full_flops,
+                                  oracle_msc=oracle_msc, amp=amp)
+
+    mfc = ev.get("matched_flops_comparison", {}) or {}
+    flat = {
+        "b1_static": ev.get("B1_static_full", {}).get("accuracy"),
+        "b2_confidence": mfc.get("B2_accuracy"),
+        "b10_msckd": mfc.get("B10_accuracy"),
+        "b11_oracle": (ev.get("B11_oracle") or {}).get("accuracy"),
+        "avg_flops_ratio": mfc.get("target_avg_rho"),
+        "frac_b2_b11_gap_closed": mfc.get("fraction_of_B2_to_B11_gap_closed"),
+        "routing_K": ev.get("K"), "routing_n": ev.get("n"),
+    }
+    if write:
+        sp = L["base"] / "summary.json"
+        summary = read_json(sp, {}) or {}
+        summary.update({k: v for k, v in flat.items() if v is not None})
+        atomic_write_json(sp, summary)
+        log(f"{run_id}: B2={flat['b2_confidence']} B10={flat['b10_msckd']} "
+            f"B11={flat['b11_oracle']} "
+            f"closed={flat['frac_b2_b11_gap_closed']}", "ROUTE")
+    return flat
+
+
+def _sweep_takes_axes() -> bool:
+    try:
+        return "axes" in _inspect_signature(sweep_all_axes).parameters
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 # =============================================================================
@@ -12349,6 +12507,77 @@ def _selftest() -> bool:
     check("D-60: a checkpoint hashed before channels_last was excluded resumes",
           _ok60, _why60)
 
+    # -- D-79: every column a reader expects must have a writer ---------------
+    #
+    # `compare_routing_methods` reads b1_static/b2_confidence/b10_msckd/
+    # b11_oracle/avg_flops_ratio out of summary.json. Nothing wrote them, so
+    # NB5's table came back all None after 18 runs and ~79 GPU-hours. A reader
+    # with no writer -- the mirror of D-63/D-72/D-74, which were writers with
+    # no readers. Four now, in both directions.
+    #
+    # The declared columns and the code that produces them are two spellings of
+    # one truth (D-16), so this compares them instead of trusting either.
+    _msckd_src = _src_of_module()
+    _decl = set(RESULT_KEYS.get("compare_routing_methods", ()))
+    _from_summary = {"b1_static", "b2_confidence", "b10_msckd", "b11_oracle",
+                     "avg_flops_ratio", "frac_b2_b11_gap_closed"}
+    _missing_writer = sorted(
+        k for k in (_decl & _from_summary)
+        if f'"{k}"' not in _msckd_src.split("def evaluate_msckd_routing")[-1][:4000]
+        and f'"{k}"' not in _msckd_src)
+    check("D-79: every routing column read from summary.json has a writer",
+          not _missing_writer,
+          "OK" if not _missing_writer else "NO WRITER: " + ", ".join(_missing_writer))
+
+    # AST, not string-splitting. The first version split on "def train_msc_kd"
+    # -- a string that appears in THIS CHECK -- so `[-1]` returned the
+    # self-test's own source and both assertions failed on correct code. A
+    # checker that reads source has to be told where the source ends.
+    def _fn_source(name: str) -> str:
+        import ast as _a
+        try:
+            t = _a.parse(_msckd_src)
+        except Exception:                                        # noqa: BLE001
+            return ""
+        for n in _a.walk(t):
+            if isinstance(n, (_a.FunctionDef, _a.AsyncFunctionDef)) and n.name == name:
+                return _a.get_source_segment(_msckd_src, n) or ""
+        return ""
+
+    _kd_src = _fn_source("train_msc_kd")
+    check("D-79 canary: the function source was actually located",
+          len(_kd_src) > 2000, f"{len(_kd_src)} chars")
+    check("D-79: train_msc_kd calls the routing evaluator",
+          "evaluate_msckd_routing(" in _kd_src,
+          "it was defined and only ever called from msckd_dry_run")
+    check("D-79b: train_msc_kd writes config_hash.txt",
+          "config_hash.txt" in _kd_src,
+          "all 18 MSC-KD runs verified incomplete without it")
+
+    # -- D-78: the arm is decided by `method`, never by a run_id substring ----
+    _arms = [
+        ("p3-shufflenetv2_in-imagenet100-mscKDshuffromresnet50-s1", True),
+        ("p3-shufflenetv2_in-imagenet100-mscKDfromresnet50-s1",     False),
+        ("p3-resnet18-imagenet100-mscKDshuffromresnet50-s2",        True),
+        ("p3-resnet18-imagenet100-mscKDfromresnet50-s2",            False),
+        ("p3-deit_small-imagenet100-mscKDfromresnet50-s3",          False),
+    ]
+    _bad78 = [r for r, want in _arms if is_control_arm(r) != want]
+    check("D-78: every arm is classified correctly, shufflenetv2 included",
+          not _bad78, "OK" if not _bad78 else "WRONG: " + "; ".join(_bad78))
+
+    # The canary: the naive substring test must actually be wrong here, or the
+    # check above proves nothing.
+    _naive_wrong = [r for r, want in _arms if ("shuff" in r) != want]
+    check("D-78 canary: the substring test IS wrong on shufflenetv2",
+          bool(_naive_wrong),
+          f"{len(_naive_wrong)} misclassified: "
+          + "; ".join(x.split('-')[1] + '/' + x.split('-')[3] for x in _naive_wrong))
+
+    check("D-78: a cfg dict works as well as a run_id",
+          is_control_arm({"method": "mscKDshuffromresnet50"}) is True
+          and is_control_arm({"method": "mscKDfromresnet50"}) is False)
+
     # -- D-77: a dense array indexed BY sample_idx must span the index space --
     #
     # Reproduces the shape that killed the kernel: ImageNet-100 has 129,395
@@ -12798,6 +13027,12 @@ def _selftest() -> bool:
         except Exception:                                       # noqa: BLE001
             return False
         return False
+
+    # D-78, placed here because `_raises` is defined above this point and not
+    # above the rest of the D-78 block. Inserting a check before the helper it
+    # uses is the same ordering mistake D-69 made with `_src_of_module`.
+    check("D-78: an unparseable id raises rather than guessing",
+          _raises(lambda: is_control_arm("not-a-run-id"), ValueError))
 
     print("utils")
     tmp = Path(SCRATCH_ROOT) / "msc_selftest"
@@ -14717,4 +14952,4 @@ if __name__ == "__main__":
         sys.exit(0 if _selftest() else 1)
     print(f"msc_lib v{__version__} -- run with --selftest for the offline checks")
 
-__MSC_BUILD__ = "0d97d743040f"
+__MSC_BUILD__ = "ca6c1c9e4552"

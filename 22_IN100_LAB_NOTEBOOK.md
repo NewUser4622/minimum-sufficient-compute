@@ -2814,3 +2814,65 @@ the AST with `ast.get_source_segment`, plus a canary asserting the segment was
 actually found (23,167 chars) rather than silently empty — because an empty
 string makes `"x" in src` False and every such check fail closed, which looks
 identical to a real defect.
+
+---
+
+## D-79c — the backfill contradicted its own docstring, and I could not run it
+
+The D-79 backfill failed on all 18 runs:
+
+```
+AttributeError: 'list' object has no attribute 'float'
+```
+
+`evaluate_msckd_routing` called `sweep_all_axes(cfg, student, ...)`.
+`sweep_all_axes` calls `multi_exit(x)` and expects a **list of exit logits**.
+`MSCStudent.forward` returns **`(logits, suff, feats)`**. The tuple was
+iterated, `l` became the logits *list*, and `l.float()` failed.
+
+**The docstring I wrote one hour earlier said:**
+
+> the B11 ceiling — the student's own post-hoc MSC — is computed from that
+> same pass's exit predictions rather than a separate sweep
+
+The code did a separate sweep. I wrote the correct design in prose and the
+wrong one in Python, in the same function, in the same edit. That is rule 7 —
+an invariant in a comment is not a mechanism — turned on its author.
+
+**Fix.** `evaluate_routing_methods` gains `oracle_from_self=True` and derives
+the B11 ceiling from the `L` tensor it already has:
+
+```python
+_srt = np.sort(probs, axis=2)
+oracle_msc = compute_msc(L.argmax(2), _srt[:, :, -1], _srt[:, :, -2],
+                         rho, tau=tau, axis="depth").msc
+```
+
+One pass, no second model interface, no adapter. `sweep_all_axes` is no longer
+involved and `_sweep_takes_axes` is deleted.
+
+**Verified, against the real `msc_core.compute_msc`** — not asserted this time.
+The sandbox has no torch, so I stubbed `scipy`/`sklearn` with an import hook,
+built a synthetic `L` of the evaluator's exact shape `(500, 5, 100)`, and ran
+the new lines verbatim: `oracle_msc` comes back `(500,)`, every value is a
+valid ρ level, `top1p >= top2p` everywhere, and B11 route indices land in
+`0..K-1`.
+
+**The structural cause, stated plainly.** My environment has numpy but not
+torch. Every torch-dependent line I have written in this project has been
+shipped unexecuted, and the defects that reached the user — D-70, D-76, D-77,
+D-79c — are all in that category, while the numpy-side logic has held up. The
+answer is not more care; it is to keep pushing the decidable part of each fix
+into pure functions I can actually run (`_model_input_problems`,
+`_module_names`, and now this), and to say clearly which half of a change is
+verified and which is not.
+
+**Also fixed:** the backfill called `build_loaders(cfg)`, which builds the
+train loader too and therefore tried to resident-cache the whole 23.7 GiB
+pack — declined at 17 GiB free, falling back to memmap. It now passes
+`ram_cache=False`; only the 10,000-image val set is needed.
+
+**Not a defect:** `[VERIFY] 0 run(s) on local disk` was `confirm_on_disk(results)`
+with `results == []`, because `CONFIRM` was False on that pass so nothing
+trained. It verified an empty list because it was handed one. All 18 runs,
+their 100-epoch histories and their checkpoints (4.4 GiB) are intact.

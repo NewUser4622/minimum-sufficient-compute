@@ -11026,7 +11026,8 @@ def train_msc_kd(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
 @_no_grad()
 def evaluate_routing_methods(student, val_loader, device, rho: Sequence[float],
                              full_flops: float, oracle_msc: Optional[np.ndarray] = None,
-                             amp: bool = True) -> Dict[str, Any]:
+                             amp: bool = True, oracle_from_self: bool = False,
+                             tau: float = 0.1) -> Dict[str, Any]:
     """B1 / B2 / B10 / B11 on one pass, at matched average FLOPs.
 
     B2 vs B10 vs B11 is the paper's central figure: B2 is where the field
@@ -11079,6 +11080,24 @@ def evaluate_routing_methods(student, val_loader, device, rho: Sequence[float],
         "B2_confidence": sweep_operating_points(top1p, correct_at, rho, full_flops),
         "B10_msc_kd": sweep_operating_points(S, correct_at, rho, full_flops),
     }
+    if oracle_msc is None and oracle_from_self:
+        # D-79c. The B11 ceiling is the student's own post-hoc MSC, and every
+        # input to it -- per-exit decision, top-1 and top-2 probability -- is
+        # already in `L` from the pass above. The first version of the backfill
+        # instead called `sweep_all_axes(cfg, student, ...)`, which expects a
+        # model returning a LIST of exit logits; `MSCStudent.forward` returns
+        # `(logits, suff, feats)`, so the tuple was iterated and every run died
+        # on `AttributeError: 'list' object has no attribute 'float'`.
+        #
+        # The docstring for that function already said "computed from that same
+        # pass's exit predictions rather than a separate sweep". The code did
+        # the opposite. Deriving it here removes the second pass and the
+        # interface mismatch together.
+        _srt = np.sort(probs, axis=2)
+        oracle_msc = _import_msc_core().compute_msc(
+            L.argmax(2), _srt[:, :, -1], _srt[:, :, -2],
+            list(rho), tau=tau, axis="depth").msc
+
     if oracle_msc is not None:
         # B11 ceiling: route by the student's own true post-hoc MSC.
         r = np.asarray(rho, float)
@@ -11135,20 +11154,13 @@ def evaluate_msckd_routing(session, run_id: str, tau: float = 0.1,
 
     **D-79.** `evaluate_routing_methods` is documented as "the paper's central
     figure" and was called from exactly one place: `msckd_dry_run`. The real
-    `train_msc_kd` never called it and its summary dict never carried the keys.
-    So 18 students trained for ~79 GPU-hours, correctly, and the number the
+    `train_msc_kd` never called it and its summary dict never carried the keys,
+    so 18 students trained for ~79 GPU-hours, correctly, and the number the
     method section exists to report was never computed.
 
-    `compare_routing_methods` reads `b2_confidence`, `b10_msckd`, `b11_oracle`
-    and friends out of `summary.json`. Nothing wrote them, so NB5's comparison
-    table came back all `None` -- a reader with no writer, the mirror of the
-    writers-with-no-reader in D-63, D-72 and D-74. Four instances now, in both
-    directions.
-
-    This is recoverable without retraining: everything B1/B2/B10/B11 need comes
-    from ONE forward pass of the saved student over the val set, and the B11
-    ceiling -- the student's own post-hoc MSC -- is computed from that same
-    pass's exit predictions rather than a separate sweep.
+    Recoverable without retraining: everything B1/B2/B10/B11 need -- including
+    the B11 ceiling -- comes from ONE forward pass of the saved student over
+    the val set.
     """
     L = run_layout(session.work, run_id)
     cfg = read_yaml(L["base"] / "config.yaml")
@@ -11162,7 +11174,8 @@ def evaluate_msckd_routing(session, run_id: str, tau: float = 0.1,
     arch = cfg["arch"]
     budgets = session.budgets(arch)
     rho = list(budgets["axes"]["depth"]["rho"])
-    full_flops = float(budgets.get("full_flops") or budgets["axes"]["depth"]["flops"][-1])
+    full_flops = float(budgets.get("full_flops")
+                       or budgets["axes"]["depth"]["flops"][-1])
 
     bb = build_model(arch, int(cfg["num_classes"]))
     student = place_model(MSCStudent(bb, int(cfg["num_classes"]), len(rho)),
@@ -11171,20 +11184,13 @@ def evaluate_msckd_routing(session, run_id: str, tau: float = 0.1,
     student.load_state_dict(blob.get("model", blob), strict=True)
     student.eval()
 
-    _, val_loader, _, _, _ = build_loaders(cfg)
-
-    # The student's own post-hoc MSC, from its own exits, for the B11 ceiling.
-    core = _import_msc_core()
-    sweep = sweep_all_axes(cfg, student, val_loader, device, show_progress=False,
-                           axes=("depth",)) if _sweep_takes_axes() else \
-        sweep_all_axes(cfg, student, val_loader, device, show_progress=False)
-    r = core.compute_msc(sweep["depth"]["preds"], sweep["depth"]["top1p"],
-                         sweep["depth"]["top2p"], rho, tau=tau, axis="depth")
-    order = np.argsort(np.asarray(sweep["sample_idx"]))
-    oracle_msc = np.asarray(r.msc, float)[order]
+    # Only the val loader is needed. `build_loaders` also builds train, which
+    # tries to resident-cache the whole 23.7 GiB pack -- unnecessary here and
+    # the reason the first backfill attempt fell back to memmap.
+    _, val_loader, _, _, _ = build_loaders(dict(cfg, ram_cache=False))
 
     ev = evaluate_routing_methods(student, val_loader, device, rho, full_flops,
-                                  oracle_msc=oracle_msc, amp=amp)
+                                  oracle_from_self=True, tau=tau, amp=amp)
 
     mfc = ev.get("matched_flops_comparison", {}) or {}
     flat = {
@@ -11201,17 +11207,13 @@ def evaluate_msckd_routing(session, run_id: str, tau: float = 0.1,
         summary = read_json(sp, {}) or {}
         summary.update({k: v for k, v in flat.items() if v is not None})
         atomic_write_json(sp, summary)
+        atomic_write_text(L["base"] / "config_hash.txt",
+                          str(cfg.get("config_hash", "")))
         log(f"{run_id}: B2={flat['b2_confidence']} B10={flat['b10_msckd']} "
             f"B11={flat['b11_oracle']} "
             f"closed={flat['frac_b2_b11_gap_closed']}", "ROUTE")
     return flat
 
-
-def _sweep_takes_axes() -> bool:
-    try:
-        return "axes" in _inspect_signature(sweep_all_axes).parameters
-    except Exception:                                            # noqa: BLE001
-        return False
 
 
 # =============================================================================

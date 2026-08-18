@@ -360,6 +360,8 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | MSC-KD real-arm counts look a third short, or shufflenetv2 appears twice as 'shuffled' | the arch name `shufflenetv2_in` contains "shuff", so a run_id substring test misclassifies both its arms | D-78 — use `M.is_control_arm(run_id_or_cfg)`, which decides on `method`. |
 | NB5's comparison table is all `None` / `NaN` in the b1/b2/b10/b11 columns | the routing baselines were never evaluated -- `evaluate_routing_methods` was only ever called from the dry run | D-79 — run NB5's backfill cell, or `M.evaluate_msckd_routing(sess, run_id)`. No retraining needed. |
 | MSC-KD runs report `still missing ['config_hash.txt']` | `train_msc_kd` wrote config.yaml but not config_hash.txt | D-79b — fixed; existing runs are cosmetically incomplete only, and the file is rewritten on backfill. |
+| Backfill fails with `AttributeError: 'list' object has no attribute 'float'` | the student was passed to `sweep_all_axes`, which expects a logits list; `MSCStudent` returns a 3-tuple | D-79c — B11 now derives from the evaluator's own forward pass. |
+| `[VERIFY] 0 run(s) on local disk` after a run | `confirm_on_disk(results)` was handed an empty list (nothing trained this pass) | Not data loss. Check `ls C:\\msc_results\\runs` — the runs are there. |
 
 ### Reading the self-test after any change
 
