@@ -4,7 +4,7 @@ Protocol §5.4 requires the exact subset to be documented, because **no canonica
 ImageNet-100 split exists**. This is that documentation. Everything here is
 verified against the files, not against memory.
 
-Produced and checked by [`tools/pack_imagenet100.py`](tools/pack_imagenet100.py).
+Produced and checked by [`tools/pack_imagenet100.py`](../../tools/pack_imagenet100.py).
 
 ---
 

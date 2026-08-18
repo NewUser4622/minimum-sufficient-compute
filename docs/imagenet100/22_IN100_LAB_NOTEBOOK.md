@@ -3,7 +3,7 @@
 **Running record of every defect and every decision that changed.**
 
 Append-only, newest first, same contract as
-[`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md): when the paper is written, three
+[`09_LAB_NOTEBOOK.md`](../cifar100/09_LAB_NOTEBOOK.md): when the paper is written, three
 questions must be answerable from this one file.
 
 1. What did we measure, and exactly where does that number live?
@@ -1137,7 +1137,7 @@ appeared.
   harness, not in any statistic. Nothing it failed to catch is known to have
   been wrong; the point is that we cannot say it *would* have caught anything.
 - **Every "self-checks N → M, all passing" line in
-  [`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md) overstates its evidence.** Those
+  [`09_LAB_NOTEBOOK.md`](../cifar100/09_LAB_NOTEBOOK.md) overstates its evidence.** Those
   entries record checks *written*, which is real work; they do not record checks
   *enforced*, which is what the wording implies. D-17's 11 regression checks,
   D-22's 12, D-24's 6, D-26's 4 all sit before the rebinding.
@@ -2995,3 +2995,62 @@ strictly weaker claim than the one I made.
 **To recover the quantitative claim** the study needs an architecture in both
 zoos (`convnext` and `shufflenetv2` qualify) or ≥3 architectures per family on
 ImageNet. That is training, not analysis, and it is now the top item in §8.
+
+---
+
+## Repository restructure + NB6_Publish
+
+Not a defect. Recording what moved, so the next person is not surprised.
+
+**Documents are now split by study.** Seventeen numbered files sat at the top
+level with two studies interleaved. Now:
+
+```
+docs/cifar100/     00-10   protocol, spec, schema, playbook, results
+docs/imagenet100/  20-25   port plan, delta, lab notebook, runbook, status, data card
+```
+
+`tools/check_links.py` verifies that every cross-reference resolves — the docs
+reference each other about 120 times, and `20_IN100_PORT_PLAN.md` opens by
+telling the reader to read four other files in order. That reading order is the
+onboarding path and nothing was checking it.
+
+**It found a break before the move:** `20_IN100_PORT_PLAN.md` referenced
+`24_IN100_RESULTS.md`, a file that has never existed. Fixed to
+`24_IN100_STATUS.md`. Moving seventeen files without that checker would have
+broken all 120 references at once and nobody would have noticed until someone
+followed one.
+
+**Removed from version control:** `download minimax.ipynb` (unrelated), a
+stray `Z:` directory, `scratch/`, the write-probe directories `msc_data/` and
+`msc_results/` (they are storage roots, not source), and the `msc_lib.py` /
+`msc_core.py` copies inside `notebooks/` and `notebooks_in100/` — those are
+written at run time from the embedded blob and are build artifacts, not source.
+Tracking them meant a stale copy could be committed and then loaded (D-62).
+
+**NB6_Publish** mirrors the local tree to `Shanmuk4622/msc-imagenet100`,
+matching the CIFAR layout under `Shanmuk4622/msc-cifar100` exactly — one
+dataset repo, one folder per run. The two-repo split (models + data) was tried
+during CIFAR and reverted because HuggingFace's write limit is per *user*, so
+two uploaders doubled commit consumption for no benefit.
+
+It defaults to `DRY_RUN = True`, reads `HF_TOKEN` from the environment rather
+than a cell, uploads one commit per run (≈28 commits, not ≈400, against a
+~120/hour limit), skips runs already present so a re-run resumes, generates the
+dataset card **from the results on disk** so it cannot drift, and verifies by
+re-reading the repo rather than trusting that the upload queue drained (D-9,
+D-10).
+
+**Two accessors added so NB6 obeys rule 4.** Remote paths are repo paths: a
+literal `runs/{id}/...` in the publish notebook is the same hazard D-23 was.
+`repo_rel_path(work, local)` computes the HuggingFace path from the local one —
+which is what `run_layout` was designed to make possible — and
+`publish_manifest(work)` derives the size report from `RUN_SUBDIRS` instead of
+hand-written globs, so a new subdirectory appears automatically rather than
+being silently omitted.
+
+**The validator learned `run_layout` keys.** `L["per_sample"]` is a path, not a
+column, and flagging it punished exactly the accessor rule 4 asks for.
+`LAYOUT_KEYS` is accepted, with a canary asserting an invented column name is
+still rejected — widening a checker without proving it can still fail is how a
+checker quietly stops checking.

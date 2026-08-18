@@ -169,4 +169,4 @@ caught OOM is the *benign* case. The damaging case is the allocation that
 handler ever sees.
 
 Full write-up, including what it cost: **D-41** in
-[`22_IN100_LAB_NOTEBOOK.md`](../22_IN100_LAB_NOTEBOOK.md).
+[`22_IN100_LAB_NOTEBOOK.md`](../docs/imagenet100/22_IN100_LAB_NOTEBOOK.md).

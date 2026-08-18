@@ -63,6 +63,11 @@ SCHEMA = set(M.HISTORY_FIELDS) | set(M.FINAL_FIELDS)
 # Keys that live in summary.json / meta blocks rather than the CSV schema.
 # Enumerated rather than pattern-matched: an allowlist you have to edit is a
 # place where someone has to think, which is the point.
+# `run_layout()` returns a dict keyed by these. They are PATHS, not columns --
+# `L["per_sample"] / "test.parquet"` is the sanctioned way to name a file, and
+# flagging it would punish exactly the accessor rule 4 asks for.
+LAYOUT_KEYS = {"base"} | set(M.RUN_SUBDIRS)
+
 SUMMARY_KEYS = {
     "run_id", "arch", "family", "dataset", "dataset_name", "seed", "phase",
     "method", "status", "config_hash", "data_fingerprint", "input_res",
@@ -267,6 +272,7 @@ LIB_DEFINED = _library_defined()
 
 def _known(name: str) -> bool:
     return (name in SCHEMA or name in SUMMARY_KEYS or name in LIB_DEFINED
+            or name in LAYOUT_KEYS
             or bool(PER_SAMPLE_RE.match(name))
             or bool(ANALYSIS_RE.match(name)))
 
@@ -809,6 +815,17 @@ def self_test() -> bool:
         ok = False
     if _stage_problems(ast.parse("sess.run_all(cfgs, title='training')")):
         print("  [SELFTEST FAIL] the stage check fires on a training call")
+        ok = False
+
+    # -- widening for run_layout keys must not blind the schema check -------
+    if _known("nonsense_column_xyz"):
+        print("  [SELFTEST FAIL] _known accepts a name that is in no schema")
+        ok = False
+    if not _known("per_sample"):
+        print("  [SELFTEST FAIL] run_layout key 'per_sample' is not accepted")
+        ok = False
+    if not _known("checkpoints"):
+        print("  [SELFTEST FAIL] run_layout key 'checkpoints' is not accepted")
         ok = False
 
     # -- the column-argument check must be able to fail (D-66) --------------

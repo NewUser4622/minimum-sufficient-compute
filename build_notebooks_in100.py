@@ -1615,12 +1615,264 @@ print('and the mechanism claim is wrong even if the method wins.')
     return notebook(c)
 
 
+def nb6():
+    c = [
+        md("""
+# NB6 · Publish — mirror the local tree to HuggingFace
+
+Everything so far has been **local only**. This notebook is the one place that
+uploads, and it is the last step by design: an artifact that has not been
+verified on disk should not be published.
+
+## The layout is the local tree, unchanged
+
+`run_layout()` was written so the local tree and the repo tree are the same
+shape — a push is a relative-path calculation, never a guess. The CIFAR study
+uses exactly this layout under `Shanmuk4622/msc-cifar100`, and ImageNet-100
+mirrors it under `Shanmuk4622/msc-imagenet100`:
+
+```
+runs/{run_id}/
+├── config.yaml · config_hash.txt · STATUS.json · summary.json
+├── metrics/      epochs.csv · final.csv · confusion_matrix.csv
+│                 per_class.csv · exit_metrics.csv
+├── telemetry/    energy_samples.csv · system_samples.csv · step_traces.jsonl
+├── per_sample/   test.parquet · train_holdout.parquet
+│                 train_dynamics.parquet · meta.json
+├── checkpoints/  ckpt_last.pt · ckpt_best.pt
+├── env/          environment.json
+└── exit_heads.pt
+
+registry/events/*.jsonl · registry/claims/ · registry/plans/
+budgets/{arch}.json
+analysis/*.csv
+tables/*.csv
+paper/figures/*.png
+README.md            <- the dataset card, generated below
+```
+
+One repo, one folder per run. The CIFAR study tried a two-repo split
+(models + data) and reverted it: HuggingFace's write limit is **per user**, so
+two uploaders doubled commit consumption for no benefit, and a run's artifacts
+belong together. See `docs/cifar100/03_IMPLEMENTATION_PLAN.md` §6.2(d).
+
+## Rate limit
+
+HF allows roughly 120 commits/hour/user. This uploads in **batched commits**
+(one commit per run, not per file) and reports the count before it starts, so a
+push of 22 runs costs ~22 commits rather than ~400.
+"""),
+        code("""
+REPO_ID   = 'Shanmuk4622/msc-imagenet100'
+REPO_TYPE = 'dataset'
+PRIVATE   = False
+
+# The token is read from the environment, never typed into a cell -- a notebook
+# is a file that gets committed, and a pasted token is a leaked token.
+#   Windows:  setx HF_TOKEN hf_xxxxxxxx     (then restart the kernel)
+import os
+HF_TOKEN = os.environ.get('HF_TOKEN')
+print('HF_TOKEN found' if HF_TOKEN else
+      'HF_TOKEN NOT SET -- set it and restart the kernel before running below')
+
+DRY_RUN = True     # True = list what WOULD be uploaded, upload nothing
+"""),
+        md("""
+---
+## What will be published, and how big it is
+
+Read the plan before uploading. Checkpoints dominate the size; everything a
+reader needs to reproduce the *analysis* is a few MB.
+"""),
+        code("""
+from pathlib import Path
+
+ROOT = Path(MSC_ROOT)
+man = M.publish_manifest(ROOT)
+print(f"{'group':30s} {'files':>7s} {'size':>10s}")
+print('-' * 50)
+tot = 0
+for _, r in man.iterrows():
+    tot += r['bytes']
+    print(f"{r['group']:30s} {r['files']:>7d} {r['bytes']/2**20:>9.1f}M")
+print('-' * 50)
+print(f"{'TOTAL':30s} {'':>7s} {tot/2**30:>9.2f}G")
+
+n_runs = len([d for d in (ROOT / 'runs').iterdir() if d.is_dir()])
+print()
+print(f"{n_runs} run(s) -> about {n_runs + 6} commits (one per run, plus"
+      f" registry/budgets/analysis/tables/figures/README)")
+print('HF allows ~120 commits/hour/user, so this fits in one window.')
+"""),
+        md("""
+---
+## The dataset card
+
+Generated from the results on disk rather than typed, so it cannot drift from
+what was actually uploaded.
+"""),
+        code("""
+import json, csv, io
+
+def _q1_rows():
+    p = ROOT / 'analysis' / 'q1_seed_ceilings_all.csv'
+    return list(csv.DictReader(p.open(encoding='utf-8'))) if p.exists() else []
+
+rows = _q1_rows()
+card = io.StringIO()
+w = card.write
+w('---\\n')
+w('license: cc-by-4.0\\n')
+w('task_categories:\\n  - image-classification\\n')
+w('tags:\\n  - minimum-sufficient-compute\\n  - per-sample-difficulty\\n')
+w('  - early-exit\\n  - imagenet-100\\n')
+w('---\\n\\n')
+w('# MSC · ImageNet-100\\n\\n')
+w('Per-sample **Minimum Sufficient Compute** for ImageNet-100 at 224px: the\\n')
+w('cost-normalised compute each sample needs before its decision has\\n')
+w('settled. Companion to the CIFAR-100 study at\\n')
+w('[`Shanmuk4622/msc-cifar100`](https://huggingface.co/datasets/Shanmuk4622/msc-cifar100).\\n\\n')
+w('## Seed reliability (rho_seed, tau=0.1)\\n\\n')
+w('| architecture | family | seeds | rho_seed | Jaccard@10 | top-1 |\\n')
+w('|---|---|---|---|---|---|\\n')
+for r in rows:
+    w(f"| `{r['arch']}` | {r['family']} | {r['n_seeds']} | "
+      f"{float(r['rho_seed_tau0.1']):.4f} | {float(r['j10_tau0.1']):.4f} | "
+      f"{float(r['top1_mean']):.4f} |\\n")
+w('\\n`rho_seed` is the Spearman correlation between the MSC of two seeds of the\\n')
+w('same architecture. It is the **noise ceiling**: no transfer claim can exceed\\n')
+w('it, and every disattenuated number in the paper divides by it.\\n\\n')
+w('## Layout\\n\\n```\\nruns/{run_id}/\\n')
+w('  config.yaml  config_hash.txt  STATUS.json  summary.json\\n')
+w('  metrics/     epochs.csv  final.csv  confusion_matrix.csv  per_class.csv\\n')
+w('               exit_metrics.csv\\n')
+w('  telemetry/   energy_samples.csv  system_samples.csv  step_traces.jsonl\\n')
+w('  per_sample/  test.parquet  train_holdout.parquet  train_dynamics.parquet\\n')
+w('               meta.json\\n')
+w('  checkpoints/ ckpt_last.pt  ckpt_best.pt\\n')
+w('  env/         environment.json\\n')
+w('  exit_heads.pt\\n\\n')
+w('budgets/{arch}.json   registry/   analysis/   tables/   paper/figures/\\n```\\n\\n')
+w('`per_sample/test.parquet` is the scientific artifact; everything in the\\n')
+w('paper is computed from it. `sample_idx` is the **global pack index**, not a\\n')
+w('position within a split, so tables from different runs join directly.\\n\\n')
+w('## Run identifiers\\n\\n')
+w('`{phase}-{arch}-{dataset}-{method}-s{seed}` — e.g.\\n')
+w('`p0-resnet50-imagenet100-base-s1`. Phase `p0` is the pilot, `p3` MSC-KD.\\n\\n')
+w('## Caveats\\n\\n')
+w('- The pilot is **2 architectures x 2 seeds**. rho_seed has no error bar.\\n')
+w('- **No architecture appears in both the CIFAR and ImageNet studies**, so\\n')
+w('  cross-study magnitudes confound architecture, resolution and dataset.\\n')
+w('  The CNN > ViT *ordering* replicates; the *magnitudes* do not transfer.\\n')
+w('- MSC-KD is a **negative** result: at matched FLOPs it is below confidence\\n')
+w('  thresholding, and the oracle ceiling shows there was no headroom.\\n\\n')
+w('Full detail: `docs/imagenet100/24_IN100_STATUS.md` in the code repository.\\n')
+
+CARD = card.getvalue()
+(ROOT / 'README.md').write_text(CARD, encoding='utf-8')
+print(CARD[:1400])
+print(f"\\n... written to {ROOT / 'README.md'} ({len(CARD)} chars)")
+"""),
+        md("""
+---
+## Upload
+
+`DRY_RUN = True` lists and stops. Set it to `False` to publish.
+
+Uploads run-by-run so a failure part way leaves a repo that is *incomplete*
+rather than *inconsistent*, and so a re-run resumes instead of restarting.
+"""),
+        code("""
+if not HF_TOKEN:
+    print('HF_TOKEN is not set -- nothing to do.')
+elif DRY_RUN:
+    print('DRY_RUN = True. Nothing uploaded. Set DRY_RUN = False to publish.')
+    print(f'  target: {REPO_ID} ({REPO_TYPE})')
+else:
+    from huggingface_hub import HfApi, create_repo
+    api = HfApi(token=HF_TOKEN)
+    create_repo(REPO_ID, token=HF_TOKEN, repo_type=REPO_TYPE,
+                private=PRIVATE, exist_ok=True)
+    print(f'repo ready: {REPO_ID}')
+
+    done = set()
+    try:
+        _pfx = M.repo_rel_path(ROOT, ROOT / 'runs') + '/'
+        done = {f[len(_pfx):].split('/')[0]
+                for f in api.list_repo_files(REPO_ID, repo_type=REPO_TYPE)
+                if f.startswith(_pfx)}
+    except Exception:
+        pass
+    print(f'{len(done)} run(s) already present -- they are skipped')
+
+    run_dirs = sorted(d for d in (ROOT / 'runs').iterdir() if d.is_dir())
+    for i, d in enumerate(run_dirs, 1):
+        if d.name in done:
+            print(f'  [{i}/{len(run_dirs)}] skip {d.name} (already uploaded)')
+            continue
+        api.upload_folder(folder_path=str(d),
+                          path_in_repo=M.repo_rel_path(ROOT, d),
+                          repo_id=REPO_ID, repo_type=REPO_TYPE,
+                          commit_message=f'add {d.name}')
+        print(f'  [{i}/{len(run_dirs)}] uploaded {d.name}')
+
+    for rel in ('budgets', 'registry', 'analysis', 'tables', 'paper'):
+        src = ROOT / rel
+        if src.exists():
+            api.upload_folder(folder_path=str(src),
+                              path_in_repo=M.repo_rel_path(ROOT, src),
+                              repo_id=REPO_ID, repo_type=REPO_TYPE,
+                              commit_message=f'add {rel}')
+            print(f'  uploaded {rel}/')
+
+    api.upload_file(path_or_fileobj=str(ROOT / 'README.md'),
+                    path_in_repo='README.md', repo_id=REPO_ID,
+                    repo_type=REPO_TYPE, commit_message='dataset card')
+    print(f'\\ndone -> https://huggingface.co/datasets/{REPO_ID}')
+"""),
+        md("""
+---
+## Verify what landed
+
+Trust `resolve`, not the file listing. During the CIFAR study `tree/` and
+`commits/` served stale data three times while `resolve` was correct
+(`docs/cifar100/09_LAB_NOTEBOOK.md`). Draining an upload queue is not
+confirmation either — this re-reads the repo.
+"""),
+        code("""
+if HF_TOKEN and not DRY_RUN:
+    from huggingface_hub import HfApi
+    api = HfApi(token=HF_TOKEN)
+    remote = set(api.list_repo_files(REPO_ID, repo_type=REPO_TYPE))
+    local_runs = sorted(d.name for d in (ROOT / 'runs').iterdir() if d.is_dir())
+    missing = []
+    for r in local_runs:
+        L = M.run_layout(ROOT, r)
+        need = [M.repo_rel_path(ROOT, L['base'] / 'summary.json'),
+                M.repo_rel_path(ROOT, L['base'] / 'config.yaml'),
+                M.repo_rel_path(ROOT, L['per_sample'] / 'test.parquet')]
+        missing += [n for n in need if n not in remote]
+    print(f'{len(remote)} files in {REPO_ID}')
+    if missing:
+        print(f'MISSING {len(missing)}:')
+        for m in missing[:15]:
+            print('   ', m)
+    else:
+        print('every run has summary.json, config.yaml and test.parquet on the hub')
+else:
+    print('skipped (dry run or no token)')
+"""),
+    ]
+    return notebook(c)
+
+
 NOTEBOOKS = {
     "NB1_Setup.ipynb": nb1,
     "NB2_Train.ipynb": nb2,
     "NB3_Measure.ipynb": nb3,
     "NB4_Analysis.ipynb": nb4,
     "NB5_Method.ipynb": nb5,
+    "NB6_Publish.ipynb": nb6,
 }
 
 

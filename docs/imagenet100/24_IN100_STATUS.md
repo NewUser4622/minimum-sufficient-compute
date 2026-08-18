@@ -74,7 +74,7 @@ not call the evaluator.
 
 This is the "where are we" file. One page, updated every session.
 
-- **What happened and why** → `22_IN100_LAB_NOTEBOOK.md` (defect log, D-37…D-70)
+- **What happened and why** → `22_IN100_LAB_NOTEBOOK.md` (defect log, D-37…D-81)
 - **Symptom → cause → fix** → `23_IN100_RUNBOOK.md` (look here first when something breaks)
 - **The plan** → `20_IN100_PORT_PLAN.md` · **What changed from CIFAR** → `21_IN100_ENGINEERING_DELTA.md`
 
@@ -103,6 +103,8 @@ NB3 Measure   ██████████ done    4/4 measured, per-sample ta
 NB4 Analysis  ██████████ done    Q1 Q2 Q3 Q4 all written to analysis/
 NB5 Method    ██████████ done    18/18 trained · routing baselines computed
                                  NEGATIVE result, and the B11 oracle explains it
+NB6 Publish   ░░░░░░░░░░ ready   mirrors the local tree to HuggingFace
+                                 DRY_RUN=True by default
 ```
 
 ## FIRST RESULT — corrected, and weaker than first stated

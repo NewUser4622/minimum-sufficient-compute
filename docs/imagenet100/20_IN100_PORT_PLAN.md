@@ -2,7 +2,7 @@
 
 **Status:** design frozen 2026-08-07 · implementation in progress
 **Predecessor:** the completed CIFAR-100 programme, recorded in
-[`09_LAB_NOTEBOOK.md`](09_LAB_NOTEBOOK.md) and [`10_FINAL_RESULTS.md`](10_FINAL_RESULTS.md)
+[`09_LAB_NOTEBOOK.md`](../cifar100/09_LAB_NOTEBOOK.md) and [`10_FINAL_RESULTS.md`](../cifar100/10_FINAL_RESULTS.md)
 
 ---
 
@@ -430,7 +430,7 @@ Mirrors playbook §14 — each step verified before the next.
 | `21_IN100_ENGINEERING_DELTA.md` | every CIFAR→ImageNet change, with its reason |
 | `22_IN100_LAB_NOTEBOOK.md` | append-only defect log, contamination analysis each |
 | `23_IN100_RUNBOOK.md` | how to run, in order, with what to check after each |
-| `24_IN100_RESULTS.md` | results ledger, filled as runs land |
+| `24_IN100_STATUS.md` | results ledger, filled as runs land |
 
 The CIFAR documents (`00`–`10`, `PAPER.md`) are the completed record of the
 previous programme and are **not edited** by this port.
