@@ -3104,3 +3104,54 @@ with no writer), and now a checker never aimed at the thing it exists to check.
 Every one is the same shape: **the verification and the artifact were not the
 same object.** Writing the check is the easy half; pointing it at what actually
 ships is the half I keep missing.
+
+---
+
+## D-83 — the offline guard is right for five notebooks and fatal for the sixth
+
+```
+OfflineModeIsEnabled: Cannot reach https://huggingface.co/api/repos/create:
+offline mode is enabled. To disable it, please unset the `HF_HUB_OFFLINE`
+environment variable.
+```
+
+`msc_lib` calls `enforce_offline()` at import whenever `MSC_OFFLINE` is set,
+and the notebook bootstrap sets it. That is exactly right for NB1–NB5: this
+pipeline must be provably self-contained, and the guard is what proves it.
+
+**NB6 is the one notebook whose entire job is to reach HuggingFace**, and it
+inherits the guard from the shared bootstrap. I added NB6 without considering
+that the thing every other notebook needs is the thing this one cannot have.
+
+**The error's own advice is misleading here**, which cost the user a round:
+`HF_HUB_OFFLINE` is set **inside the notebook process**, after the shell has
+been left behind. `unset` in PowerShell (which is `Remove-Item Env:` anyway)
+operates on a shell that is not the one with the problem.
+
+**And popping the variable is not sufficient either.** `huggingface_hub` reads
+`HF_HUB_OFFLINE` **once, at import**, into `huggingface_hub.constants`. If the
+package is already imported — and importing it is how you find out you are
+offline — clearing the environment changes nothing. The constant has to be
+patched as well.
+
+**Fix.** `allow_network()` clears the four variables *and* patches
+`HF_HUB_OFFLINE` on every already-imported `huggingface_hub` module, returning
+what it changed. `offline_state()` reports the guard for display. NB6 prints
+the state before and after and calls `allow_network()` explicitly, so going
+online is a visible, deliberate act in the one notebook that does it — rather
+than something a later cell fails on.
+
+**The fix's first version did not run at all.** I inserted `allow_network`
+immediately above `def no_network`, which sits under a `@contextmanager`
+decorator — so the decorator attached to the new function and
+`allow_network()` returned a context manager. The self-test caught it:
+`TypeError: '_GeneratorContextManager' object is not subscriptable`. Inserting
+between a decorator and its function is D-69's ordering mistake in a new place;
+the lesson is that "insert before `def X`" is not a safe operation when a
+decorator can sit above it.
+
+**Verified in both directions.** The self-test sets all four variables and
+installs a fake `huggingface_hub.constants` with `HF_HUB_OFFLINE = True`,
+asserts the guard is genuinely on first (the canary), then asserts
+`allow_network()` clears all four *and* flips the module constant to `False`.
+Without the canary the test would pass on a machine that was never offline.

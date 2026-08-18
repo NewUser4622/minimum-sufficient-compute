@@ -1236,6 +1236,66 @@ def enforce_offline(verbose: bool = True) -> Dict[str, str]:
     return dict(OFFLINE_ENV)
 
 
+def allow_network(verbose: bool = True) -> Dict[str, Any]:
+    """Reverse `enforce_offline` for this process. Publishing needs the network.
+
+    **D-83.** `msc_lib` calls `enforce_offline()` at import time whenever
+    `MSC_OFFLINE` is set, and the notebook bootstrap sets it. That is right for
+    NB1-NB5, which must be provably self-contained. NB6 is the one notebook
+    whose entire job is to reach HuggingFace, and it inherited the guard:
+
+        OfflineModeIsEnabled: Cannot reach
+        https://huggingface.co/api/repos/create: offline mode is enabled.
+
+    Clearing the variable in PowerShell does not help, and the error's own
+    advice is misleading here: the variable is set **inside this process**,
+    after the shell has been left behind.
+
+    Nor is `os.environ.pop` sufficient on its own. `huggingface_hub` reads
+    `HF_HUB_OFFLINE` **once, at import**, into `huggingface_hub.constants`.
+    Anything already imported keeps the old value, so the constant is patched
+    too -- for the module and for the submodules that copied it.
+
+    Returns what it changed, so a notebook can show it rather than assert it.
+    """
+    changed = {"env_cleared": [], "constants_patched": []}
+    for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
+              "MSC_OFFLINE"):
+        if os.environ.pop(k, None) is not None:
+            changed["env_cleared"].append(k)
+
+    for mod_name in ("huggingface_hub.constants", "huggingface_hub",
+                     "huggingface_hub.file_download",
+                     "huggingface_hub._snapshot_download"):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "HF_HUB_OFFLINE"):
+            try:
+                setattr(mod, "HF_HUB_OFFLINE", False)
+                changed["constants_patched"].append(mod_name)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    if verbose:
+        log(f"network ENABLED for this process. cleared "
+            f"{changed['env_cleared'] or 'nothing'}; patched "
+            f"{changed['constants_patched'] or 'nothing'}", "NET")
+        log("this is the only notebook that goes online. NB1-NB5 stay offline.",
+            "NET")
+    return changed
+
+
+def offline_state() -> Dict[str, Any]:
+    """What the offline guard currently looks like, for display."""
+    out = {k: os.environ.get(k) for k in
+           ("MSC_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+            "HF_DATASETS_OFFLINE")}
+    mod = sys.modules.get("huggingface_hub.constants")
+    out["huggingface_hub.constants.HF_HUB_OFFLINE"] = (
+        getattr(mod, "HF_HUB_OFFLINE", None) if mod is not None
+        else "<not imported>")
+    return out
+
+
 @contextmanager
 def no_network(allow_local: bool = True):
     """Block the socket layer, so a fetch RAISES instead of hanging.
@@ -12625,6 +12685,43 @@ def _selftest() -> bool:
     check("D-79b: train_msc_kd writes config_hash.txt",
           "config_hash.txt" in _kd_src,
           "all 18 MSC-KD runs verified incomplete without it")
+
+    # -- D-83: allow_network must actually reverse the offline guard ----------
+    _saved83 = {k: os.environ.get(k) for k in
+                ("MSC_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+                 "HF_DATASETS_OFFLINE")}
+    try:
+        for _k in _saved83:
+            os.environ[_k] = "1"
+        import types as _t83
+        _fake_hub = _t83.ModuleType("huggingface_hub.constants")
+        _fake_hub.HF_HUB_OFFLINE = True
+        sys.modules["huggingface_hub.constants"] = _fake_hub
+
+        _before = offline_state()
+        check("D-83 canary: the guard really is on before the call",
+              _before["HF_HUB_OFFLINE"] == "1"
+              and _before["huggingface_hub.constants.HF_HUB_OFFLINE"] is True,
+              "otherwise the test below proves nothing")
+
+        _ch = allow_network(verbose=False)
+        _after = offline_state()
+        check("D-83: env vars are cleared",
+              all(_after[k] is None for k in
+                  ("MSC_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+                   "HF_DATASETS_OFFLINE")),
+              f"cleared {_ch['env_cleared']}")
+        check("D-83: the imported hub CONSTANT is patched too",
+              _after["huggingface_hub.constants.HF_HUB_OFFLINE"] is False,
+              "popping the env var alone leaves huggingface_hub offline, "
+              "because it reads the flag once at import")
+    finally:
+        sys.modules.pop("huggingface_hub.constants", None)
+        for _k, _v in _saved83.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
 
     # -- D-78: the arm is decided by `method`, never by a run_id substring ----
     _arms = [

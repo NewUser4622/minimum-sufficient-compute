@@ -1343,6 +1343,54 @@ RUN_ARTIFACTS_EXPECTED = (
 )
 
 
+def repo_rel_path(work, local_path) -> str:
+    """The HuggingFace path for a local file. THE accessor for remote paths.
+
+    `run_layout` exists so the local tree and the repo tree are the same shape
+    -- "a push is a relative-path calculation and never a guess". This is that
+    calculation, in one place, so NB6 does not spell `runs/{id}/...` by hand.
+
+    Rule 4 is about repo paths generally, and a remote path typed as a literal
+    is the same hazard as a local one: D-23 was `exit_heads.pt` written to the
+    run root and read from `checkpoints/`, and the fix was an accessor.
+    """
+    rel = Path(local_path).resolve().relative_to(Path(work).resolve())
+    return rel.as_posix()
+
+
+def publish_manifest(work) -> "Any":
+    """Everything that would be published, grouped, with sizes -- from the
+    layout rather than from hand-written globs.
+
+    Groups are derived from `RUN_SUBDIRS` and the artifact lists, so a new
+    subdirectory appears here automatically instead of being silently omitted.
+    """
+    work = Path(work)
+    rows = []
+    runs = sorted(d for d in (work / "runs").iterdir() if d.is_dir()) \
+        if (work / "runs").exists() else []
+    for sub in ("", ) + RUN_SUBDIRS:
+        files = []
+        for d in runs:
+            base = d / sub if sub else d
+            if not base.exists():
+                continue
+            files += [f for f in base.iterdir() if f.is_file()]
+        if files:
+            rows.append({"group": f"runs/*/{sub}" if sub else "runs/* (root)",
+                         "files": len(files),
+                         "bytes": sum(f.stat().st_size for f in files)})
+    for top in ("budgets", "registry", "analysis", "tables", "paper"):
+        d = work / top
+        if not d.exists():
+            continue
+        files = [f for f in d.rglob("*") if f.is_file()]
+        if files:
+            rows.append({"group": top + "/", "files": len(files),
+                         "bytes": sum(f.stat().st_size for f in files)})
+    return pd.DataFrame(rows) if pd is not None else rows
+
+
 def phases_present(work) -> Dict[str, Dict[str, int]]:
     """`{phase: {"runs": n, "completed": n}}` read straight off disk.
 
@@ -14976,4 +15024,4 @@ if __name__ == "__main__":
         sys.exit(0 if _selftest() else 1)
     print(f"msc_lib v{__version__} -- run with --selftest for the offline checks")
 
-__MSC_BUILD__ = "71afdb69322f"
+__MSC_BUILD__ = "8abf84bdcf6e"

@@ -1665,6 +1665,27 @@ push of 22 runs costs ~22 commits rather than ~400.
         code(bootstrap()),
         code(paths_cell(phase="p3", detect=False)),
         code("""
+# D-83. msc_lib calls enforce_offline() at import whenever MSC_OFFLINE is set,
+# and the bootstrap sets it. That is correct for NB1-NB5, which must be
+# provably self-contained. THIS notebook is the one that goes online, so it
+# turns the guard off explicitly -- and says so, rather than a later cell
+# failing with "offline mode is enabled" and sending you to the shell.
+#
+# Clearing the variable in PowerShell does not help: it is set inside THIS
+# process. And popping the variable alone is not enough either -- huggingface_hub
+# reads it once at import into a module constant, so that is patched too.
+print('offline guard BEFORE:')
+for k, v in M.offline_state().items():
+    print(f'    {k:44s} {v}')
+
+M.allow_network()
+
+print()
+print('offline guard AFTER:')
+for k, v in M.offline_state().items():
+    print(f'    {k:44s} {v}')
+print()
+
 REPO_ID   = 'Shanmuk4622/msc-imagenet100'
 REPO_TYPE = 'dataset'
 PRIVATE   = False
