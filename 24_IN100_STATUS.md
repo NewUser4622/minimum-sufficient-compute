@@ -29,7 +29,7 @@ Jaccard@top-10 = 0.259.
 
 | claim | status | evidence |
 |---|---|---|
-| **Q1 seed ceilings** | **PROVEN** | resnet50 ρ_seed **0.822**, vit **0.649** (τ=0.1), both above the 0.60 gate |
+| **Q1 seed ceilings** | **PROVEN within IN-100** | resnet50 **0.822** vs vit **0.649**, both above the 0.60 gate. The CNN>ViT *ordering* replicates CIFAR. Cross-study *magnitudes* are confounded — see §FIRST RESULT |
 | **Q2 multi-axis** | **PROVEN** | PC1 explains 0.547 / 0.522 — MSC is not one axis in disguise |
 | **Q3 transfer** | **PROVEN** | T = **0.640** [0.614, 0.664]; shuffled control T = 0.037, a 17× separation |
 | **Q4 irreducibility** | **PARTIAL** | ΔR² = 0.0411, CI [0.0352, 0.0468] excludes zero — but partial ρ **0.282 < 0.30 gate** |
@@ -105,35 +105,54 @@ NB5 Method    ██████████ done    18/18 trained · routing ba
                                  NEGATIVE result, and the B11 oracle explains it
 ```
 
-## FIRST RESULT — the question, answered for the pilot
+## FIRST RESULT — corrected, and weaker than first stated
 
-**ρ_seed at τ=0.1** (the noise ceiling: Spearman between two seeds of the same
-architecture; the denominator of every transfer claim)
+**ρ_seed at τ=0.1.** An earlier version of this file claimed *"the gap widened
+from ~0.10 to 0.173"*. That claim does not survive checking, and the reason
+matters more than the number.
 
-| architecture | CIFAR-100 | **ImageNet-100** | change |
-|---|---|---|---|
-| CNN (`resnet50`) | 0.62–0.73 | **0.822** | up |
-| ViT (`vit_small_p16`) | 0.547 | **0.649** | up |
-| **gap (CNN − ViT)** | ~0.10 | **0.173** | **wider** |
+| | CIFAR-100 | ImageNet-100 |
+|---|---|---|
+| CNN | 12 archs, mean **0.6683**, range 0.622–0.722 | `resnet50` **0.8220** (n=1) |
+| non-CNN | `vit_tiny` 0.5475, `mixer_nano` 0.5470 | `vit_small_p16` **0.6492** (n=1) |
+| gap | **+0.1210** | **+0.1728** |
 
-Read carefully, because it cuts both ways:
+### What is NOT supported
 
-- **The ordering survives.** ViT is still measurably less seed-reliable than
-  the CNN at 40× the data and 49× the pixels. The CIFAR finding was not purely
-  a small-data artifact.
-- **But both rose**, and ViT's 0.649 at ImageNet scale now sits *inside* the
-  range CNNs occupied on CIFAR (0.62–0.73). "ViT is unreliable" is not
-  scale-invariant; "ViT is less reliable *than a CNN trained alongside it*" is
-  what held.
-- **The gap widened rather than closed** (0.10 → 0.17), which is the opposite
-  of the small-data-artifact hypothesis.
+**No architecture is shared between the two studies.** CIFAR ran `vit_tiny`;
+ImageNet ran `vit_small_p16`. CIFAR ran twelve small CNNs; ImageNet ran
+`resnet50`. So every cross-study number bundles **architecture + resolution +
+dataset** into one difference, and none of them can be attributed to scale:
 
-Jaccard@top-10 tells the same story more starkly: 0.62 (resnet50) vs 0.28
-(vit) — the two ViT seeds barely agree on *which* samples are expensive.
+- "ViT's ρ_seed rose 0.547 → 0.649" compares `vit_tiny`@32px to
+  `vit_small_p16`@224px. Different model, different resolution.
+- "the gap widened 0.121 → 0.173" is one CNN and one ViT against twelve and
+  two. With n=1 per family on ImageNet there is no error bar on that 0.173.
+- `table6_cifar_vs_imagenet.csv` says it plainly: `same_architecture = False`
+  on both rows, and the CIFAR column is empty because there is no match to
+  join on.
 
-**Do not write this up yet.** n=2 seeds means one pair per architecture and no
-error bar (§6.1), and the ViT arm has a 38-point train/val gap (§6.2). Both are
-reasons this number could move. Two architectures is a pilot, not the atlas.
+Note also that `vit_small_p16` at 0.649 sits **inside** the CIFAR CNN range
+(0.622–0.722). "ViT is unreliable in absolute terms" is not a scale-invariant
+statement.
+
+### What IS supported
+
+**The ordering replicates.** Within ImageNet-100 — same dataset, same
+resolution, same recipe family, same pipeline — the CNN is more seed-reliable
+than the ViT: **0.822 vs 0.649**. CIFAR found the same direction across 14
+architectures.
+
+That is an *independent replication with non-overlapping architectures*, which
+is arguably stronger evidence that the phenomenon is not architecture-specific
+than re-running the same model would have been. It is also a much narrower
+claim than the one this file made yesterday, and it is the one the data
+supports.
+
+**To say anything quantitative about scale**, the study needs either an
+architecture present in both (`convnext` and `shufflenetv2` exist in both
+zoos), or ≥3 architectures per family on ImageNet. Both are training, not
+analysis.
 
 **Phase 0 is a 2-architecture pilot, not the study.** The 8-architecture
 atlas is phase `p1` and has not been started.

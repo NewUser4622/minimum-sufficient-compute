@@ -11124,8 +11124,30 @@ def evaluate_routing_methods(student, val_loader, device, rho: Sequence[float],
             "B2_auc": auc_accuracy_flops(c2)}
         if "B11_oracle" in out:
             gap_total = out["B11_oracle"]["accuracy"] - a2
-            out["matched_flops_comparison"]["fraction_of_B2_to_B11_gap_closed"] = (
-                float((a10 - a2) / gap_total) if abs(gap_total) > 1e-9 else float("nan"))
+            # D-80. `> 1e-9` is not a guard, it is a formality. On ImageNet-100
+            # the measured B11-B2 gap is +0.00007 (sd 0.00036) -- the oracle
+            # ceiling offers no headroom over confidence routing at all -- and
+            # dividing by it produced "fractions" of 26.0, -47.9 and 83.6.
+            #
+            # A ratio is only meaningful when its denominator is larger than
+            # the noise on the quantities it is built from. With n samples the
+            # binomial SE on a difference of two accuracies is about
+            # sqrt(2 p(1-p)/n); below 2 SE the gap is indistinguishable from
+            # zero and the fraction is undefined, not large.
+            _se = math.sqrt(2.0 * 0.25 / max(1, n))
+            out["matched_flops_comparison"]["B2_to_B11_gap"] = float(gap_total)
+            out["matched_flops_comparison"]["B2_to_B11_gap_noise_2se"] = float(2 * _se)
+            if abs(gap_total) > 2 * _se:
+                out["matched_flops_comparison"]["fraction_of_B2_to_B11_gap_closed"] = \
+                    float((a10 - a2) / gap_total)
+            else:
+                out["matched_flops_comparison"]["fraction_of_B2_to_B11_gap_closed"] = \
+                    float("nan")
+                out["matched_flops_comparison"]["gap_verdict"] = (
+                    f"B11-B2 = {gap_total:+.5f} is within noise (2SE = "
+                    f"{2*_se:.5f}); the oracle ceiling offers no headroom over "
+                    f"confidence routing, so there is no gap to close and the "
+                    f"fraction is undefined (D-80)")
     return out
 
 
@@ -14954,4 +14976,4 @@ if __name__ == "__main__":
         sys.exit(0 if _selftest() else 1)
     print(f"msc_lib v{__version__} -- run with --selftest for the offline checks")
 
-__MSC_BUILD__ = "468588bd2e4c"
+__MSC_BUILD__ = "71afdb69322f"
