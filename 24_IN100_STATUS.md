@@ -20,6 +20,54 @@ must be reported as a miss, not rounded up.
 Shuffled control gives T = 0.037 — a 17× separation, so the alignment is real.
 Jaccard@top-10 = 0.259.
 
+---
+
+## 0. CAN THE PAPER BE WRITTEN FROM WHAT IS ON DISK? — read this first
+
+**Nothing needs retraining.** All 22 runs (4 backbones + 18 students), their
+100-epoch histories and their checkpoints are intact: 4.4 GiB of `p3-*` alone.
+
+| claim | status | evidence |
+|---|---|---|
+| **Q1 seed ceilings** | **PROVEN** | resnet50 ρ_seed **0.822**, vit **0.649** (τ=0.1), both above the 0.60 gate |
+| **Q2 multi-axis** | **PROVEN** | PC1 explains 0.547 / 0.522 — MSC is not one axis in disguise |
+| **Q3 transfer** | **PROVEN** | T = **0.640** [0.614, 0.664]; shuffled control T = 0.037, a 17× separation |
+| **Q4 irreducibility** | **PARTIAL** | ΔR² = 0.0411, CI [0.0352, 0.0468] excludes zero — but partial ρ **0.282 < 0.30 gate** |
+| **Q5 MSC-KD** | **COMPUTABLE, ~15 min** | 18 students trained; routing baselines need the backfill cell |
+
+**The paper's thesis is Q1–Q3, and it is already provable.** The headline —
+*ViT's low seed-reliability survives at ImageNet scale, and the CNN/ViT gap
+widens rather than closes* — rests entirely on results that exist and are
+verified on disk.
+
+Q5 is the method section. It is a section, not the thesis; NB5's own header
+says so. What is missing there is one evaluation pass, not a single epoch of
+training.
+
+### What is genuinely NOT proven, and why
+
+1. **n = 2 seeds** for the backbones. ρ_seed has no error bar. The plan said 3.
+   This is the one real limitation of the pilot and it is a *training* gap —
+   the only thing on this page that would cost GPU-days to close.
+2. **Q4 missed its gate** by 0.018. Report it as a miss.
+3. **2 architectures, not 8.** The `p1` atlas has not been run. No CNN-vs-ViT
+   claim can rest on one of each.
+4. **MSC-KD accuracy is null**: +0.0020 mean over 9 pairs, t = +1.02. The
+   routing comparison may still separate; accuracy does not.
+
+### Whose fault, concretely
+
+Mine, and the mechanism is worth recording rather than apologising for:
+`compare_routing_methods` (the reader) was written and wired; nothing ever
+checked that a writer existed. `evaluate_routing_methods` was called only from
+`msckd_dry_run`. **The dry run measured the paper's central quantity; the real
+run did not.** That is D-55's shape on the output side, and the fourth
+reader/writer mismatch in this project (D-63, D-72, D-74, D-79).
+
+There is now a self-test that fails if any column `compare_routing_methods`
+reads has no writer in the source, and one that fails if `train_msc_kd` does
+not call the evaluator.
+
 This is the "where are we" file. One page, updated every session.
 
 - **What happened and why** → `22_IN100_LAB_NOTEBOOK.md` (defect log, D-37…D-70)
@@ -49,8 +97,8 @@ NB1 Setup     ██████████ done    data packed, 129,395 images
 NB2 Train     ██████████ done    4/4 runs, 100 epochs each
 NB3 Measure   ██████████ done    4/4 measured, per-sample tables written
 NB4 Analysis  ██████████ done    Q1 Q2 Q3 Q4 all written to analysis/
-NB5 Method    ░░░░░░░░░░ ready   CONFIRM gate clean · 18 runs, seed-major
-                                 first comparison after 6 runs, not 18 (D-75)
+NB5 Method    ████████░░ 18/18 TRAINED · routing baselines pending backfill
+                                 accuracy real-vs-control: +0.0020, t=+1.02 (null)
 ```
 
 ## FIRST RESULT — the question, answered for the pilot
