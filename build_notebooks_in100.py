@@ -1552,6 +1552,37 @@ print(f"\\n{len([r for r in real if r.get('status') != 'skipped'])}/"
 """),
         md("""
 ---
+## Backfill the routing baselines
+
+`train_msc_kd` only began writing B1/B2/B10/B11 after **D-79** — before that it
+trained students correctly and never evaluated their routing, which is the
+number the method section reports. Runs finished before the fix have everything
+needed on disk, so this recovers them from the saved checkpoints instead of
+retraining: one forward pass per student, minutes rather than hours.
+
+Runs trained after the fix already carry the numbers and are skipped.
+"""),
+        code("""
+need = []
+for r in sess.completed_runs(phase=PHASE):
+    rid = r['run_id']
+    s_ = M.read_json(M.run_layout(sess.work, rid)['base'] / 'summary.json', {})
+    if s_ and s_.get('b10_msckd') is None:
+        need.append(rid)
+
+print(f'{len(need)} run(s) need routing baselines')
+for rid in need:
+    try:
+        out = M.evaluate_msckd_routing(sess, rid)
+        print(f"  ok   {rid}  B2={out['b2_confidence']}  B10={out['b10_msckd']}  "
+              f"B11={out['b11_oracle']}  closed={out['frac_b2_b11_gap_closed']}")
+    except Exception as e:
+        print(f"  FAIL {rid}: {type(e).__name__}: {e}")
+if not need:
+    print('  nothing to backfill')
+"""),
+        md("""
+---
 ## Compare at matched FLOPs
 
 The only comparison that means anything. B2 (confidence-threshold routing) is

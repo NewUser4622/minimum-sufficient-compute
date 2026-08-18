@@ -2756,3 +2756,61 @@ guessed "real". Relying on an exception that never comes is exactly how that
 happens. The `None` is now checked directly, and the self-test that caught it
 was the one asserting a bad id raises — which failed on first run, as it
 should have.
+
+---
+
+## D-79 — 18 students trained, and the number they exist to produce was never computed
+
+**All 18 MSC-KD runs completed 100 epochs correctly.** Then NB5's comparison
+table printed `None` in every result column, and `verify_run_artifacts`
+reported `0 complete, 18 resumable`.
+
+**D-79a — the reader with no writer.** `compare_routing_methods` reads
+`b1_static`, `b2_confidence`, `b10_msckd`, `b11_oracle`, `avg_flops_ratio` from
+each `summary.json`. `train_msc_kd`'s summary dict contains none of them.
+
+`evaluate_routing_methods` — whose own docstring says *"B2 vs B10 vs B11 is the
+paper's central figure … the fraction of the B2→B11 gap that B10 closes IS the
+result"* — is called from exactly one place in the library:
+**`msckd_dry_run`**. The dry run measures the paper's central quantity. The
+real run does not.
+
+That is D-55's shape again (the dry run exercised a configuration the trainer
+never used), now on the output side. And it is the fourth writer/reader
+mismatch in this log — `atomic_write_yaml` with no `read_yaml` (D-63),
+`save_analysis` with no loader (D-72), `conv_sweep` results nothing consulted
+(D-74), and now a reader whose writer was never wired. **Four, in both
+directions.** The write and the read are separate acts and I have repeatedly
+shipped one of them.
+
+**D-79b — `config_hash.txt`.** `train_backbone` writes it; `train_msc_kd` wrote
+only `config.yaml`. It is in `RUN_ARTIFACTS_REQUIRED`, so all 18 runs verified
+as incomplete on a file that costs nothing to write.
+
+**Recoverable without retraining.** Everything B1/B2/B10/B11 need comes from
+one forward pass of the saved student over the val set, and the B11 ceiling —
+the student's own post-hoc MSC — is computed from that same pass's exit
+predictions. `evaluate_msckd_routing(session, run_id)` loads `ckpt_best.pt`,
+runs it, and merges the results into `summary.json`. **Minutes per run against
+~79 GPU-hours of training already spent.** NB5 gains a backfill cell that finds
+runs missing `b10_msckd` and fills them.
+
+`train_msc_kd` now calls it at the end, so the number exists when the run
+finishes rather than being discovered missing afterwards. The failure is caught
+and logged rather than losing the run — a routing evaluation that fails should
+not discard a trained student.
+
+**Three checks, and each one earned its place.**
+
+1. Every routing column declared in `RESULT_KEYS["compare_routing_methods"]`
+   that comes from `summary.json` must have a writer in the source.
+2. `train_msc_kd` must call the evaluator.
+3. `train_msc_kd` must write `config_hash.txt`.
+
+**Checks 2 and 3 failed on correct code first.** They located the function by
+`_msckd_src.split("def train_msc_kd")[-1]` — and that string appears *in the
+check itself*, so `[-1]` returned the self-test's own source. Rewritten over
+the AST with `ast.get_source_segment`, plus a canary asserting the segment was
+actually found (23,167 chars) rather than silently empty — because an empty
+string makes `"x" in src` False and every such check fail closed, which looks
+identical to a real defect.
