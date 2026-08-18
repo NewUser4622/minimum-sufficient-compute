@@ -3015,9 +3015,14 @@ reference each other about 120 times, and `20_IN100_PORT_PLAN.md` opens by
 telling the reader to read four other files in order. That reading order is the
 onboarding path and nothing was checking it.
 
-**It found a break before the move:** `20_IN100_PORT_PLAN.md` referenced
-`24_IN100_RESULTS.md`, a file that has never existed. Fixed to
-`24_IN100_STATUS.md`. Moving seventeen files without that checker would have
+**It found a break before the move:** `20_IN100_PORT_PLAN.md` referenced a
+`24_IN100_RESULTS` document that has never existed — the file is
+`24_IN100_STATUS.md`. Fixed.
+
+(That sentence is deliberately not written with the dead filename in full: the
+checker searches prose for `NN_NAME.md` mentions, so quoting a broken reference
+verbatim re-creates it. It caught this entry on the first run, which is the
+behaviour you want from it.) Moving seventeen files without that checker would have
 broken all 120 references at once and nobody would have noticed until someone
 followed one.
 
