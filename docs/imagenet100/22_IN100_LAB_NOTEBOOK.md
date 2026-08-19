@@ -3245,3 +3245,56 @@ explicitly not supported, the strongest honest framing, and the cost of the
 three options that would strengthen it. `README.md` now leads with the science
 and `PAPER.md` carries a scope note saying it is CIFAR-only and which of its
 statements this study supersedes.
+
+---
+
+## D-86 — one dropped packet poisoned every upload after it
+
+The publish reached run 12 of 22 and then produced **two different** errors:
+
+```
+[Errno 11001] getaddrinfo failed ... Retrying in 1s [Retry 1/5].
+RuntimeError: Cannot send a request, as the client has been closed.
+```
+
+**The first is transient and handled.** DNS resolution failed for a moment;
+`huggingface_hub` retried five times, correctly.
+
+**The second is the defect.** Once those retries are exhausted, the underlying
+httpx client is closed — and it stays closed **for the life of the `HfApi`
+object**. Runs 13 through 22 then failed instantly with the same message, even
+though the network had come back. One momentary blip cost ten uploads, and none
+of the failures after the first were real.
+
+So the fix is *not* more retries — `huggingface_hub` already retries, and doing
+it again around a dead client changes nothing. It is to **rebuild the client**
+instead of reusing a corpse, and to treat a failed item as one failed item
+rather than the end of the run.
+
+**Fix.** `hf_upload_resilient(token, repo_id, repo_type, items)`:
+
+- constructs a **fresh `HfApi` per attempt** — that is the actual mechanism;
+- retries each item with linear backoff;
+- **never raises** — it returns `{"uploaded": [...], "failed": [(label, why)]}`,
+  because a publish that dies on the first error has to be babysat, and the
+  point is that it can be re-run;
+- NB6 lists what is already on the hub first, so a re-run **resumes** and
+  nothing is uploaded twice.
+
+**Verified against the exact failure sequence.** The self-test installs a stub
+`HfApi` whose third upload raises `getaddrinfo failed` *and* marks that client
+dead, so every subsequent call on it raises `Cannot send a request, as the
+client has been closed` — precisely what happened. Five assertions:
+
+1. the drop does not poison the items after it (5/5 still upload);
+2. a permanently unreachable item is reported and the rest continue;
+3. a new client is built per upload — 5 clients for 5 items;
+4. **canary**: with no failures, everything uploads exactly once;
+5. total failure returns a report rather than raising.
+
+Without (3) and (4) this would pass while quietly reusing one client, or while
+uploading nothing at all.
+
+**Your 12 uploaded runs are on the hub and are not re-sent.** The remaining 10
+plus `budgets/registry/analysis/tables/paper` and the card go on the next run
+of that cell.

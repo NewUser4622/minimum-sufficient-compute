@@ -1284,6 +1284,63 @@ def allow_network(verbose: bool = True) -> Dict[str, Any]:
     return changed
 
 
+def hf_upload_resilient(token: str, repo_id: str, repo_type: str,
+                        items: Sequence[Tuple[str, str, str]],
+                        attempts: int = 4, backoff: float = 4.0,
+                        on_event=None) -> Dict[str, Any]:
+    """Upload folders one at a time, surviving a network drop.
+
+    **D-86.** A 22-run publish reached run 12 and then:
+
+        [Errno 11001] getaddrinfo failed ... Retrying in 1s [Retry 1/5].
+        RuntimeError: Cannot send a request, as the client has been closed.
+
+    Two distinct failures. The first is a transient DNS loss, which
+    `huggingface_hub` retries correctly. The second is what happens *after*
+    those retries are exhausted: the underlying httpx client is closed, and it
+    is closed **for the life of the object**. Every later call on that `HfApi`
+    fails instantly with the same message, so one blip at run 12 poisons runs
+    13 to 22 even once the network is back.
+
+    So the fix is not more retries -- `huggingface_hub` already retries. It is
+    to **rebuild the client** rather than reuse a dead one, and to treat a
+    failed item as one failed item instead of the end of the run.
+
+    `items` is `(local_path, path_in_repo, label)`. Returns
+    `{"uploaded": [...], "failed": [(label, reason), ...]}` and never raises:
+    a publish that stops on the first error is one that has to be babysat, and
+    the whole point is that it can be re-run.
+    """
+    from huggingface_hub import HfApi
+
+    out: Dict[str, Any] = {"uploaded": [], "failed": []}
+    for local, in_repo, label in items:
+        last = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                # A FRESH client each attempt. Reusing one that has been closed
+                # is the whole defect.
+                HfApi(token=token).upload_folder(
+                    folder_path=str(local), path_in_repo=in_repo,
+                    repo_id=repo_id, repo_type=repo_type,
+                    commit_message=f"add {label}")
+                out["uploaded"].append(label)
+                if on_event:
+                    on_event("ok", label, attempt, "")
+                break
+            except Exception as e:                               # noqa: BLE001
+                last = f"{type(e).__name__}: {str(e)[:140]}"
+                if on_event:
+                    on_event("retry", label, attempt, last)
+                if attempt < attempts:
+                    time.sleep(backoff * attempt)
+        else:
+            out["failed"].append((label, last))
+            if on_event:
+                on_event("failed", label, attempts, last)
+    return out
+
+
 def hf_token_check(token: Optional[str], repo_id: str,
                    repo_type: str = "dataset") -> Dict[str, Any]:
     """Can this token write to this namespace? Asked BEFORE anything is created.
@@ -12757,6 +12814,89 @@ def _selftest() -> bool:
     check("D-79b: train_msc_kd writes config_hash.txt",
           "config_hash.txt" in _kd_src,
           "all 18 MSC-KD runs verified incomplete without it")
+
+    # -- D-86: an upload must survive a network drop, not be poisoned by it ---
+    import types as _t86
+
+    def _hub_that(behaviour):
+        """Stub HfApi. `behaviour(label, call_n)` returns None or raises."""
+        mod = _t86.ModuleType("huggingface_hub")
+        state = {"n": 0, "clients": 0}
+
+        class _Api:
+            def __init__(self, token=None):
+                state["clients"] += 1
+                self._dead = False
+            def upload_folder(self, folder_path=None, path_in_repo=None,
+                              repo_id=None, repo_type=None, commit_message=None):
+                state["n"] += 1
+                behaviour(commit_message, state["n"], self)
+        mod.HfApi = _Api
+        sys.modules["huggingface_hub"] = mod
+        return state
+
+    _prev86 = sys.modules.get("huggingface_hub")
+    try:
+        _items = [(f"/tmp/r{i}", f"runs/r{i}", f"r{i}") for i in range(1, 6)]
+
+        # 1. THE EXACT FAILURE: item 3 kills the client, and every later call
+        #    on that client raises "client has been closed" forever.
+        def _poison(label, n, api):
+            if label.endswith("r3") and not getattr(_poison, "done", False):
+                _poison.done = True
+                api._dead = True
+                raise OSError("[Errno 11001] getaddrinfo failed")
+            if api._dead:
+                raise RuntimeError("Cannot send a request, as the client has been closed.")
+        _hub_that(_poison)
+        _res = hf_upload_resilient("t", "u/r", "dataset", _items,
+                                   attempts=3, backoff=0)
+        check("D-86: a dropped connection does not poison the runs after it",
+              len(_res["uploaded"]) == 5 and not _res["failed"],
+              f"uploaded {_res['uploaded']}, failed {_res['failed']}")
+
+        # 2. a genuinely unreachable item is reported, and the rest continue
+        def _one_bad(label, n, api):
+            if label.endswith("r2"):
+                raise OSError("[Errno 11001] getaddrinfo failed")
+        _hub_that(_one_bad)
+        _res = hf_upload_resilient("t", "u/r", "dataset", _items,
+                                   attempts=2, backoff=0)
+        check("D-86: one permanently failing item does not stop the others",
+              len(_res["uploaded"]) == 4 and len(_res["failed"]) == 1
+              and _res["failed"][0][0] == "r2",
+              f"failed: {_res['failed']}")
+
+        # 3. a fresh client per attempt -- the actual mechanism
+        _st = _hub_that(lambda l, n, a: None)
+        hf_upload_resilient("t", "u/r", "dataset", _items, attempts=1, backoff=0)
+        check("D-86: a NEW client is built per upload, never reused",
+              _st["clients"] == len(_items),
+              f"{_st['clients']} clients for {len(_items)} items")
+
+        # 4. canary -- the happy path must actually upload
+        _st = _hub_that(lambda l, n, a: None)
+        _res = hf_upload_resilient("t", "u/r", "dataset", _items,
+                                   attempts=3, backoff=0)
+        check("D-86 canary: with no failures everything uploads once",
+              _res["uploaded"] == ["r1", "r2", "r3", "r4", "r5"]
+              and not _res["failed"] and _st["n"] == 5)
+
+        # 5. it must never raise -- a publish that dies must be re-runnable
+        _hub_that(lambda l, n, a: (_ for _ in ()).throw(RuntimeError("boom")))
+        _raised = False
+        try:
+            _res = hf_upload_resilient("t", "u/r", "dataset", _items,
+                                       attempts=1, backoff=0)
+        except Exception:
+            _raised = True
+        check("D-86: total failure returns a report rather than raising",
+              not _raised and len(_res["failed"]) == 5)
+    finally:
+        if _prev86 is None:
+            sys.modules.pop("huggingface_hub", None)
+        else:
+            sys.modules["huggingface_hub"] = _prev86
 
     # -- D-84: the token preflight must name the cause, not just fail ---------
     import types as _t84

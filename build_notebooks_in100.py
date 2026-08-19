@@ -1831,45 +1831,63 @@ elif DRY_RUN:
     print(f'  target: {REPO_ID} ({REPO_TYPE})')
 else:
     from huggingface_hub import HfApi, create_repo
-    api = HfApi(token=HF_TOKEN)
     create_repo(REPO_ID, token=HF_TOKEN, repo_type=REPO_TYPE,
                 private=PRIVATE, exist_ok=True)
     print(f'repo ready: {REPO_ID}')
 
+    # What is already there? Re-running must resume, not restart.
     done = set()
     try:
         _pfx = M.repo_rel_path(ROOT, ROOT / 'runs') + '/'
         done = {f[len(_pfx):].split('/')[0]
-                for f in api.list_repo_files(REPO_ID, repo_type=REPO_TYPE)
+                for f in HfApi(token=HF_TOKEN).list_repo_files(
+                    REPO_ID, repo_type=REPO_TYPE)
                 if f.startswith(_pfx)}
-    except Exception:
-        pass
-    print(f'{len(done)} run(s) already present -- they are skipped')
+    except Exception as e:
+        print(f'  could not list the repo ({type(e).__name__}) -- assuming empty')
+    print(f'{len(done)} run(s) already on the hub -- they are skipped')
 
-    run_dirs = sorted(d for d in (ROOT / 'runs').iterdir() if d.is_dir())
-    for i, d in enumerate(run_dirs, 1):
+    items = []
+    for d in sorted(x for x in (ROOT / 'runs').iterdir() if x.is_dir()):
         if d.name in done:
-            print(f'  [{i}/{len(run_dirs)}] skip {d.name} (already uploaded)')
             continue
-        api.upload_folder(folder_path=str(d),
-                          path_in_repo=M.repo_rel_path(ROOT, d),
-                          repo_id=REPO_ID, repo_type=REPO_TYPE,
-                          commit_message=f'add {d.name}')
-        print(f'  [{i}/{len(run_dirs)}] uploaded {d.name}')
-
+        items.append((str(d), M.repo_rel_path(ROOT, d), d.name))
     for rel in ('budgets', 'registry', 'analysis', 'tables', 'paper'):
         src = ROOT / rel
         if src.exists():
-            api.upload_folder(folder_path=str(src),
-                              path_in_repo=M.repo_rel_path(ROOT, src),
-                              repo_id=REPO_ID, repo_type=REPO_TYPE,
-                              commit_message=f'add {rel}')
-            print(f'  uploaded {rel}/')
+            items.append((str(src), M.repo_rel_path(ROOT, src), rel))
 
-    api.upload_file(path_or_fileobj=str(ROOT / 'README.md'),
-                    path_in_repo='README.md', repo_id=REPO_ID,
-                    repo_type=REPO_TYPE, commit_message='dataset card')
-    print(f'\\ndone -> https://huggingface.co/datasets/{REPO_ID}')
+    print(f'{len(items)} item(s) to upload')
+
+    # D-86. A network drop at item 12 of 22 closed the HTTP client, and a closed
+    # client stays closed -- every later upload failed instantly with
+    # "Cannot send a request, as the client has been closed", even after the
+    # network returned. hf_upload_resilient builds a FRESH client per attempt
+    # and treats a failed item as one failed item.
+    def _say(kind, label, attempt, why):
+        if kind == 'ok':
+            print(f'  ok      {label}' + (f'  (attempt {attempt})' if attempt > 1 else ''))
+        elif kind == 'retry':
+            print(f'  retry   {label}  attempt {attempt}: {why}')
+        else:
+            print(f'  FAILED  {label}: {why}')
+
+    res = M.hf_upload_resilient(HF_TOKEN, REPO_ID, REPO_TYPE, items,
+                                on_event=_say)
+
+    HfApi(token=HF_TOKEN).upload_file(
+        path_or_fileobj=str(ROOT / 'README.md'), path_in_repo='README.md',
+        repo_id=REPO_ID, repo_type=REPO_TYPE, commit_message='dataset card')
+
+    print()
+    print(f"uploaded {len(res['uploaded'])}, failed {len(res['failed'])}")
+    if res['failed']:
+        print('re-run THIS CELL to retry the failures -- everything already on')
+        print('the hub is skipped, so nothing is uploaded twice:')
+        for label, why in res['failed']:
+            print(f'    {label}: {why}')
+    else:
+        print(f'done -> https://huggingface.co/datasets/{REPO_ID}')
 """),
         md("""
 ---

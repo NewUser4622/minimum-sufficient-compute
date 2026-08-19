@@ -365,6 +365,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | `NameError: name 'MSC_ROOT' is not defined` (or `M`) in a notebook | the notebook was generated without `bootstrap()` / `paths_cell()` | D-82 — the build now checks every notebook for names no earlier cell defines. Rebuild. |
 | `OfflineModeIsEnabled: Cannot reach https://huggingface.co/...` in NB6 | the offline guard is set INSIDE the notebook process by the shared bootstrap; a shell `unset` cannot reach it | D-83 — NB6 calls `M.allow_network()`, which clears the env vars AND patches the `huggingface_hub` constant. Rebuild and re-run. |
 | `403 Forbidden: You don't have the rights to create a dataset under the namespace ...` | the HF token is read-only, for another account, or fine-grained without write scope -- NOT a code fault | D-84 — NB6's token check names which. Fix: huggingface.co Settings -> Access Tokens -> New token -> WRITE, `setx HF_TOKEN hf_...`, restart the kernel. |
+| Upload stops mid-way: `getaddrinfo failed` then `Cannot send a request, as the client has been closed` | a transient DNS drop exhausted the retries and permanently closed the HTTP client; every later item fails instantly | D-86 — fixed: a fresh client per attempt. Just re-run the upload cell; runs already on the hub are skipped. |
 
 ### Reading the self-test after any change
 
