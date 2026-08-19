@@ -10,14 +10,29 @@ Study 1 (`docs/cifar100/`, `docs/imagenet100/`) is complete and stays as it is.
 
 ## The one-sentence version
 
-> Per-sample difficulty scores are measured with **architecture-dependent
-> noise that essentially nobody reports**, and once you grant a router *oracle*
-> access to the true score, the headroom that motivates adaptive inference
-> **is not there**.
+> **Oracle upper bounds for per-sample adaptive inference are optimistically
+> biased, because they are computed from the same model they route.** The bias
+> is measurable, it scales with how unreliably the routing signal is measured,
+> and correcting it removes most of the headroom the field reports.
 
-Two halves. The first is a measurement the literature is missing. The second is
-a ceiling that bounds a whole family of proposed methods. Neither depends on
-MSC being a good metric — which is precisely the flaw that sank Study 1.
+An oracle ceiling asks *"if we knew each sample's true difficulty, how well
+could we route?"* — and then computes that difficulty **from the model being
+routed**. So it partly routes on that model's own noise, which no deployable
+router could have. With ≥2 seeds you can separate the two:
+
+```
+in-seed   oracle : score from seed i  ->  routes seed i's model   (optimistic)
+cross-seed oracle: score from seed j  ->  routes seed i's model   (honest)
+optimism bias    = in-seed - cross-seed              at matched FLOPs
+```
+
+**Both outcomes are publishable**, which is the point: a large bias means the
+field's upper bounds are inflated and here is the correction; a bias of zero
+validates a practice nobody had checked. Neither depends on MSC being a good
+metric — the flaw that sank Study 1.
+
+*(v1 of this proposal had two halves that could both land as nulls. That was my
+design error; see `06_RISK_REGISTER.md` §R-01.)*
 
 ---
 
@@ -52,13 +67,19 @@ than assumed.*
 
 | phase | new training | compute | what it settles |
 |---|---|---|---|
-| **P0** reliability atlas | **none** | ~2 CPU-h | ρ_seed for 8 scores × 15 architectures |
-| **P1** routing ceiling | **none** | ~6 GPU-h | oracle ceiling per score, from saved checkpoints |
-| **P2** confirmation | optional | ~12 GPU-h | a 3rd seed where Study 1 has 2 |
+| **P0** reliability atlas | **none** | ~1 h **CPU** | ρ_seed for 8 scores × 15 architectures |
+| **P1** optimism bias + honest ceiling | **none** | ~2 h **CPU** | R3, R4, R5 |
+| **P2** confirmation | optional | 12–18 GPU-h | **only if a gate opens** |
 
-**P0 and P1 need no new models.** That is the point of the design: the
-expensive part of Study 1 produced artifacts that answer a better question than
-the one they were collected for.
+**No GPU. No models loaded at all.** Every measured run's
+`per_sample/test.parquet` already carries `pred_d1..dK`, `top1p_d*`, `top2p_d*`
+and `label` — per-exit predictions for every sample. Correctness is
+`pred_dk == label`; confidence routing is a threshold on `top1p_dk`; oracle
+routing on any score is a sort; cost comes from `budgets/{arch}.json`.
+
+That single fact removes most of Study 1's failure surface: no training, no
+resume, no throughput, no `channels_last`, no CUDA asserts, no 79-hour
+commitment before a cheap check.
 
 ---
 
@@ -71,6 +92,8 @@ the one they were collected for.
 | [`03_INVENTORY.md`](03_INVENTORY.md) | exactly what data exists and what it can answer without new runs |
 | [`04_DESIGN.md`](04_DESIGN.md) | the plan, phase by phase, with costs |
 | [`05_OPEN_DECISIONS.md`](05_OPEN_DECISIONS.md) | **what needs your call before anything starts** |
+| [`06_RISK_REGISTER.md`](06_RISK_REGISTER.md) | **how this fails, and what stops it** — seven risks, each with a detector, trigger and response |
+| [`07_PROGRESS.md`](07_PROGRESS.md) | live log — newest first, updated every session |
 
 ---
 
@@ -90,14 +113,16 @@ ceiling is flat, the method is not built.
 
 ## Honest risk
 
-This study can also fail, in two specific ways, and both are worth naming now:
+Full register in [`06_RISK_REGISTER.md`](06_RISK_REGISTER.md). The short form:
 
-1. **If ρ_seed turns out uniformly high** (say all scores > 0.85 across all
-   architectures), Half 1 collapses to "the literature was fine". That is still
-   publishable as a null, but it is a much smaller paper.
-2. **If some score's oracle ceiling is substantially above confidence**, Half 2
-   inverts: it becomes "here is the signal worth routing on", which is a
-   *better* outcome scientifically but means the negative framing is wrong.
+- **The genuine failure case** is three simultaneous nulls — flat reliability,
+  zero bias, flat ceiling. Fallback: the reliability atlas itself (8 scores ×
+  15 architectures × 3 seeds) is a reusable artifact nobody has published.
+- **The one risk I cannot retire from here** is R-07: someone may already have
+  done cross-seed oracle debiasing under another name. I cannot search the
+  literature from this environment. **It costs you 30 minutes and it decides
+  whether the paper is novel — do it before P1 is written up.**
 
-Both are decided by P0 and P1, which cost about a day between them. Neither
-requires committing to a method first. That is the design.
+Everything else is detected within about a day of CPU work, before any
+commitment. Study 1 reached its equivalent decision point after three weeks and
+215 GPU-hours.

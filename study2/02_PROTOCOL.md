@@ -1,19 +1,46 @@
 # Study 2 — pre-registration
 
-**Status: DRAFT. Not yet committed to.** Once P0 runs, this file is frozen and
-every change to it is recorded with a date and a reason.
+**Status: DRAFT v2. Not yet committed to.** Once P0 runs this file is frozen and
+every change is recorded with a date and a reason.
 
-Study 1's mistake was inheriting a pre-registration across a design change
-(`01_POSTMORTEM.md` §5). This one is written for *this* experiment, and every
-threshold below has a stated justification rather than being carried over.
+**v2 changed the centrepiece.** v1 had two halves that could both land as nulls
+— R1 might come back flat, and R3 *predicted* a null by design. That is a bad
+bet, and it was my design error. See `06_RISK_REGISTER.md` §R-01.
 
 ---
 
 ## The claim
 
-> Per-sample difficulty scores are measured with architecture-dependent noise
-> that the literature does not report, and correcting for it removes the
-> headroom that motivates per-sample adaptive inference.
+> **Oracle upper bounds for per-sample adaptive inference are optimistically
+> biased, because they are computed from the same model they route.** The bias
+> is measurable, it scales with how unreliably the routing signal is measured,
+> and correcting it removes most of the headroom the field reports.
+
+This is a **positive, quantitative** result that holds whether or not the
+corrected ceiling turns out flat. That property is the whole point of v2.
+
+---
+
+## The mechanism, stated plainly
+
+An "oracle" ceiling asks: *if we knew each sample's true difficulty, how well
+could we route?* In practice the difficulty is computed **from the same trained
+model being routed**. So the oracle partly routes on that model's own noise —
+its seed-specific idiosyncrasies — which no deployable router could ever have.
+
+With ≥2 seeds of the same architecture you can separate the two:
+
+| | routing signal | what it measures |
+|---|---|---|
+| **in-seed oracle** | score from seed *i* | routes seed *i*'s model — **optimistic** |
+| **cross-seed oracle** | score from seed *j ≠ i* | routes seed *i*'s model — **honest** |
+
+```
+optimism bias  =  in-seed accuracy  −  cross-seed accuracy       (at matched FLOPs)
+```
+
+Study 1 already reported the in-seed number: B11 for MSC was **+0.00007** over
+confidence. Nobody has reported the cross-seed one, for any score.
 
 ---
 
@@ -21,121 +48,115 @@ threshold below has a stated justification rather than being carried over.
 
 Eight, all already computed per sample in every measured run:
 
-| score | source | what it is |
-|---|---|---|
-| `msp` | max softmax probability | the confidence baseline everything is compared to |
-| `margin` | top1 − top2 probability | |
-| `entropy` | predictive entropy | |
-| `ce_loss` | per-sample cross-entropy | |
-| `el2n` | Paul et al. 2021 | early-training gradient-norm proxy |
-| `forget_events` | Toneva et al. 2019 | count of correct→incorrect transitions |
-| `pred_depth` | Baldock et al. 2021 | earliest layer a k-NN probe is right |
-| `msc` | Study 1 | cost-normalised stable-sufficiency depth |
+`msp` · `margin` · `entropy` · `ce_loss` · `el2n` · `forget_events` ·
+`pred_depth` · `msc`
 
-MSC is **one column among eight**, not the subject. That is deliberate.
+MSC is **one column among eight**. That is deliberate — `01_POSTMORTEM.md` §2.
 
 ---
 
 ## R1 — How reliable is each difficulty score?
 
-**ρ_seed(score, arch)** = Spearman between the score computed from two seeds of
-the same architecture, over the same samples.
+ρ_seed(score, arch) = Spearman between the score from two seeds of the same
+architecture, over the same samples.
 
-**H1.** ρ_seed varies by **both** score and architecture, with a range of at
-least **0.15** across the score × architecture grid.
+**H1.** ρ_seed varies across the score × architecture grid by at least **0.15**.
 
-*Justification for 0.15:* Study 1 measured a 0.275 range for MSC alone
-(0.547–0.822). A threshold at roughly half that is a conservative bar for "this
-variation is real and worth reporting", chosen before seeing the other seven
-scores.
+*Justification:* Study 1 measured a 0.275 range for MSC alone (0.547–0.822).
+Half that is a conservative bar for "this variation is real", set before seeing
+the other seven scores.
 
-**Falsified if** every score sits within 0.15 of every other on every
-architecture — i.e. reliability is essentially constant, and the literature's
-practice of not reporting it is harmless.
+*If falsified:* reliability is essentially constant. R1 is reported as a null;
+**R3 is unaffected** — the optimism bias can be large even when reliability is
+uniformly high.
 
-**This is the outcome that would kill Half 1, and it is a real possibility.**
+## R2 — Does ignoring reliability distort published-style comparisons?
 
-## R2 — How much does unmeasured noise distort published-style comparisons?
+Cross-architecture agreement per score, raw and disattenuated by √(ρ_a·ρ_b).
 
-For each score, compute cross-architecture agreement **raw** and
-**disattenuated** by √(ρ_a·ρ_b).
+**H2.** The median correction exceeds **0.10** for at least one score, **and**
+the ranking of architecture pairs changes under correction.
 
-**H2.** The median raw-to-disattenuated correction exceeds **0.10** for at
-least one score, and the *ranking* of architecture pairs by agreement changes
-under correction.
+*Justification:* a correction that preserves rank order is cosmetic. A rank
+change means published orderings may be artifacts of unequal precision.
 
-*Justification:* a correction smaller than 0.10 that preserves rank order would
-mean the omission is cosmetic. A rank change means published orderings could be
-artifacts of unequal measurement precision — which is the claim with teeth.
+## R3 — How optimistic is the in-seed oracle? **(the centrepiece)**
 
-## R3 — What is the oracle ceiling for routing on each score? (the gate)
+For every architecture, every score, every ordered seed pair (i, j), at matched
+average FLOPs.
 
-For each score *s*, route each sample to the cheapest exit using the **true**
-value of *s* for that sample, and measure accuracy at matched average FLOPs
-against `msp` thresholding.
+**H3.** The median optimism bias across scores and architectures is
+**≥ 0.5 accuracy points**, and is **> 0 for at least 6 of the 8 scores**.
 
-**H3.** No score's oracle exceeds `msp` by more than **1.0 accuracy point** at
-matched FLOPs.
+*Justification for 0.5:* half the +1.0 point effect size that Study 1
+pre-registered for a *method*. If oracle bounds are inflated by half of what a
+method is expected to gain, every such bound in the literature is materially
+wrong. The 6-of-8 clause stops one outlier score carrying the claim.
 
-*Justification:* 1.0 point is the effect size Study 1's H5 pre-registered for
-MSC-KD, so using it keeps the two studies commensurable. Study 1 measured
-+0.00007 for MSC's oracle — four orders of magnitude below it.
+*If falsified* (bias ≈ 0 everywhere): in-seed oracles are honest, the field's
+upper bounds stand, and **that is itself a useful, reportable methods result** —
+it licenses a practice nobody had validated.
 
-**This hypothesis predicts a null, on purpose.** It is a bound, and it is the
-**gate for P2**:
+**This hypothesis cannot land as "nothing to report" in either direction.**
 
-> If **no** score clears +1.0 point, no routing method is built. The result is
-> the ceiling itself.
->
-> If **some** score clears it, that score becomes the subject and the study
-> pivots from a bound to a method — a better outcome, and one this design
-> detects for ~6 GPU-hours instead of 79.
+## R4 — Does the bias follow reliability?
 
-## R4 — Does reliability explain the ceiling?
+**H4.** Across the score × architecture grid, optimism bias correlates with
+(1 − ρ_seed) at Spearman **≥ 0.5**.
 
-**H4.** Across scores, ρ_seed correlates with oracle-ceiling headroom at
-Spearman **≥ 0.5**.
+*Justification:* the mechanism predicts it — a less reliably measured score has
+more seed-specific noise for an in-seed oracle to exploit. Confirming it turns
+two observations into one mechanism, and gives a **cheap predictor**: measure
+ρ_seed (minutes, no model) and you can estimate how inflated a published oracle
+bound is without recomputing it.
 
-If true, "difficulty routing does not help" and "difficulty is measured
-noisily" are the same fact, which is a tighter story than two separate
-observations. If false, they are independent limitations and both must be
-reported.
+*Caveat, stated now:* n = 8 scores. This is suggestive, never conclusive, and
+will be reported as such with the full scatter, not just the coefficient.
 
-*Justification for 0.5:* with eight scores, |ρ| ≥ 0.5 is roughly the point at
-which a monotone relationship is visible above sampling noise at n=8. It is
-deliberately modest — with n=8 this is suggestive, never conclusive, and will
-be reported as such.
+## R5 — After correction, is there any headroom left?
+
+**H5.** No score's **cross-seed** oracle exceeds `msp` thresholding by more than
+**1.0 accuracy point** at matched FLOPs.
+
+*Justification:* 1.0 point is Study 1's H5 bar, kept so the two studies are
+commensurable.
+
+**This is the gate for any method work.** If some score clears it, that score
+becomes the subject and the protocol is amended in writing. If none does, the
+bound is the result and no method is built.
 
 ---
 
 ## Stopping rules
 
-Written down now so they are not negotiated later against a result.
+Written before any result exists.
 
-1. **After P0**, if H1 is falsified, Half 1 is reported as a null and the study
-   continues on Half 2 alone. It does not get re-cut to find a positive.
-2. **After P1**, if H3 holds (no score clears +1.0), **P2 is not run.** The
-   paper is the ceiling.
-3. **After P1**, if a score clears +1.0, P2 is run *for that score only*, and
-   the pre-registration is amended in writing with the date and the reason.
-4. **n = 3 seeds minimum** for any ρ_seed reported as a headline number. Study 1's
-   ImageNet arm has 2, so ImageNet ρ_seed values are reported as
-   **point estimates without error bars** and are never used for a family-level
-   claim.
+1. **After P0**: if H1 is falsified, R1 is reported as a null. It is not re-cut
+   looking for a positive, and R3 continues regardless.
+2. **After P1**: if H5 holds, **no method is built.** The corrected ceiling is
+   the paper.
+3. **If H5 fails** for some score: amend this file with the date and reason,
+   then scope any method to that score at that operating point.
+4. **≥ 3 seeds** for any headline ρ_seed or bias. CIFAR-100 has 3.
+   ImageNet-100 has 2, so ImageNet numbers are **point estimates without error
+   bars** and never carry a family-level claim.
+5. Any ratio whose denominator is within 2 SE of zero is reported as
+   **"within noise"**, never as a ratio. (Study 1 published `26.0`, `−47.9` and
+   `83.6` by dividing by 0.00007 — D-80.)
 
 ## What would make this study wrong
 
-- ρ_seed is high and flat for all eight scores → H1 falsified, Half 1 is a null.
-- Some oracle clears +1.0 comfortably → H3 falsified, the framing inverts.
-- The eight scores are so correlated that they are one score → R1–R4 collapse to
-  a statement about one quantity. **Checked in P0 before anything else**, by
-  reporting the score × score correlation matrix.
+- **The eight scores are near-collinear** → R1–R5 collapse to a statement about
+  one quantity. **Checked first, in P0, before anything else is computed.**
+- **Bias ≈ 0 everywhere** → H3 falsified; reported as a positive validation of
+  existing practice.
+- **ρ_seed flat AND bias ≈ 0** → both halves null. This is the genuine failure
+  case; `06_RISK_REGISTER.md` §R-01 gives the fallback.
 
 ## Deliberately not claimed
 
 - **Nothing about scale.** CIFAR-100 and ImageNet-100 share no architecture
-  (`01_POSTMORTEM.md` §4). Any cross-dataset statement is confounded and is out
-  of scope unless P2 adds a shared architecture.
-- **Nothing about which score is "best"** for anything other than routing at
-  the operating points measured.
+  (`01_POSTMORTEM.md` §4).
+- **Nothing about which score is best** outside routing at the measured
+  operating points.
 - **No claim that MSC is or is not a good metric.** It is one column.

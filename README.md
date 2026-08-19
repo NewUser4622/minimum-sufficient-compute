@@ -57,6 +57,7 @@ It scores all five pre-registered hypotheses against **both** studies.
 │                               reimplemented.
 ├── build_notebooks.py          generates notebooks/       (CIFAR-100, 14)
 ├── build_notebooks_in100.py    generates notebooks_in100/ (ImageNet-100, 6)
+├── build_notebooks_study2.py   generates notebooks_study2/ (Study 2, 3)
 ├── notebooks/                  GENERATED -- do not edit
 ├── notebooks_in100/            GENERATED -- do not edit
 ├── tools/
@@ -73,8 +74,9 @@ It scores all five pre-registered hypotheses against **both** studies.
 ├── docs/cifar100/              00-10  protocol, spec, schema, results
 ├── docs/imagenet100/           20-26  port plan, delta, lab notebook, status,
 │                                      data card, FINDINGS
+├── notebooks_study2/           GENERATED -- CPU re-analysis, no GPU
 ├── study2/                     PROPOSAL -- postmortem, protocol, inventory,
-│                               design, open decisions
+│                               design, decisions, RISK REGISTER, progress
 └── PAPER.md
 ```
 
