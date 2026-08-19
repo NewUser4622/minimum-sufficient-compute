@@ -10,7 +10,7 @@ live in this repository:
 | study | dataset | scale | architectures | status |
 |---|---|---|---|---|
 | **CIFAR-100** | 50k @ 32px | small | 14 | complete — [`docs/cifar100/10_FINAL_RESULTS.md`](docs/cifar100/10_FINAL_RESULTS.md) |
-| **ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/24_IN100_STATUS.md`](docs/imagenet100/24_IN100_STATUS.md) |
+| **ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
 
 ---
 
@@ -36,7 +36,7 @@ It scores all five pre-registered hypotheses against **both** studies.
 3. [`docs/cifar100/07_REPLICATION_PLAYBOOK.md`](docs/cifar100/07_REPLICATION_PLAYBOOK.md)
 4. [`docs/cifar100/00_RESEARCH_PROTOCOL.md`](docs/cifar100/00_RESEARCH_PROTOCOL.md)
 5. [`docs/imagenet100/22_IN100_LAB_NOTEBOOK.md`](docs/imagenet100/22_IN100_LAB_NOTEBOOK.md)
-   — defects D-37…D-81 from the ImageNet port.
+   — defects D-37…D-85 from the ImageNet port.
 
 ---
 
@@ -49,7 +49,7 @@ It scores all five pre-registered hypotheses against **both** studies.
 │                               every statistic in the paper. Imported, never
 │                               reimplemented.
 ├── build_notebooks.py          generates notebooks/       (CIFAR-100, 14)
-├── build_notebooks_in100.py    generates notebooks_in100/ (ImageNet-100, 5)
+├── build_notebooks_in100.py    generates notebooks_in100/ (ImageNet-100, 6)
 ├── notebooks/                  GENERATED -- do not edit
 ├── notebooks_in100/            GENERATED -- do not edit
 ├── tools/
@@ -64,7 +64,8 @@ It scores all five pre-registered hypotheses against **both** studies.
 │   └── pack_imagenet100.py     JPEG tree -> uint8 memmap
 ├── benchmark/                  throughput measurements + their JSON
 ├── docs/cifar100/              00-10  protocol, spec, schema, results
-├── docs/imagenet100/           20-25  port plan, delta, lab notebook, status
+├── docs/imagenet100/           20-26  port plan, delta, lab notebook, status,
+│                                      data card, FINDINGS
 └── PAPER.md
 ```
 
@@ -84,7 +85,7 @@ arity, or a stage predicate that would skip the work it was asked to do.
 ## Verifying a checkout
 
 ```bash
-python src/msc_lib.py --selftest      # 445 checks, each with a canary
+python src/msc_lib.py --selftest      # 454 checks, each with a canary
 python tools/check_names.py           # no NameErrors waiting in a branch
 python tools/check_links.py           # every doc reference resolves
 python build_notebooks_in100.py       # regenerate + all six validation layers
@@ -99,7 +100,7 @@ cannot fail is [D-37](docs/imagenet100/22_IN100_LAB_NOTEBOOK.md).
 ## Running the ImageNet-100 pipeline
 
 ```
-NB1_Setup  →  NB2_Train  →  NB3_Measure  →  NB4_Analysis  →  NB5_Method
+NB1_Setup  →  NB2_Train  →  NB3_Measure  →  NB4_Analysis  →  NB5_Method  →  NB6_Publish
 ```
 
 Full instructions, including the close-without-saving step that Jupyter makes
