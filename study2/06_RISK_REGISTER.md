@@ -53,13 +53,18 @@ as a resource paper even if every hypothesis fails — nobody has published one.
 
 **Detector:** P0 + P1. **Trigger:** ~1 day in. **Not** three weeks in.
 
-## R-02 · The eight scores are the same thing · **MEDIUM**
+## R-02 · The eight scores are the same thing · **HIGH** (escalated)
 
 If `msp`, `margin`, `entropy` and `ce_loss` are near-collinear (they are all
 functions of the softmax), the "8 scores" framing overstates the coverage.
 
+**Escalated from MEDIUM after the literature search.** A curriculum-learning
+survey reports that difficulty scoring functions agree **>70% in all but one
+case** (`08_RELATED_WORK.md` §6). This is now the most likely way the study is
+weakened.
+
 **Detector:** score × score Spearman matrix, **computed first in P0, before
-anything else.**
+anything else** — now a decision point, not a sanity check.
 **Trigger:** immediately.
 **Response:** report the correlation matrix openly, group the scores into
 families (softmax-derived / training-dynamics / structural), and state the
@@ -123,19 +128,32 @@ Plus two rules Study 1 paid for:
 2. **Compute the cheap check before the expensive one.** Encoded as the phase
    gates.
 
-## R-07 · Someone has already done this · **UNKNOWN — the real unknown**
+## R-07 · Someone has already done this · **PARTIALLY RETIRED**
 
-I cannot search the literature from this environment. Cross-seed oracle
-debiasing for early-exit routing may exist under another name.
+I said I could not search from this environment. That was wrong — I had web
+search and asked the user to do it instead. Done: `08_RELATED_WORK.md`.
 
-**Detector:** you, or a supervisor, with 30 minutes and a search engine.
-**Trigger:** **before P1 is written up.**
-**Suggested searches:** *"oracle upper bound" early exit optimistic bias* ·
-*noise ceiling example difficulty* · *seed reliability per-sample difficulty* ·
-*adaptive inference oracle ceiling*.
+**What the search settled.** Every *ingredient* exists and is citable: oracle
+early-exit bounds are standard and same-model by construction; "oracle selection
+is positively biased" is an established statistical principle; noise ceilings
+and disattenuation are routine in computational neuroscience; EL2N's seed
+instability is known; cross-architecture difficulty agreement is published
+uncorrected.
 
-**This is the one risk I cannot retire myself, and it is the one that decides
-whether the paper is novel.** It costs half an hour and should happen early.
+**What it did not find:** a second training seed used to debias a per-sample
+routing oracle, the bias quantified per score and per architecture, or the bias
+related to measured reliability.
+
+**Residual risk.** Four queries on US-indexed web search, no citation graph, no
+paywalled venues. **Weak evidence of absence.**
+**Trigger:** before submission, not before P0.
+**Response:** a proper pass — forward citations from Baldock et al., and the
+[Early-Exit DNN survey](https://dl.acm.org/doi/10.1145/3698767), which is where
+a prior version of this would be catalogued.
+
+**Consequence for the framing:** reliability can no longer lead, because seed
+noise in these scores is already known qualitatively. The optimism bias leads;
+reliability is the instrument. D1 and D3 changed accordingly.
 
 ---
 

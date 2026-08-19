@@ -38,7 +38,9 @@ design error; see `06_RISK_REGISTER.md` §R-01.)*
 
 ## Why this is worth doing
 
-**Half 1 — the noise ceiling nobody reports.**
+**Half 1 — reliability, as the instrument.**
+*(Reframed after the literature check: seed noise in these scores is already
+known qualitatively, so it cannot lead. It is what makes Half 2 measurable.)*
 Study 1 measured ρ_seed (agreement between two seeds of the same architecture)
 for MSC and found it ranges **0.547 → 0.822** depending on architecture. The
 example-difficulty literature — EL2N, forgetting events, C-score, prediction
@@ -94,6 +96,7 @@ commitment before a cheap check.
 | [`05_OPEN_DECISIONS.md`](05_OPEN_DECISIONS.md) | **what needs your call before anything starts** |
 | [`06_RISK_REGISTER.md`](06_RISK_REGISTER.md) | **how this fails, and what stops it** — seven risks, each with a detector, trigger and response |
 | [`07_PROGRESS.md`](07_PROGRESS.md) | live log — newest first, updated every session |
+| [`08_RELATED_WORK.md`](08_RELATED_WORK.md) | **what already exists and where the gap is** — the literature check, done |
 
 ---
 
@@ -118,10 +121,16 @@ Full register in [`06_RISK_REGISTER.md`](06_RISK_REGISTER.md). The short form:
 - **The genuine failure case** is three simultaneous nulls — flat reliability,
   zero bias, flat ceiling. Fallback: the reliability atlas itself (8 scores ×
   15 architectures × 3 seeds) is a reusable artifact nobody has published.
-- **The one risk I cannot retire from here** is R-07: someone may already have
-  done cross-seed oracle debiasing under another name. I cannot search the
-  literature from this environment. **It costs you 30 minutes and it decides
-  whether the paper is novel — do it before P1 is written up.**
+- **The literature check is done** (`08_RELATED_WORK.md`). Every *ingredient*
+  exists and is citable — oracle early-exit bounds are standard and same-model
+  by construction, "oracle selection is positively biased" is established,
+  noise ceilings are routine in computational neuroscience, EL2N's seed noise is
+  known. **What was not found**: a second seed used to debias a per-sample
+  routing oracle. The novelty is the combination and the measurement.
+- **The search made one risk worse.** Difficulty scoring functions are reported
+  to agree **>70% with each other**, so the eight scores may be three or four
+  families. R-02 is escalated to HIGH and P0a is now a decision point, not a
+  sanity check.
 
 Everything else is detected within about a day of CPU work, before any
 commitment. Study 1 reached its equivalent decision point after three weeks and

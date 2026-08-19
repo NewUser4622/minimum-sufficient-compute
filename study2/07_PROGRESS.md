@@ -18,9 +18,46 @@ next. Updated every session.
 | **P1b** | honest ceiling → the gate | ~1 h CPU | ready — `S2_NB2` |
 | **P2** | confirmation runs | 12–18 GPU-h | **opt-in**, only if a gate opens |
 
-**Blocking:** nothing technical. Two things need you —
-`05_OPEN_DECISIONS.md` (five calls) and `06_RISK_REGISTER.md` §R-07 (30 minutes
-of literature search, the one risk I cannot retire).
+**Blocking: nothing.** The five decisions are settled (`05_OPEN_DECISIONS.md`)
+and the literature check is done (`08_RELATED_WORK.md`). Next action is running
+`S2_NB0_Fetch`, then `S2_NB1` as far as the P0a collinearity output.
+
+---
+
+## 2026-08-19 (later) · literature checked, decisions made
+
+**I had web search the whole time and asked the user to do it instead.** Wrong
+call; corrected. Four searches, ~30 minutes, written up in `08_RELATED_WORK.md`.
+
+**What it settled.** Every ingredient of the idea exists and is citable:
+
+- oracle early-exit bounds are **standard practice and same-model by
+  construction** — so the target is real, not a straw man;
+- "oracle selection over noisy estimates is positively biased" is an
+  **established statistical principle**;
+- noise ceilings and disattenuation are **routine in computational
+  neuroscience** (Spearman-Brown, noise-ceiling-corrected Spearman) and absent
+  from the difficulty literature — a clean, citable framing;
+- EL2N's run-to-run instability is **already known qualitatively**;
+- cross-architecture difficulty agreement is **published uncorrected**
+  (Baldock et al.).
+
+**Not found:** a second training seed used to debias a per-sample routing
+oracle, the bias quantified per score and architecture, or the bias tied to
+measured reliability. The novelty is the **combination and the measurement**.
+
+**Two consequences, one of them bad.**
+
+1. **Reliability can no longer lead.** Seed noise is known; the optimism bias
+   leads and reliability becomes the instrument. D1 and D3 changed.
+2. **R-02 escalated to HIGH.** One survey reports difficulty scoring functions
+   agree **>70% with each other in all but one case**. Our eight scores may be
+   three or four families. **P0a is now a decision point, not a sanity check.**
+
+**Decisions settled** (all five, in `05_OPEN_DECISIONS.md`): optimism-bias
+framing · MSC as one of eight · **CIFAR-only main result** (ImageNet's 2 seeds
+cannot support a cross-seed estimate — one paragraph, not an appendix) ·
+keep +1.0 with the noise floor always reported · keep Study 1 and cite it.
 
 ---
 
