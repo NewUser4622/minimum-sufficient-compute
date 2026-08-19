@@ -9,8 +9,15 @@ live in this repository:
 
 | study | dataset | scale | architectures | status |
 |---|---|---|---|---|
-| **CIFAR-100** | 50k @ 32px | small | 14 | complete — [`docs/cifar100/10_FINAL_RESULTS.md`](docs/cifar100/10_FINAL_RESULTS.md) |
-| **ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
+| **Study 1 · CIFAR-100** | 50k @ 32px | small | 15 | complete — [`docs/cifar100/10_FINAL_RESULTS.md`](docs/cifar100/10_FINAL_RESULTS.md) |
+| **Study 1 · ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
+| **Study 2** | both, re-analysed | — | 15 + 2 | **proposal** — [`study2/README.md`](study2/README.md) |
+
+**Study 2 is a design, not a result.** It reuses Study 1's 49 measured runs to
+ask a question that does not depend on MSC being a good metric, and it is built
+so the cheap measurements gate the expensive ones. Start at
+[`study2/README.md`](study2/README.md); the decisions it needs are in
+[`study2/05_OPEN_DECISIONS.md`](study2/05_OPEN_DECISIONS.md).
 
 ---
 
@@ -66,6 +73,8 @@ It scores all five pre-registered hypotheses against **both** studies.
 ├── docs/cifar100/              00-10  protocol, spec, schema, results
 ├── docs/imagenet100/           20-26  port plan, delta, lab notebook, status,
 │                                      data card, FINDINGS
+├── study2/                     PROPOSAL -- postmortem, protocol, inventory,
+│                               design, open decisions
 └── PAPER.md
 ```
 
