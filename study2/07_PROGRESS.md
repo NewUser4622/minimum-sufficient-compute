@@ -3,7 +3,8 @@
 Newest first. Every entry: what changed, what it cost, what it settled, what is
 next. Updated every session.
 
-**Current state: notebooks built, nothing run.**
+**Current state: P0 run once, three defects found and fixed, R1 has a
+provisional answer that needs one re-run.**
 
 ---
 
@@ -11,16 +12,128 @@ next. Updated every session.
 
 | phase | what | cost | status |
 |---|---|---|---|
-| **P-1** | verify the inventory against the artifacts | minutes | ready — `S2_NB1` cell 3 |
-| **P0a** | collinearity — are 8 scores really 8? | minutes | ready — `S2_NB1` |
-| **P0b** | reliability atlas, 8 scores × 15 archs | ~1 h CPU | ready — `S2_NB1` |
-| **P1** | optimism bias (**centrepiece**) | ~1 h CPU | ready — `S2_NB2` |
+| **P-1** | verify the inventory against the artifacts | minutes | **done — the inventory was wrong** |
+| **P0a** | collinearity — are 8 scores really 8? | minutes | **fixed after a false pass; re-run needed** |
+| **P0b** | reliability atlas | ~1 h CPU | **result obtained; re-run for the CIFAR-only cut** |
+| **P1** | optimism bias (**centrepiece**) | ~1 h CPU | ready — `S2_NB2`, crash fixed |
 | **P1b** | honest ceiling → the gate | ~1 h CPU | ready — `S2_NB2` |
 | **P2** | confirmation runs | 12–18 GPU-h | **opt-in**, only if a gate opens |
 
-**Blocking: nothing.** The five decisions are settled (`05_OPEN_DECISIONS.md`)
-and the literature check is done (`08_RELATED_WORK.md`). Next action is running
-`S2_NB0_Fetch`, then `S2_NB1` as far as the P0a collinearity output.
+**Next action: re-run `S2_NB1`, then `S2_NB2`.**
+
+---
+
+## 2026-08-19 (evening) · first run — one result, three defects
+
+`S2_NB0_Fetch` succeeded. `S2_NB1` ran after you removed `msc` from `SCORES`
+yourself. `S2_NB2` crashed. All three problems trace to the same root: **I wrote
+what the data should contain instead of asking it.**
+
+### R1 — the reliability atlas has an answer, and it is a strong one
+
+```
+grid range  0.667      (H1 threshold 0.15)          H1: SUPPORTED
+```
+
+ρ_seed spans **0.207 → 0.874**. The threshold was 0.15; the observed range is
+more than four times it. The structure is not noise:
+
+| arch | ce_loss | entropy | margin | msp | pred_depth |
+|---|---|---|---|---|---|
+| **mixer_nano** | 0.647 | **0.207** | 0.245 | 0.217 | 0.432 |
+| **vit_tiny** | 0.673 | 0.283 | 0.310 | 0.289 | 0.464 |
+| mobilenetv2 | 0.874 | 0.830 | 0.752 | 0.791 | 0.614 |
+| resnet8x4 | 0.870 | 0.829 | 0.770 | 0.797 | 0.599 |
+
+Two readings, both useful:
+
+1. **The two non-CNNs are the least reliable on every softmax-derived score**,
+   and by a wide margin — entropy on `mixer_nano` is 0.207 against 0.83 for the
+   CNNs. This *replicates Study 1's ViT/Mixer finding across five scores rather
+   than one*, which is much harder to dismiss as an MSC artifact.
+2. **The effect is score-dependent.** `ce_loss` stays high everywhere (0.647
+   even on `mixer_nano`) while `entropy` collapses; `pred_depth` is the most
+   architecture-stable (range 0.308). So "difficulty is noisy" is too coarse —
+   *which* difficulty, on *which* architecture.
+
+**Provisional.** That grid mixed the 2 ImageNet architectures into the CIFAR
+result, against decision D3, and used 5 scores because two silently vanished.
+The direction will not change; the exact range must be recomputed.
+
+### Defect 1 — `S2_NB2` crashed: budgets asked the wrong zoo
+
+```
+ValueError: 'convnext_femto' belongs to the 'cifar' zoo but dataset
+'imagenet100' needs the 'imagenet' zoo.
+```
+
+`S2_NB1`/`S2_NB2` build their Session from `paths_cell(phase="p1")`, reused from
+the ImageNet-100 generator, which hardcodes `dataset='imagenet100'`. The corpus
+is **mixed** — 15 CIFAR architectures and 2 ImageNet ones — so a budget belongs
+to the **run**, not to the session. `rho_for(arch)` is now `rho_for(arch,
+dataset)`, keyed on the pair, and every grouping carries `dataset` through.
+
+This is rule 4 charging interest: one accessor was reused across two studies
+that do not share a dataset.
+
+### Defect 2 — P0a was a false pass, and that is the serious one
+
+```
+|Spearman| between scores, run p0-resnet32x4-...  (n=0)
+[all-NaN 7x7 matrix]
+no pair exceeds |rho| = 0.9 -- the scores carry distinct information
+```
+
+It printed **n=0**, an all-NaN matrix, and then a reassuring conclusion. The mask
+`ok = ~np.isnan(X).any(axis=1)` is *listwise*: one all-NaN column drops every
+row. `el2n` and `forget_events` are all-NaN on the test split, so nothing
+survived — and the cell reported success from zero samples.
+
+This is the D-37 shape, the exact failure `06_RISK_REGISTER.md` §R-06 says every
+new statistic must be canaried against, and I shipped it in the cell the risk
+register calls the study's first decision point.
+
+Now: pairwise-complete correlation, per-score coverage printed first, and an
+explicit **refusal** when there is nothing to conclude from.
+`tools/s2_canaries.py` proves all three checks can fail — canary A caught a
+second bug in my own fix (a `KeyError` instead of a clean refusal when only one
+score survives).
+
+### Defect 3 — two scores vanished without a word
+
+The atlas reported 5 scores. It should have said it was dropping 2. Skipped
+`(split, arch, score)` cells are now counted and listed.
+
+### What the data actually contains — `03_INVENTORY.md` was wrong
+
+| score | `test.parquet` | `train_holdout.parquet` |
+|---|---|---|
+| `msp`, `margin`, `entropy`, `ce_loss`, `pred_depth` | populated | populated |
+| `el2n`, `forget_events` | column exists, **all NaN** | **populated** |
+| `msc` | **absent** | **absent** |
+
+I sourced "eight scores" from a summary CSV instead of a parquet. You hit it
+first and fixed it by hand.
+
+**But the recovery is better than the original plan.** `el2n` and
+`forget_events` are not lost — they are real on `train_holdout`, so the atlas now
+runs on **both splits**: 5 scores on `test`, **7** on `train_holdout`. And the
+constraint is itself a finding worth stating in the paper: *two of the eight
+candidate difficulty signals cannot route unseen samples at all*, because a test
+sample has no training history. That is a limit on the whole method family, not
+a limitation of ours.
+
+### Verification, given that I cannot read a parquet here
+
+My sandbox has no `pyarrow` and no `scipy`, so parquet code has always shipped
+unexecuted — the structural gap behind D-70, D-76, D-77 and D-79c. What I did
+instead:
+
+- read the parquet **footer bytes directly** to confirm `msc` is absent and the
+  other seven are present in all three files;
+- `tools/s2_cell_harness.py` — executes `S2_NB1`'s **real cells** against
+  synthetic frames reproducing the on-disk shape (all-NaN train scores on test);
+- `tools/s2_canaries.py` — 3/3 pass, and canary A found a bug in the fix.
 
 ---
 

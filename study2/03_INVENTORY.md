@@ -20,16 +20,43 @@ MLP-Mixer. **13 convolutional, 2 not** — the split R1 needs.
 
 ## Per-sample scores
 
-Every measured run has `per_sample/test.parquet` and
-`per_sample/train_holdout.parquet` carrying **all eight scores per sample**:
+> ### ⚠ CORRECTED 2026-08-19 — this section was wrong, and wrong in the exact
+> ### way this file was written to prevent
+>
+> The original text claimed **eight scores on both splits**, sourced from
+> `analysis/q4_irreducibility_all.csv` — a *summary* file — rather than from a
+> parquet. It shipped as an unverified claim and it cost a notebook failure and
+> a false pass. What the files actually contain:
 
-```
-msp   margin   entropy   ce_loss   el2n   forget_events   pred_depth   msc
-```
+| score | `test.parquet` | `train_holdout.parquet` |
+|---|---|---|
+| `msp`, `margin`, `entropy`, `ce_loss`, `pred_depth` | **populated** | **populated** |
+| `el2n`, `forget_events` | column exists, **entirely NaN** | **populated** |
+| `msc` | **not a column at all** | **not a column at all** |
 
-Confirmed from `analysis/q4_irreducibility_all.csv`: `n_battery_scores = 7`,
-`battery = msp,margin,entropy,ce_loss,el2n,forget_events,pred_depth`, plus `msc`
-as the eighth.
+Three consequences, none of them cosmetic:
+
+1. **`msc` is derived, never persisted.** It has to be recomputed from
+   `pred_d*` / `top1p_d*` / `top2p_d*` if it is wanted. Decision **D2** (MSC as
+   one of eight) therefore costs work rather than being free.
+2. **`el2n` and `forget_events` are training-set quantities.** A test sample has
+   no training history, so the columns are NaN there by construction. They are
+   real on `train_holdout.parquet`.
+3. **Only 5 scores can route unseen data.** This is a finding, not an
+   inconvenience: two of the eight candidate signals are *unusable as routing
+   signals on unseen samples by construction*, whatever their reliability.
+
+So the grids are:
+
+| grid | split | scores | used for |
+|---|---|---|---|
+| routing / optimism bias (NB2) | `test` | **5** | R3, R4, R5 — the centrepiece |
+| reliability atlas (NB1) | `test` **and** `train_holdout` | 5 and **7** | R1, R2 |
+
+**How this was caught, and how it is prevented.** It was *not* caught by
+reading. `S2_NB1` cell 4 now probes every split and prints what it found;
+`tools/s2_canaries.py` proves the check can fail. The verification snippet at
+the end of this file was correct in spirit and I did not run it.
 
 **`sample_idx` is a global pack index**, not a position within a split. This is
 why 49 runs can be joined directly — and it is a Study 1 design decision (D-49)
@@ -84,20 +111,34 @@ It also means a negative result costs a day. That is the property worth having.
 
 ## Verifying this inventory before trusting it
 
-Run before P0 — do not take this file's word for it:
+**This section already existed, was correct, and I did not run it.** That is the
+whole defect. A verification snippet nobody executes is a comment, not a
+mechanism (rule 7).
+
+It is no longer optional: `S2_NB1` cell 4 performs this probe on every split and
+refuses to continue if nothing usable survives. To check by hand:
 
 ```python
-import msc_lib as M, pandas as pd
-sess = M.Session(account='local', phase='p1', dataset='cifar100', work_root=MSC_ROOT)
-runs = [r['run_id'] for r in sess.completed_runs(phase='p1') if sess.measured(r['run_id'])]
-print(len(runs), 'measured runs')
-
-df = pd.read_parquet(M.run_layout(sess.work, runs[0])['per_sample'] / 'test.parquet')
-need = {'msp','margin','entropy','ce_loss','el2n','forget_events','pred_depth','msc'}
-print('missing columns:', need - set(df.columns))   # must be empty
-print('sample_idx is global:', df['sample_idx'].max(), 'vs rows', len(df))
+import pandas as pd
+from pathlib import Path
+run = sorted((Path(MSC_ROOT) / 'runs').iterdir())[0]
+want = ['msp','margin','entropy','ce_loss','el2n','forget_events','pred_depth','msc']
+for split in ['test', 'train_holdout']:
+    d = pd.read_parquet(run / 'per_sample' / f'{split}.parquet')
+    absent = [c for c in want if c not in d.columns]
+    allnan = [c for c in want if c in d.columns and d[c].notna().mean() <= 0.5]
+    print(f'{split:14s} usable={len([c for c in want if c not in absent + allnan])}'
+          f'  absent={absent}  all-NaN={allnan}')
 ```
 
-If `missing columns` is non-empty, P0's scope shrinks to whatever is present and
-this file is wrong — which is exactly the kind of assumption Study 1 kept making
-without checking.
+Expected, as of the correction above:
+
+```
+test           usable=5  absent=['msc']  all-NaN=['el2n', 'forget_events']
+train_holdout  usable=7  absent=['msc']  all-NaN=[]
+```
+
+**Presence is not enough — check for all-NaN too.** The original snippet tested
+only `need - set(df.columns)`, which `el2n` and `forget_events` pass on the test
+split while carrying no data. That is precisely how they vanished from the first
+atlas without a word.
