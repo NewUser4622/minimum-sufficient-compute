@@ -3204,3 +3204,44 @@ This is the discipline the torch-side defects (D-70, D-76, D-77, D-79c) needed
 and did not get: the environment here has no network, so the decidable part —
 what to do with each `whoami` response — was pushed into a pure function and
 exercised against every case that matters.
+
+---
+
+## D-85 — three hypotheses had results and no verdict, and I mis-scored a fourth
+
+Documentation audit, prompted by "are we clear on what is what".
+
+**The gap.** Five hypotheses were pre-registered in
+`docs/cifar100/00_RESEARCH_PROTOCOL.md`. The ImageNet-100 numbers existed in
+`analysis/*.csv` and were quoted in `24_IN100_STATUS.md`, but **no document
+scored them against the predictions**. H2, H3 and H5 had measured outcomes and
+no recorded verdict. `PAPER.md` contains zero mentions of ImageNet.
+
+A result that is not scored against its own pre-registration is not a
+pre-registered result. That is the whole point of registering it.
+
+**And I mis-scored H4.** I reported it repeatedly as "partial ρ 0.282 misses
+the 0.30 gate" while treating ΔR² = 0.0411 as the passing half. H4 requires
+**both** ΔR² ≥ 0.05 **and** partial ρ ≥ 0.30. ΔR² 0.0411 is also below its bar.
+Both criteria miss. Corrected in `24_IN100_STATUS.md` and scored correctly in
+the new findings document.
+
+**What the audit turned up that is genuinely good news.**
+`docs/cifar100/10_FINAL_RESULTS.md` §6 names B11 — the oracle ceiling — as the
+CIFAR study's *"one substantive gap remaining"*, tracked as **O-21**, because
+computing it needs a measurement pass over the `p3` students that was never
+done. **This study computed it, for all 18.** That reframes the Q5 negative
+entirely: without B11 the result is "our distillation underperformed" (a claim
+about an implementation); with it, "MSC-based routing has no headroom over
+confidence" (a claim about the premise).
+
+The scorecard also shows H2 and H3 **replicating** across a 49× change in
+pixels on non-overlapping architectures, and H4 missing in both studies at
+almost the same value (0.0425 vs 0.0411).
+
+**Added.** `26_IN100_FINDINGS.md` — the missing scientific document: the five
+hypotheses scored against both studies, what is novel and why, what is
+explicitly not supported, the strongest honest framing, and the cost of the
+three options that would strengthen it. `README.md` now leads with the science
+and `PAPER.md` carries a scope note saying it is CIFAR-only and which of its
+statements this study supersedes.

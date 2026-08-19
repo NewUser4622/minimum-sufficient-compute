@@ -1,5 +1,17 @@
 # How Much Computation Does an Image Need? A Noise-Ceiling-Corrected Atlas of Per-Sample Compute Requirements Across Fifteen Architectures
 
+> **Scope note.** This document is the **CIFAR-100** paper. The ImageNet-100
+> study is not written up here yet — its results, the pre-registered scorecard
+> across both studies, and the novelty assessment are in
+> [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md).
+>
+> Two things in this document are now superseded by that study:
+> §Q5 records B11 (the oracle ceiling) as uncomputed and tracked as **O-21**;
+> it has since been computed on ImageNet-100 for 18 students, and it is flat.
+> And the limitation *"nothing here is demonstrated at ImageNet scale"* is now
+> partly addressed.
+
+
 **Draft v1 — for submission to TMLR / IEEE TPAMI / IJCV.**
 Every number in this manuscript is traceable to
 `huggingface.co/datasets/Shanmuk4622/msc-cifar100`.

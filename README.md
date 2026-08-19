@@ -16,9 +16,13 @@ live in this repository:
 
 ## Start here
 
-**If you want the current state of the ImageNet-100 work**, read
+**If you want the science** — what was predicted, what was measured, and what
+is actually new — read
+[`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md).
+It scores all five pre-registered hypotheses against **both** studies.
+
+**If you want the current operational state**, read
 [`docs/imagenet100/24_IN100_STATUS.md`](docs/imagenet100/24_IN100_STATUS.md).
-It opens with what is proven, what is not, and why.
 
 **If something is broken**, read
 [`docs/imagenet100/23_IN100_RUNBOOK.md`](docs/imagenet100/23_IN100_RUNBOOK.md)
@@ -110,17 +114,24 @@ run time. Artifacts stay on local disk and are pushed to HuggingFace only by
 
 ## Results in one paragraph
 
-On CIFAR-100, non-convolutional models had markedly lower seed-reliability
-(ρ_seed ≈ 0.547) than CNNs (0.62–0.72). On ImageNet-100 the **ordering
-replicates** on non-overlapping architectures — `resnet50` 0.822 versus
-`vit_small_p16` 0.649 — but no architecture appears in both studies, so
-cross-study *magnitudes* are confounded by architecture, resolution and dataset
-together. Disattenuated transfer between the CNN and the ViT is
-T = 0.640 [0.614, 0.664] against a shuffled control of 0.037. MSC-KD is a clean
-negative: at matched FLOPs (ρ = 0.806) it sits 0.9 points *below* confidence
-thresholding in 18/18 runs, and the oracle ceiling — routing by the student's
-own true post-hoc MSC — offers only +0.00007 over confidence, so the limitation
-is the premise rather than the distillation.
+> MSC is a reliable, three-dimensional, largely architecture-transferable
+> per-sample quantity — and it does **not** yield better inference routing than
+> confidence thresholding, because the oracle ceiling for MSC-based routing is
+> itself flat.
 
-Numbers, caveats and what would close the gaps:
-[`docs/imagenet100/24_IN100_STATUS.md`](docs/imagenet100/24_IN100_STATUS.md).
+Compute-need is three-dimensional in both studies (PC1 max 0.532 on CIFAR,
+0.547 on ImageNet, against a pre-registered 0.60 — refuted twice). It transfers
+across the convolution/attention boundary above the pre-registered bound in
+both (T = 0.710 and 0.640 against a predicted < 0.6, with a shuffled control at
+0.037). Seed-reliability is architecture-dependent in both, same ordering, on
+non-overlapping architectures — which is what makes noise-ceiling correction a
+demonstrated necessity rather than an argued one.
+
+**The new result is the oracle ceiling.** The CIFAR study lists B11 as its
+*"one substantive gap remaining"* (O-21) — without it, "did the method fail or
+is the premise empty?" is unanswerable. It is now computed for 18 students:
+B11 is **+0.00007** over confidence routing, so there was never headroom, and
+MSC-KD's −0.0088 is a fact about the premise rather than the distillation.
+
+Scorecard, caveats and cost of closing the gaps:
+[`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md).

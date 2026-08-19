@@ -8,12 +8,17 @@
 |---|---|---|---|
 | ρ_seed ≥ 0.60 | resnet50 **0.822** · vit **0.649** | 0.60 | **PASS** |
 | shuffled control \|z\| < 5 | **2.30** | 5.0 | **PASS** |
-| Q4 partial ρ ≥ 0.30 | **0.282** | 0.30 | **MISS by 0.018** |
+| Q4 partial ρ ≥ 0.30 | **0.282** | 0.30 | **MISS** |
+| Q4 ΔR² ≥ 0.05 | **0.0411** | 0.05 | **MISS** |
 
-Q4 ΔR² = **0.0411**, CI [0.0352, 0.0468] — excludes zero. MSC *does* add
-information beyond the 7-score difficulty battery; the partial Spearman just
-misses its threshold. This is the gate MSC-KD (NB5) sits downstream of, and it
-must be reported as a miss, not rounded up.
+**H4 requires BOTH ΔR² ≥ 0.05 and partial ρ ≥ 0.30. Both miss.** An earlier
+version of this file said only the partial Spearman missed — ΔR² = 0.0411 is
+also below its 0.05 bar. The CI [0.0352, 0.0468] excludes zero, so MSC *does*
+carry information beyond the 7-score difficulty battery; it does not carry
+enough to clear the pre-registered threshold.
+
+CIFAR's transformer pairs missed the same gate (median 0.0425). **The weakness
+replicates** — see `26_IN100_FINDINGS.md` §2.5.
 
 **Q3 transfer, resnet50 ↔ vit_small_p16 (CNN–transformer):**
 ρ_raw 0.468 → **T = 0.640** [0.614, 0.664] after disattenuation.
@@ -32,7 +37,7 @@ Jaccard@top-10 = 0.259.
 | **Q1 seed ceilings** | **PROVEN within IN-100** | resnet50 **0.822** vs vit **0.649**, both above the 0.60 gate. The CNN>ViT *ordering* replicates CIFAR. Cross-study *magnitudes* are confounded — see §FIRST RESULT |
 | **Q2 multi-axis** | **PROVEN** | PC1 explains 0.547 / 0.522 — MSC is not one axis in disguise |
 | **Q3 transfer** | **PROVEN** | T = **0.640** [0.614, 0.664]; shuffled control T = 0.037, a 17× separation |
-| **Q4 irreducibility** | **PARTIAL** | ΔR² = 0.0411, CI [0.0352, 0.0468] excludes zero — but partial ρ **0.282 < 0.30 gate** |
+| **Q4 irreducibility** | **MISSED (both criteria)** | ΔR² **0.0411** < 0.05 and partial ρ **0.282** < 0.30. CI excludes zero, so the effect is real but under the bar. CIFAR missed it too (0.0425) — replicates |
 | **Q5 MSC-KD** | **COMPLETE — NEGATIVE** | at ρ=0.806: B10 is **−0.0088** vs B2 in **18/18** runs; B11 oracle offers **+0.00007** headroom |
 
 **The paper's thesis is Q1–Q3, and it is already provable.** The headline —
@@ -74,7 +79,8 @@ not call the evaluator.
 
 This is the "where are we" file. One page, updated every session.
 
-- **What happened and why** → `22_IN100_LAB_NOTEBOOK.md` (defect log, D-37…D-81)
+- **What was found, and what is novel** → `26_IN100_FINDINGS.md` ← the science
+- **What happened and why** → `22_IN100_LAB_NOTEBOOK.md` (defect log, D-37…D-84)
 - **Symptom → cause → fix** → `23_IN100_RUNBOOK.md` (look here first when something breaks)
 - **The plan** → `20_IN100_PORT_PLAN.md` · **What changed from CIFAR** → `21_IN100_ENGINEERING_DELTA.md`
 
