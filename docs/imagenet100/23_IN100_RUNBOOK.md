@@ -364,6 +364,7 @@ Full write-ups in [`22_IN100_LAB_NOTEBOOK.md`](22_IN100_LAB_NOTEBOOK.md) §2.
 | `[VERIFY] 0 run(s) on local disk` after a run | `confirm_on_disk(results)` was handed an empty list (nothing trained this pass) | Not data loss. Check `ls C:\\msc_results\\runs` — the runs are there. |
 | `NameError: name 'MSC_ROOT' is not defined` (or `M`) in a notebook | the notebook was generated without `bootstrap()` / `paths_cell()` | D-82 — the build now checks every notebook for names no earlier cell defines. Rebuild. |
 | `OfflineModeIsEnabled: Cannot reach https://huggingface.co/...` in NB6 | the offline guard is set INSIDE the notebook process by the shared bootstrap; a shell `unset` cannot reach it | D-83 — NB6 calls `M.allow_network()`, which clears the env vars AND patches the `huggingface_hub` constant. Rebuild and re-run. |
+| `403 Forbidden: You don't have the rights to create a dataset under the namespace ...` | the HF token is read-only, for another account, or fine-grained without write scope -- NOT a code fault | D-84 — NB6's token check names which. Fix: huggingface.co Settings -> Access Tokens -> New token -> WRITE, `setx HF_TOKEN hf_...`, restart the kernel. |
 
 ### Reading the self-test after any change
 

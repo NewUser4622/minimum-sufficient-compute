@@ -1284,6 +1284,78 @@ def allow_network(verbose: bool = True) -> Dict[str, Any]:
     return changed
 
 
+def hf_token_check(token: Optional[str], repo_id: str,
+                   repo_type: str = "dataset") -> Dict[str, Any]:
+    """Can this token write to this namespace? Asked BEFORE anything is created.
+
+    **D-84.** NB6's first network call was `create_repo`, and the most likely
+    thing to be wrong -- a read-only token, or a token belonging to a different
+    account -- surfaced as a forty-line traceback ending in
+
+        403 Forbidden: You don't have the rights to create a dataset under the
+        namespace "Shanmuk4622".
+
+    The message is accurate and the diagnosis is buried under an httpx
+    HTTPStatusError, an HfHubHTTPError, a deprecation wrapper and a validator.
+    `whoami()` answers the same question in one call, before anything is
+    attempted, and can name which of the three causes it is.
+
+    Never raises: it returns a verdict so the notebook can print it. A preflight
+    that throws is just a different traceback.
+    """
+    out: Dict[str, Any] = {"ok": False, "reason": "", "user": None,
+                           "role": None, "namespace": repo_id.split("/")[0],
+                           "repo_id": repo_id, "fine_grained": None}
+    if not token:
+        out["reason"] = ("HF_TOKEN is not set. Create one at "
+                         "https://huggingface.co/settings/tokens (type: Write), "
+                         "then `setx HF_TOKEN hf_...` and restart the kernel.")
+        return out
+    try:
+        from huggingface_hub import HfApi
+        me = HfApi(token=token).whoami()
+    except Exception as e:                                       # noqa: BLE001
+        out["reason"] = (f"could not identify the token: {type(e).__name__}: "
+                         f"{str(e)[:160]}")
+        return out
+
+    out["user"] = me.get("name")
+    auth = (me.get("auth") or {}).get("accessToken") or {}
+    out["role"] = auth.get("role")
+    out["fine_grained"] = auth.get("fineGrained")
+
+    orgs = {o.get("name") for o in (me.get("orgs") or [])}
+    ns = out["namespace"]
+    if ns != out["user"] and ns not in orgs:
+        out["reason"] = (
+            f"the token belongs to '{out['user']}' but the repo namespace is "
+            f"'{ns}'. Either set REPO_ID to '{out['user']}/{repo_id.split('/')[-1]}' "
+            f"or use a token for '{ns}'.")
+        return out
+
+    if out["fine_grained"] is not None:
+        # A fine-grained token lists explicit permissions; a missing write
+        # scope is the common case and the 403 does not say which.
+        out["reason"] = (
+            f"token is FINE-GRAINED. It must grant write access to "
+            f"'{ns}'. If create fails, re-issue it with 'Write access to "
+            f"contents/settings of all repos under your personal namespace', "
+            f"or use a classic Write token.")
+        out["ok"] = True          # cannot prove it fails; let the call decide
+        return out
+
+    if out["role"] not in ("write", "admin"):
+        out["reason"] = (
+            f"token role is '{out['role']}' -- read-only. Creating or writing "
+            f"a {repo_type} needs a WRITE token. "
+            f"https://huggingface.co/settings/tokens -> New token -> Write.")
+        return out
+
+    out["ok"] = True
+    out["reason"] = f"token for '{out['user']}' has role '{out['role']}'"
+    return out
+
+
 def offline_state() -> Dict[str, Any]:
     """What the offline guard currently looks like, for display."""
     out = {k: os.environ.get(k) for k in
@@ -12685,6 +12757,70 @@ def _selftest() -> bool:
     check("D-79b: train_msc_kd writes config_hash.txt",
           "config_hash.txt" in _kd_src,
           "all 18 MSC-KD runs verified incomplete without it")
+
+    # -- D-84: the token preflight must name the cause, not just fail ---------
+    import types as _t84
+
+    def _with_whoami(payload, raises=None):
+        """Install a stub huggingface_hub whose whoami() returns `payload`."""
+        mod = _t84.ModuleType("huggingface_hub")
+
+        class _Api:
+            def __init__(self, token=None): self.token = token
+            def whoami(self):
+                if raises is not None:
+                    raise raises
+                return payload
+        mod.HfApi = _Api
+        sys.modules["huggingface_hub"] = mod
+
+    _prev_hub = sys.modules.get("huggingface_hub")
+    try:
+        # 1. no token at all
+        _r = hf_token_check(None, "Shanmuk4622/msc-imagenet100")
+        check("D-84: a missing token is refused and says where to make one",
+              not _r["ok"] and "settings/tokens" in _r["reason"])
+
+        # 2. THE CASE THE USER HIT: valid token, read-only role
+        _with_whoami({"name": "Shanmuk4622", "orgs": [],
+                      "auth": {"accessToken": {"role": "read"}}})
+        _r = hf_token_check("hf_x", "Shanmuk4622/msc-imagenet100")
+        check("D-84: a READ-ONLY token is refused before create_repo is called",
+              not _r["ok"] and "read-only" in _r["reason"],
+              _r["reason"][:72])
+
+        # 3. token belongs to someone else
+        _with_whoami({"name": "someone_else", "orgs": [],
+                      "auth": {"accessToken": {"role": "write"}}})
+        _r = hf_token_check("hf_x", "Shanmuk4622/msc-imagenet100")
+        check("D-84: a token for the wrong namespace names BOTH names",
+              not _r["ok"] and "someone_else" in _r["reason"]
+              and "Shanmuk4622" in _r["reason"],
+              _r["reason"][:72])
+
+        # 4. the working case must PASS -- a preflight that always fails is useless
+        _with_whoami({"name": "Shanmuk4622", "orgs": [],
+                      "auth": {"accessToken": {"role": "write"}}})
+        _r = hf_token_check("hf_x", "Shanmuk4622/msc-imagenet100")
+        check("D-84 canary: a WRITE token for the right namespace passes",
+              _r["ok"] and _r["role"] == "write", _r["reason"][:72])
+
+        # 5. an org repo the user belongs to is fine
+        _with_whoami({"name": "Shanmuk4622", "orgs": [{"name": "some-lab"}],
+                      "auth": {"accessToken": {"role": "write"}}})
+        _r = hf_token_check("hf_x", "some-lab/msc-imagenet100")
+        check("D-84: an org the user belongs to is accepted", _r["ok"])
+
+        # 6. network/auth failure must not raise out of the preflight
+        _with_whoami(None, raises=RuntimeError("connection reset"))
+        _r = hf_token_check("hf_x", "Shanmuk4622/msc-imagenet100")
+        check("D-84: a failing whoami returns a verdict rather than raising",
+              not _r["ok"] and "could not identify" in _r["reason"])
+    finally:
+        if _prev_hub is None:
+            sys.modules.pop("huggingface_hub", None)
+        else:
+            sys.modules["huggingface_hub"] = _prev_hub
 
     # -- D-83: allow_network must actually reverse the offline guard ----------
     _saved83 = {k: os.environ.get(k) for k in

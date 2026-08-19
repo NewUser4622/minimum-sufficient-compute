@@ -3155,3 +3155,52 @@ installs a fake `huggingface_hub.constants` with `HF_HUB_OFFLINE = True`,
 asserts the guard is genuinely on first (the canary), then asserts
 `allow_network()` clears all four *and* flips the module constant to `False`.
 Without the canary the test would pass on a machine that was never offline.
+
+---
+
+## D-84 — a token problem presented as a forty-line traceback
+
+```
+403 Forbidden: You don't have the rights to create a dataset under the
+namespace "Shanmuk4622". Make sure your token has the correct permissions.
+```
+
+**Not a code defect.** The notebook worked: it went online (D-83's fix held),
+reached HuggingFace, authenticated, and HuggingFace declined. The token is
+read-only, or belongs to another account, or is fine-grained without write
+access to that namespace.
+
+**But the presentation was mine.** `create_repo` was NB6's first network call,
+and a token-permission failure is the single most likely thing to be wrong at
+that point. The one accurate sentence arrived at the bottom of a stack running
+`httpx.HTTPStatusError` → `HfHubHTTPError` → a deprecation wrapper → an
+argument validator → `create_repo`. Everything above it is noise, and the
+reader has to get to the last line to learn anything.
+
+`whoami()` answers the same question in one call, before anything is created,
+and can distinguish the three causes — which the 403 cannot.
+
+**Fix.** `hf_token_check(token, repo_id, repo_type)` returns a verdict rather
+than raising (a preflight that throws is just a different traceback) and names
+which case applies:
+
+- no token → where to create one;
+- role `read` → "read-only … needs a WRITE token", with the settings URL;
+- namespace mismatch → **both** names, and the two ways to reconcile them;
+- fine-grained → passes, with a caution about the scope it needs, since its
+  permissions cannot be read from `whoami`;
+- `whoami` itself failing → reported, not raised.
+
+NB6 prints user / role / namespace / verdict before the upload cell, and the
+upload cell refuses on a bad verdict.
+
+**Verified — all six branches, including the exact failure.** The self-test
+installs a stub `huggingface_hub` whose `whoami()` returns each shape:
+read-only, wrong namespace, write, org membership, and a raising call. The
+canary asserts a **valid write token passes**, without which a preflight that
+always says no would look like a working check.
+
+This is the discipline the torch-side defects (D-70, D-76, D-77, D-79c) needed
+and did not get: the environment here has no network, so the decidable part —
+what to do with each `whoami` response — was pushed into a pure function and
+exercised against every case that matters.

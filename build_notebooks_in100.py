@@ -1699,6 +1699,24 @@ print('HF_TOKEN found' if HF_TOKEN else
       'HF_TOKEN NOT SET -- set it and restart the kernel before running below')
 
 DRY_RUN = True     # True = list what WOULD be uploaded, upload nothing
+
+# D-84. Ask whether this token CAN write here, before anything is created.
+# The alternative is a 403 forty lines deep in httpx -> HfHubHTTPError ->
+# a deprecation wrapper -> a validator, whose real cause is one sentence at
+# the very bottom.
+_tok = M.hf_token_check(HF_TOKEN, REPO_ID, REPO_TYPE)
+print()
+print('token check')
+print(f"    user       {_tok['user']}")
+print(f"    role       {_tok['role']}")
+print(f"    namespace  {_tok['namespace']}")
+print(f"    verdict    {'OK' if _tok['ok'] else 'CANNOT PUBLISH'}")
+print(f"    {_tok['reason']}")
+if not _tok['ok']:
+    print()
+    print('  Fix the token before running the upload cell. On huggingface.co:')
+    print('    Settings -> Access Tokens -> New token -> type WRITE')
+    print('  then:  setx HF_TOKEN hf_...   and RESTART THE KERNEL.')
 """),
         md("""
 ---
@@ -1806,8 +1824,8 @@ Uploads run-by-run so a failure part way leaves a repo that is *incomplete*
 rather than *inconsistent*, and so a re-run resumes instead of restarting.
 """),
         code("""
-if not HF_TOKEN:
-    print('HF_TOKEN is not set -- nothing to do.')
+if not _tok['ok']:
+    print('token cannot publish -- see the token check above. Nothing uploaded.')
 elif DRY_RUN:
     print('DRY_RUN = True. Nothing uploaded. Set DRY_RUN = False to publish.')
     print(f'  target: {REPO_ID} ({REPO_TYPE})')
