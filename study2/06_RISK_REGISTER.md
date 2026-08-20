@@ -53,7 +53,20 @@ as a resource paper even if every hypothesis fails — nobody has published one.
 
 **Detector:** P0 + P1. **Trigger:** ~1 day in. **Not** three weeks in.
 
-## R-02 · The eight scores are the same thing · **HIGH** (escalated)
+## R-02 · The eight scores are the same thing · **FIRED — confirmed 2026-08-20**
+
+**Measured: ρ = 0.997–1.000 between `msp`, `margin`, `entropy` and `ce_loss`.**
+The survey warned of >70% agreement; the reality is ~100%. They are one signal.
+
+Three families survive, not eight: `{msp, margin, entropy, ce_loss}`,
+`{el2n, forget_events}` (ρ = 0.58), `{pred_depth}`. Every "N scores" claim in
+this repo is now a "N families" claim and the grid's effective n is 3 × 15.
+The response written below was the right one and is now in force.
+
+---
+
+### original entry
+
 
 If `msp`, `margin`, `entropy` and `ce_loss` are near-collinear (they are all
 functions of the softmax), the "8 scores" framing overstates the coverage.
@@ -72,7 +85,18 @@ effective number of independent signals. `el2n`, `forget_events`, `pred_depth`
 and `msc` come from genuinely different information, so at least 4 families
 survive any collapse.
 
-## R-03 · Cross-seed oracle is confounded by accuracy differences · **MEDIUM**
+## R-03 · Cross-seed oracle is confounded by accuracy differences · **FIRED**
+
+**Measured 2026-08-20: within-pair sd of the bias is 0.443 pt; the bias itself
+is −0.200 pt.** The asymmetry is more than twice the effect, which is the exact
+trigger written below. The sign of the optimism bias **cannot be interpreted**
+until seed accuracy is regressed out. H3 is reported as not supported either
+way, but the negative sign must not be claimed as a finding yet.
+
+---
+
+### original entry
+
 
 Seeds differ slightly in accuracy. Routing seed *i*'s model with seed *j*'s
 score could look worse simply because seed *j* is a worse model.

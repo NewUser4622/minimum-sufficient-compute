@@ -516,23 +516,59 @@ def exit_tables(run_id):
     conf = np.stack([d[f'top1p_d{k}'].to_numpy() for k in ks], axis=1)
     return d, correct, conf, ks
 
-def route_by(rank, correct, rho, target_rho):
+def _cost(k_assign, rho):
+    return float(np.mean(np.asarray(rho)[k_assign]))
+
+def route_by(rank, correct, rho, target_rho, all_exits=True):
     '''Route each sample to an exit so the MEAN cost equals target_rho.
-    Samples with the lowest `rank` exit earliest.'''
+    Samples with the lowest `rank` exit earliest.
+
+    all_exits=True  -- every one of the K exits is reachable (what an early-exit
+                       system actually does).
+    all_exits=False -- the original two-exit split (exit 0 or exit K-1) kept so
+                       the first run's numbers remain reproducible.
+    '''
+    rank = np.asarray(rank, dtype=float)
     n, K = correct.shape
-    order = np.argsort(rank, kind='stable')
+    u = np.empty(n)
+    u[np.argsort(rank, kind='stable')] = np.arange(n) / max(n - 1, 1)
     lo, hi = 0.0, 1.0
-    for _ in range(40):                       # bisect the fraction sent deep
-        frac = (lo + hi) / 2
-        k_assign = np.full(n, 0, dtype=int)
-        n_deep = int(round(frac * n))
-        k_assign[order[n - n_deep:]] = K - 1
-        cost = np.mean([rho[k] for k in k_assign])
-        if cost < target_rho: lo = frac
-        else: hi = frac
-    return float(correct[np.arange(n), k_assign].mean()), cost
+    for _ in range(60):
+        t = (lo + hi) / 2
+        if all_exits:
+            k_assign = np.clip((u * K * t * 2).astype(int), 0, K - 1)
+        else:
+            k_assign = np.where(u >= 1.0 - t, K - 1, 0)
+        c = _cost(k_assign, rho)
+        if c < target_rho: lo = t
+        else: hi = t
+    return float(correct[np.arange(n), k_assign].mean()), c
+
+def route_confidence(conf, correct, rho, target_rho):
+    '''The baseline the field actually deploys: exit at the FIRST exit whose
+    top-1 probability clears a threshold. Crucially this reads confidence at
+    the EARLY exit, so it is computable without running the rest of the net.
+
+    The first version of this notebook used `-conf[:, -1]` -- the FINAL exit's
+    confidence -- as the baseline. That needs a full forward pass to evaluate,
+    so it is an oracle, not a baseline, and it made every headroom number a
+    comparison between two oracles.
+    '''
+    n, K = correct.shape
+    lo, hi = 0.0, 1.0
+    for _ in range(60):
+        th = (lo + hi) / 2
+        fires = conf >= th
+        fires[:, -1] = True                    # the last exit always answers
+        k_assign = fires.argmax(axis=1)
+        c = _cost(k_assign, rho)
+        if c < target_rho: lo = th
+        else: hi = th
+    return float(correct[np.arange(n), k_assign].mean()), c
 
 print('routing helpers defined -- correctness and cost come from the parquet')
+print('  baseline = threshold on EARLY-exit confidence (deployable)')
+print('  oracle   = sort on a per-sample score, all K exits reachable')
 """),
         md("""
 ---
@@ -572,7 +608,7 @@ for (arch, dset), grp in base.groupby(['arch', 'dataset']):
         di, ci, confi, _ = tab[i]
         dj, _, _, _ = tab[j]
         common = di['sample_idx'].isin(dj['sample_idx']).to_numpy()
-        base_conf, _ = route_by(-confi[:, -1][common], ci[common], rho, TARGET_RHO)
+        base_conf, _ = route_confidence(confi[common], ci[common], rho, TARGET_RHO)
         for s in SCORES:
             sign = -1.0 if s in HIGH_MEANS_EASY else 1.0
             in_seed = sign * di[s].to_numpy(dtype=float)[common]
@@ -640,10 +676,32 @@ print(f'noise floor (2 SE, 10k samples): +/-{se2:.3f} pt')
 print(f'best honest headroom           : {hon.max():+.3f} pt  ({hon.idxmax()})')
 print(f'H5 (nothing clears +1.0 pt)    : '
       f'{"SUPPORTED -- no method is built" if hon.max() < 1.0 else "FALSIFIED"}')
-if hon.max() >= 1.0:
+# ---- what clearing the gate does and does NOT license -------------------
+# `pred_depth` is not a deployable routing signal. prediction_depth() runs a
+# kNN probe over the features of EVERY layer and targets the network's own
+# final answer, so obtaining it costs a full forward pass -- a router that
+# needs the whole network to decide where to stop saves nothing. It is the
+# textbook Oracle-EE rule (08_RELATED_WORK.md S1) wearing a score's clothes.
+#
+# So a large number here is a CEILING, not a method. Read it as: this much
+# accuracy is on the table at this budget for a router that could predict
+# prediction depth from cheap early features. That is the follow-up question,
+# and it is worth asking precisely because the ceiling is not flat.
+ORACLE_ONLY = {'pred_depth'}
+deployable = hon.drop(index=[s_ for s_ in ORACLE_ONLY if s_ in hon.index])
+
+print()
+print(f'  oracle-only signals (need full compute to evaluate): {sorted(ORACLE_ONLY)}')
+print(f'  best DEPLOYABLE headroom : {deployable.max():+.3f} pt  ({deployable.idxmax()})')
+print(f'  ceiling from the oracle  : {hon.max():+.3f} pt  ({hon.idxmax()})')
+if hon.max() >= 1.0 and deployable.max() < 1.0:
     print()
-    print(f'  -> {hon.idxmax()} clears the gate. Amend 02_PROTOCOL.md in writing')
-    print('     with the date and reason, then scope a method to that score.')
+    print('  -> The GATE IS AMBIGUOUS and must not be read as "build a method".')
+    print('     No deployable score clears +1.0; the oracle clears it by a lot.')
+    print('     That is a statement about headroom, not about any method, and')
+    print('     it contradicts Study 1 B11 (+0.00007) -- which used MSC, a')
+    print('     cost-normalised aggregate, where this uses the raw per-sample')
+    print('     sufficient depth. Chase the discrepancy before building.')
 """),
         md("""
 ---
@@ -655,6 +713,50 @@ If it holds, two observations become one mechanism — and ρ_seed becomes a che
 predictor of how inflated a published oracle bound is.
 
 n is small. The scatter is reported, not just the coefficient.
+"""),
+        md("""
+---
+## R-04 — the operating point, not one point
+
+A ceiling measured at a single budget is one point on a curve. Study 1's B11
+lived at rho = 0.806 and concluded there was no headroom anywhere.
+"""),
+        code("""
+sweep = []
+for tr in [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]:
+    for (arch, dset), grp in base.groupby(['arch', 'dataset']):
+        if dset != 'cifar100':
+            continue
+        ids = sorted(grp['run_id'])
+        if len(ids) < 2:
+            continue
+        try:
+            rho = rho_for(arch, dset)
+        except Exception:
+            continue
+        i, j = ids[0], ids[1]
+        di, ci, confi, _ = exit_tables(i)
+        dj, _, _, _ = exit_tables(j)
+        common = di['sample_idx'].isin(dj['sample_idx']).to_numpy()
+        b, _ = route_confidence(confi[common], ci[common], rho, tr)
+        for sc in SCORES:
+            sign = -1.0 if sc in HIGH_MEANS_EASY else 1.0
+            cross = sign * dj.set_index('sample_idx').loc[
+                di['sample_idx'][common], sc].to_numpy(dtype=float)
+            if np.isnan(cross).all():
+                continue
+            a, _ = route_by(np.nan_to_num(cross, nan=np.inf), ci[common], rho, tr)
+            sweep.append({'target_rho': tr, 'arch': arch, 'score': sc,
+                          'headroom': (a - b) * 100})
+
+sw = pd.DataFrame(sweep)
+M.save_analysis(sess.data_dir, 's2_headroom_sweep', sw)
+piv = sw.groupby(['target_rho', 'score'])['headroom'].median().unstack()
+print('median honest headroom (accuracy points) vs compute budget')
+print(piv.round(2).to_string())
+print()
+print('If the curve is flat everywhere, the bound is the paper. If headroom')
+print('appears in a region, that region becomes the subject (R-04).')
 """),
         code("""
 from scipy.stats import spearmanr

@@ -3,8 +3,119 @@
 Newest first. Every entry: what changed, what it cost, what it settled, what is
 next. Updated every session.
 
-**Current state: P0 run once, three defects found and fixed, R1 has a
-provisional answer that needs one re-run.**
+**Current state: P0 and P1 both run. The pre-registered centrepiece (H3, the
+optimism bias) is NOT SUPPORTED. Two unplanned findings are stronger than the
+plan was. NB2 must be re-run — its baseline was mis-specified.**
+
+---
+
+## 2026-08-20 · P0 + P1 complete — the centrepiece failed, something better fell out
+
+### Scoreboard, against what was pre-registered
+
+| | hypothesis | result |
+|---|---|---|
+| **H1** | ρ_seed varies by ≥ 0.15 | **SUPPORTED** — range **0.667** |
+| **H3** | in-seed oracle optimistic by ≥ 0.5 pt, ≥ 6 of 8 scores | **NOT SUPPORTED** — bias **−0.200 pt**, 0 of 5 positive |
+| **H4** | corr(unreliability, bias) ≥ 0.5 | **NOT SUPPORTED** — ρ = **−0.301** (p = 0.009), wrong sign |
+| **H5** | nothing clears +1.0 pt honest headroom | **ambiguous** — see below, the baseline was wrong |
+
+**The centrepiece is dead as stated.** `02_PROTOCOL.md` R3 predicted a positive
+optimism bias; the measurement says it is small and **negative** — routing seed
+*i*'s model with seed *j*'s score is *better* than using seed *i*'s own. And
+R-03 has fired: within-pair asymmetry (0.443 pt) **exceeds** the bias (0.200 pt),
+so the accuracy confound is larger than the effect. Under the register's own
+rule the sign cannot be interpreted until seed accuracy is regressed out.
+
+Per the stopping rule, this is reported as a null and not re-cut for a positive.
+
+### Finding A — the four softmax scores are one score
+
+P0a, the decision point, now works, and it fires at maximum:
+
+```
+                msp  margin  entropy  ce_loss   el2n  forget_events  pred_depth
+msp            1.00    1.00     1.00     1.00   0.17           0.19        0.17
+margin         1.00    1.00     0.99     1.00   0.19           0.21        0.18
+entropy        1.00    0.99     1.00     1.00   0.16           0.17        0.16
+ce_loss        1.00    1.00     1.00     1.00   0.17           0.19        0.17
+el2n           0.17    0.19     0.16     0.17   1.00           0.58        0.43
+forget_events  0.19    0.21     0.17     0.19   0.58           1.00        0.36
+pred_depth     0.17    0.18     0.16     0.17   0.43           0.36        1.00
+```
+
+**Eight scores are three families**, not eight: `{msp, margin, entropy,
+ce_loss}` at ρ ≈ 1.00, `{el2n, forget_events}` at 0.58, and `pred_depth` alone.
+R-02 was escalated to HIGH on the strength of a survey reporting >70% agreement;
+the measured number here is **99.7–100%**. Every "N scores" claim in this repo
+must become "N families", and the effective n of the grid is 3 × 15, not 8 × 15.
+
+### Finding B — softmax difficulty scores are unmeasurable on memorised data
+
+This was not planned and it is the strongest thing here. ρ_seed for the same
+architecture and the same score, on the test split versus `train_holdout`:
+
+| arch | ce_loss (test) | ce_loss (train_holdout) | el2n (train_holdout) |
+|---|---|---|---|
+| convnext_femto | 0.709 | **0.150** | 0.684 |
+| mixer_nano | 0.647 | **0.108** | 0.645 |
+| vit_tiny | 0.673 | **0.116** | 0.620 |
+| resnet32x4 | 0.742 | **0.284** | 0.667 |
+| mobilenetv2 | 0.874 | 0.849 | 0.568 |
+| resnet20 | 0.832 | 0.793 | 0.589 |
+
+`train_holdout` is **a slice of train, not withheld from it** (`msc_lib.py`
+§`_in100_loaders`) — the model has fit these samples. On data a high-capacity
+network has memorised, its softmax is saturated, the per-sample ranking is
+degenerate, and **seed reliability collapses to ~0.11–0.15**. Low-capacity nets
+that do not saturate (mobilenetv2, resnet20) are barely affected. The
+training-dynamics scores, which integrate over the whole trajectory rather than
+reading the endpoint, hold steady at 0.57–0.68.
+
+**Why this matters beyond us.** Dataset pruning, coreset selection and
+curriculum learning compute exactly these scores on exactly this data — the
+training set — and typically from **one seed**. This says that for the
+high-capacity models those methods target, a single-seed softmax difficulty
+score on training data carries almost no reproducible signal, while EL2N and
+forgetting events do. That is a concrete, mechanistic, testable warning, and it
+is squarely in the gap `08_RELATED_WORK.md` §4 identified.
+
+### Finding C — the oracle ceiling is ~5 points, not ~0 — but re-measure it
+
+`H5 FALSIFIED: best honest headroom +5.165 pt (pred_depth)`, every other score
+between −0.16 and +0.23. Two defects sit under that number:
+
+1. **`pred_depth` is not a routing signal.** `prediction_depth()` runs a kNN
+   probe over the features of *every* layer and targets the network's own final
+   answer. Obtaining it costs a full forward pass, so a router using it saves
+   nothing. It is the textbook Oracle-EE rule (`08_RELATED_WORK.md` §1) in a
+   score's clothing. Its number is a **ceiling**, never a method.
+2. **The baseline was an oracle too.** It thresholded `conf[:, -1]` — the
+   *final* exit's confidence — which also needs the full network. So the
+   headline compared two oracles. Confidence routing has been rewritten to
+   threshold the **early** exit's confidence, which is what is deployable and
+   what Study 1's B2 did.
+
+`route_by` also reached only exits 0 and K−1, a two-exit binary split, never the
+intermediate ones. Both are fixed; `tools/s2_routing_canaries.py` (5/5) checks
+that the budget is hit, that all K exits are reachable, that a perfect oracle
+beats a random router, and that an *uninformative* confidence signal does **not**.
+
+**Even so, the direction is interesting and contradicts Study 1.** B11 reported
+**+0.00007** and concluded there was no headroom anywhere. B11 routed on MSC — a
+cost-normalised aggregate — where this routes on raw per-sample sufficient
+depth. If a corrected measurement keeps any large part of +5.2, Study 1's
+central negative was an artifact of the metric, not a property of the problem.
+That discrepancy is now the most valuable open question in the study.
+
+### Also worth a second look
+
+`forget_events` ρ_seed is 0.68–0.92 and almost flat across architectures, which
+is suspiciously stable. Most likely a tie-mass artifact — if most samples are
+never forgotten, Spearman is dominated by one easy/hard split. **Report the tie
+fraction before using this number.**
+
+---
 
 ---
 
