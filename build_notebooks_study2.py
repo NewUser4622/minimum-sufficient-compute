@@ -564,11 +564,44 @@ def route_confidence(conf, correct, rho, target_rho):
         c = _cost(k_assign, rho)
         if c < target_rho: lo = th
         else: hi = th
-    return float(correct[np.arange(n), k_assign].mean()), c
+    counts = np.bincount(k_assign, minlength=K)
+    return float(correct[np.arange(n), k_assign].mean()), c, counts
+
+def route_matched(rank, correct, counts):
+    '''Route by `rank` using EXACTLY the exit histogram `counts`.
+
+    Why this exists. A per-sample difficulty score carries ONE number per
+    sample; confidence carries K (one per exit). So a confidence threshold can
+    choose any exit histogram that meets the budget, while a sort on a
+    difficulty score was being forced through a rigid quantile spread -- 20% of
+    samples at every exit at rho=0.6. Comparing them then measures the
+    MECHANISM, not the signal, and produced -10 accuracy points for every score
+    at every budget: an oracle apparently losing to a threshold, which cannot
+    happen.
+
+    Fixing that means holding the mechanism constant. We take the baseline's
+    own exit histogram and give the score the same one, so the cost is
+    identical BY CONSTRUCTION -- no bisection, no residual budget mismatch --
+    and the only thing that differs is WHICH samples go where. That is the
+    question the study is actually asking.
+    '''
+    rank = np.asarray(rank, dtype=float)
+    n = len(rank)
+    order = np.argsort(rank, kind='stable')     # easiest first
+    k_assign = np.empty(n, dtype=int)
+    pos = 0
+    for k, cnt in enumerate(counts):            # cheapest exit to the easiest
+        cnt = int(cnt)
+        k_assign[order[pos:pos + cnt]] = k
+        pos += cnt
+    if pos < n:
+        k_assign[order[pos:]] = len(counts) - 1
+    return float(correct[np.arange(n), k_assign].mean())
 
 print('routing helpers defined -- correctness and cost come from the parquet')
 print('  baseline = threshold on EARLY-exit confidence (deployable)')
-print('  oracle   = sort on a per-sample score, all K exits reachable')
+print('  oracle   = same exit histogram as the baseline, samples chosen by score')
+print('  -> cost is identical by construction; only the selection differs')
 """),
         md("""
 ---
@@ -608,7 +641,8 @@ for (arch, dset), grp in base.groupby(['arch', 'dataset']):
         di, ci, confi, _ = tab[i]
         dj, _, _, _ = tab[j]
         common = di['sample_idx'].isin(dj['sample_idx']).to_numpy()
-        base_conf, _ = route_confidence(confi[common], ci[common], rho, TARGET_RHO)
+        base_conf, _, counts = route_confidence(confi[common], ci[common],
+                                                rho, TARGET_RHO)
         for s in SCORES:
             sign = -1.0 if s in HIGH_MEANS_EASY else 1.0
             in_seed = sign * di[s].to_numpy(dtype=float)[common]
@@ -616,8 +650,10 @@ for (arch, dset), grp in base.groupby(['arch', 'dataset']):
                 di['sample_idx'][common], s].to_numpy(dtype=float)
             if np.isnan(in_seed).all() or np.isnan(cross).all():
                 continue
-            a_in, _ = route_by(np.nan_to_num(in_seed, nan=np.inf), ci[common], rho, TARGET_RHO)
-            a_cx, _ = route_by(np.nan_to_num(cross,  nan=np.inf), ci[common], rho, TARGET_RHO)
+            a_in = route_matched(np.nan_to_num(in_seed, nan=np.inf),
+                                 ci[common], counts)
+            a_cx = route_matched(np.nan_to_num(cross, nan=np.inf),
+                                 ci[common], counts)
             rows.append({'arch': arch, 'dataset': dset, 'score': s,
                          'model_seed': i[-2:],
                          'score_seed': j[-2:], 'in_seed': a_in,
@@ -738,14 +774,14 @@ for tr in [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]:
         di, ci, confi, _ = exit_tables(i)
         dj, _, _, _ = exit_tables(j)
         common = di['sample_idx'].isin(dj['sample_idx']).to_numpy()
-        b, _ = route_confidence(confi[common], ci[common], rho, tr)
+        b, _, cnts = route_confidence(confi[common], ci[common], rho, tr)
         for sc in SCORES:
             sign = -1.0 if sc in HIGH_MEANS_EASY else 1.0
             cross = sign * dj.set_index('sample_idx').loc[
                 di['sample_idx'][common], sc].to_numpy(dtype=float)
             if np.isnan(cross).all():
                 continue
-            a, _ = route_by(np.nan_to_num(cross, nan=np.inf), ci[common], rho, tr)
+            a = route_matched(np.nan_to_num(cross, nan=np.inf), ci[common], cnts)
             sweep.append({'target_rho': tr, 'arch': arch, 'score': sc,
                           'headroom': (a - b) * 100})
 
