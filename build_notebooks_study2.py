@@ -519,6 +519,10 @@ def exit_tables(run_id):
 def _cost(k_assign, rho):
     return float(np.mean(np.asarray(rho)[k_assign]))
 
+def _cost_of_counts(counts, rho):
+    counts = np.asarray(counts, dtype=float)
+    return float((counts * np.asarray(rho)).sum() / counts.sum())
+
 def route_by(rank, correct, rho, target_rho, all_exits=True):
     '''Route each sample to an exit so the MEAN cost equals target_rho.
     Samples with the lowest `rank` exit earliest.
@@ -566,6 +570,82 @@ def route_confidence(conf, correct, rho, target_rho):
         else: hi = th
     counts = np.bincount(k_assign, minlength=K)
     return float(correct[np.arange(n), k_assign].mean()), c, counts
+
+def route_oracle(correct_choose, correct_eval, rho, target_rho):
+    '''The real oracle ceiling at a budget, by Lagrangian relaxation.
+
+    Choose an exit per sample to maximise expected correctness subject to a
+    mean-cost constraint:   max_k  correct[i,k] - lambda * rho[k],  bisect
+    lambda until the mean cost hits the budget. Because it is a maximum over
+    EVERY assignment meeting the budget, it dominates any particular router --
+    including a confidence threshold. That is what makes it a ceiling.
+
+    Two earlier attempts were not ceilings and both produced negative headroom:
+      1. sorting samples by a per-SAMPLE difficulty score, while the baseline
+         thresholded per-EXIT confidence -- the baseline was better informed;
+      2. forcing the oracle through the baseline's exit histogram -- filling
+         exits greedily by cheapest-correct-exit is a heuristic, not the
+         optimum, and canary 10 showed it losing by up to 3.2 points.
+
+    `correct_choose` picks the exits, `correct_eval` scores them. Passing the
+    same array gives the optimistic in-seed oracle; passing another seed's
+    correctness gives the honest cross-seed one.
+    '''
+    rho = np.asarray(rho, dtype=float)
+    n_ = correct_choose.shape[0]
+
+    def assign(lam):
+        return (correct_choose - lam * rho[None, :]).argmax(axis=1)
+
+    lo, hi = 0.0, 100.0
+    for _ in range(80):
+        lam = (lo + hi) / 2
+        if float(rho[assign(lam)].mean()) > target_rho: lo = lam
+        else: hi = lam
+    k = assign(hi)                       # cost <= target
+    k_rich = assign(lo)                  # cost >= target
+
+    # The argmax jumps in steps, so bisection typically lands UNDER budget --
+    # canary 12 caught it at 0.608 against a target of 0.65. Leftover budget
+    # understates the ceiling, so spend it: upgrade the samples with the best
+    # correctness gain per unit of extra compute until the budget is used.
+    idx = np.arange(n_)
+    cand = np.nonzero(k_rich != k)[0]
+    if len(cand):
+        dcost = rho[k_rich[cand]] - rho[k[cand]]
+        dgain = (correct_choose[cand, k_rich[cand]]
+                 - correct_choose[cand, k[cand]])
+        keep = dcost > 1e-12
+        cand, dcost, dgain = cand[keep], dcost[keep], dgain[keep]
+        if len(cand):
+            room = (target_rho - float(rho[k].mean())) * n_
+            for t in np.argsort(-(dgain / dcost), kind='stable'):
+                if dcost[t] > room:
+                    continue
+                k[cand[t]] = k_rich[cand[t]]
+                room -= dcost[t]
+                if room <= 1e-12:
+                    break
+    return float(correct_eval[idx, k].mean()), float(rho[k].mean())
+
+def oracle_rank(correct):
+    '''The cheapest exit at which the sample is ACTUALLY CORRECT (K if never).
+
+    This is what the early-exit literature means by an oracle -- "exit at the
+    first layer whose prediction matches the final one" (08_RELATED_WORK.md S1)
+    -- and it is per-EXIT information, K numbers per sample.
+
+    Everything measured before this used a per-SAMPLE difficulty score as the
+    "oracle" while the baseline thresholded per-EXIT confidence. The baseline
+    knew "am I right at exit k"; the score only knew "is this sample generically
+    hard". The baseline was strictly better informed, so the headroom came out
+    at -8 accuracy points -- which is a real statement about difficulty scores,
+    but is NOT a ceiling and must never be reported as one.
+    '''
+    correct = np.asarray(correct)
+    n_, K_ = correct.shape
+    ever = correct.any(axis=1)
+    return np.where(ever, correct.argmax(axis=1), K_).astype(float)
 
 def route_matched(rank, correct, counts):
     '''Route by `rank` using EXACTLY the exit histogram `counts`.
@@ -626,7 +706,7 @@ def rho_for(arch, dataset):
 
 TARGET_RHO = 0.80          # the operating point; the full curve comes next
 
-rows = []
+rows, orows = [], []
 for (arch, dset), grp in base.groupby(['arch', 'dataset']):
     ids = sorted(grp['run_id'])
     if len(ids) < 2:
@@ -643,6 +723,32 @@ for (arch, dset), grp in base.groupby(['arch', 'dataset']):
         common = di['sample_idx'].isin(dj['sample_idx']).to_numpy()
         base_conf, _, counts = route_confidence(confi[common], ci[common],
                                                 rho, TARGET_RHO)
+
+        # seed j's per-exit correctness, aligned onto seed i's common samples
+        idx_common = di['sample_idx'].to_numpy()[common]
+        posj = pd.Series(np.arange(len(dj)), index=dj['sample_idx'].to_numpy())
+        cj_al = tab[j][1][posj.loc[idx_common].to_numpy()]
+
+        # THE oracle: cheapest correct exit. In-seed = optimistic (it is scored
+        # from the very model it routes); cross-seed = honest.
+        a_in_true, c_in = route_oracle(ci[common], ci[common], rho, TARGET_RHO)
+        a_cx_true, c_cx = route_oracle(cj_al,      ci[common], rho, TARGET_RHO)
+        # An in-seed oracle knows this model's own correctness at every exit and
+        # spends an identical budget. It cannot lose to a threshold on that same
+        # model's confidence. If it does, the harness is broken, not the field.
+        if a_in_true < base_conf - 1e-6 and c_in <= _cost_of_counts(counts, rho) + 1e-6:
+            raise RuntimeError(
+                f'{arch} {i}: in-seed oracle {a_in_true:.4f} < confidence '
+                f'baseline {base_conf:.4f} at no greater cost '
+                f'({c_in:.4f} vs {_cost_of_counts(counts, rho):.4f}). The '
+                'oracle is a maximum over all assignments, so this is '
+                'impossible -- the routing harness is wrong.')
+        orows.append({'arch': arch, 'dataset': dset, 'model_seed': i[-2:],
+                      'score_seed': j[-2:], 'oracle_in': a_in_true,
+                      'oracle_cross': a_cx_true, 'baseline': base_conf,
+                      'bias_true': a_in_true - a_cx_true,
+                      'ceiling_honest': a_cx_true - base_conf,
+                      'ceiling_optimistic': a_in_true - base_conf})
         for s in SCORES:
             sign = -1.0 if s in HIGH_MEANS_EASY else 1.0
             in_seed = sign * di[s].to_numpy(dtype=float)[common]
@@ -663,6 +769,23 @@ for (arch, dset), grp in base.groupby(['arch', 'dataset']):
 
 bias = pd.DataFrame(rows)
 M.save_analysis(sess.data_dir, 's2_optimism_bias', bias)
+
+orc = pd.DataFrame(orows)
+M.save_analysis(sess.data_dir, 's2_true_oracle', orc)
+oc = orc[orc['dataset'] == 'cifar100']
+print()
+print('=== THE ORACLE CEILING (cheapest correct exit, matched budget) ===')
+print(f'{len(oc)} (arch, seed-pair) rows, CIFAR-100, rho = {TARGET_RHO}')
+print(f'  confidence baseline        : {oc["baseline"].median()*100:.2f} %')
+print(f'  oracle, in-seed            : {oc["oracle_in"].median()*100:.2f} %'
+      f'   (+{oc["ceiling_optimistic"].median()*100:.2f} pt)')
+print(f'  oracle, cross-seed (honest): {oc["oracle_cross"].median()*100:.2f} %'
+      f'   (+{oc["ceiling_honest"].median()*100:.2f} pt)')
+print()
+print(f'  OPTIMISM BIAS (in - cross) : '
+      f'{oc["bias_true"].median()*100:+.3f} accuracy points')
+print(f'  share of the apparent headroom that is optimism: '
+      f'{100*oc["bias_true"].median()/max(oc["ceiling_optimistic"].median(),1e-9):.1f} %')
 print(f'{len(bias)} (arch, score, seed-pair) rows')
 print(bias.groupby('score')[['bias', 'headroom_honest']].mean().round(4).to_string())
 """),

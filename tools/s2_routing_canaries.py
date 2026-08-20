@@ -103,5 +103,64 @@ gap = (a_orc - a_bad) * 100
 check(f'DETECTS real headroom when it exists ({gap:+.1f} pt, oracle '
       f'{a_orc:.3f} vs misleading confidence {a_bad:.3f})', gap > 5.0)
 
+oracle_rank = ns['oracle_rank']
+
+route_oracle = ns['route_oracle']
+
+# 10. THE INVARIANT. The in-seed oracle is a maximum over every assignment
+#     meeting the budget, so it cannot lose to a confidence threshold at no
+#     greater cost -- on ANY input. 200 adversarial draws, random budgets,
+#     confidence deliberately unrelated to correctness. The notebook asserts
+#     this on every (arch, seed) pair; if it can fail here, it will fail there.
+worst = 0.0
+for trial in range(200):
+    m = int(rng.integers(200, 2000))
+    cc = (rng.random((m, K)) < rng.random()).astype(float)
+    cf = rng.random((m, K))
+    tr = float(rng.uniform(0.3, 0.95))
+    b_, cb, _ = route_confidence(cf, cc, rho, tr)
+    a_, ca = route_oracle(cc, cc, rho, tr)
+    if ca <= cb + 1e-6:
+        worst = min(worst, a_ - b_)
+check(f'in-seed oracle never loses to confidence, 200 draws (worst {worst:+.6f})',
+      worst >= -1e-6)
+
+# 11. and it must be STRICTLY better when confidence is uninformative
+cc = np.zeros((n, K)); ez = rng.random(n) < .5
+cc[ez, :] = 1.0; cc[~ez, K-1] = 1.0
+b_, _, _ = route_confidence(rng.random((n, K)), cc, rho, 0.70)
+a_, _ = route_oracle(cc, cc, rho, 0.70)
+check(f'oracle beats uninformative confidence ({(a_-b_)*100:+.1f} pt)',
+      a_ - b_ > 0.05)
+
+# 12. the oracle must never OVERSPEND. It may underspend: in the easy/hard
+#     world above, every useful assignment costs at most 0.60, and buying more
+#     compute cannot buy more accuracy. Requiring equality here was my error --
+#     it asserted a property the problem does not have.
+_, c_ = route_oracle(cc, cc, rho, 0.65)
+check(f'oracle never overspends (cost {c_:.4f} <= 0.65)', c_ <= 0.65 + 1e-6)
+
+# 12b. and where the budget genuinely BINDS -- graded correctness, so deeper
+#      always helps a little -- it must be consumed, not left on the table.
+grad = (rng.random((n, K)) < np.linspace(0.35, 0.9, K)[None, :]).astype(float)
+grad = np.maximum.accumulate(grad, axis=1)        # deeper never hurts
+# With monotone correctness the oracle never wants more than the cheapest
+# correct exit, so 0.65 does not bind either -- it tops out near 0.42. The
+# budget only binds BELOW that, where samples must actually be sacrificed.
+_, cfree = route_oracle(grad, grad, rho, 0.99)
+check(f'unconstrained oracle cost {cfree:.4f} < 0.65 (so 0.65 cannot bind)',
+      cfree < 0.65)
+_, cg = route_oracle(grad, grad, rho, 0.30)
+check(f'oracle spends a genuinely binding budget (cost {cg:.4f} ~ 0.30)',
+      abs(cg - 0.30) < 0.02)
+
+# 13. cross-seed <= in-seed when the two seeds agree perfectly they must TIE;
+#     when seed j is pure noise the cross-seed oracle must be clearly worse.
+a_same, _ = route_oracle(cc, cc, rho, 0.70)
+noise = (rng.random((n, K)) < 0.5).astype(float)
+a_noise, _ = route_oracle(noise, cc, rho, 0.70)
+check(f'cross-seed with a noise instrument is worse ({(a_noise-a_same)*100:+.1f} pt)',
+      a_noise < a_same - 0.01)
+
 print(f'\n{sum(res)}/{len(res)} routing canaries pass')
 sys.exit(0 if all(res) else 1)
