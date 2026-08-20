@@ -213,6 +213,18 @@ for r in runs:
                  'dataset': m['dataset']}})
 mdf = pd.DataFrame(meta)
 base = mdf[mdf['method'] == 'base'] if 'method' in mdf else mdf
+# ---- one run per (arch, seed) -------------------------------------------
+# `resnet32x4` and `wrn_40_2` each have FIVE base runs: p0 pilots at seeds 1-2
+# plus p1 at seeds 1-3, with byte-identical configs. So p0-s1 and p1-s1 are the
+# SAME SEED run twice -- a replicate, which measures run-to-run nondeterminism,
+# not seed variation. Pooling them conflated two different quantities and let
+# two architectures supply 40 of 118 ordered pairs. Keep the highest phase.
+_before = len(base)
+base = (base.sort_values('phase')
+            .drop_duplicates(subset=['arch', 'dataset', 'seed'], keep='last'))
+if len(base) < _before:
+    print(f'  dropped {{_before - len(base)}} duplicate (arch, seed) run(s) '
+          f'-- pilot replicates; {{len(base)}} remain')
 per_arch = base.groupby('arch')['seed'].nunique().sort_values(ascending=False)
 print(f'{{per_arch.size}} architecture(s); '
       f'{{(per_arch >= 2).sum()}} have >=2 seeds (needed for rho_seed)')
@@ -489,6 +501,18 @@ print(f'usable scores            : {SCORES}  ({len(SCORES)} of {len(WANTED)})')
 if not SCORES:
     raise RuntimeError('no usable score columns -- refusing to continue')
 base = meta[meta['method'] == 'base']
+# ---- one run per (arch, seed) -------------------------------------------
+# `resnet32x4` and `wrn_40_2` each have FIVE base runs: p0 pilots at seeds 1-2
+# plus p1 at seeds 1-3, with byte-identical configs. So p0-s1 and p1-s1 are the
+# SAME SEED run twice -- a replicate, which measures run-to-run nondeterminism,
+# not seed variation. Pooling them conflated two different quantities and let
+# two architectures supply 40 of 118 ordered pairs. Keep the highest phase.
+_before = len(base)
+base = (base.sort_values('phase')
+            .drop_duplicates(subset=['arch', 'dataset', 'seed'], keep='last'))
+if len(base) < _before:
+    print(f'  dropped {_before - len(base)} duplicate (arch, seed) run(s) '
+          f'-- pilot replicates; {len(base)} remain')
 print(f'{len(base)} base run(s), {base["arch"].nunique()} architecture(s)')
 """),
         md("""
@@ -680,8 +704,8 @@ def route_matched(rank, correct, counts):
 
 print('routing helpers defined -- correctness and cost come from the parquet')
 print('  baseline = threshold on EARLY-exit confidence (deployable)')
-print('  oracle   = same exit histogram as the baseline, samples chosen by score')
-print('  -> cost is identical by construction; only the selection differs')
+print('  score routing = baseline exit histogram, samples chosen by score')
+print('  TRUE oracle   = Lagrangian max over every assignment meeting the budget')
 """),
         md("""
 ---
@@ -743,7 +767,14 @@ for (arch, dset), grp in base.groupby(['arch', 'dataset']):
                 f'({c_in:.4f} vs {_cost_of_counts(counts, rho):.4f}). The '
                 'oracle is a maximum over all assignments, so this is '
                 'impossible -- the routing harness is wrong.')
-        orows.append({'arch': arch, 'dataset': dset, 'model_seed': i[-2:],
+        ci_c = ci[common]
+        final_ok = ci_c[:, -1]
+        early_ok = ci_c[:, :-1].max(axis=1)
+        orows.append({'acc_full': float(final_ok.mean()),
+                      'acc_best_exit': float(ci_c.mean(axis=0).max()),
+                      'frac_early_saves': float(
+                          ((early_ok > 0) & (final_ok == 0)).mean()),
+                      'arch': arch, 'dataset': dset, 'model_seed': i[-2:],
                       'score_seed': j[-2:], 'oracle_in': a_in_true,
                       'oracle_cross': a_cx_true, 'baseline': base_conf,
                       'bias_true': a_in_true - a_cx_true,
@@ -786,6 +817,30 @@ print(f'  OPTIMISM BIAS (in - cross) : '
       f'{oc["bias_true"].median()*100:+.3f} accuracy points')
 print(f'  share of the apparent headroom that is optimism: '
       f'{100*oc["bias_true"].median()/max(oc["ceiling_optimistic"].median(),1e-9):.1f} %')
+
+# ---- the reference line that decides whether any of this is real ---------
+# An oracle that beats the network's OWN full-compute accuracy is not finding
+# headroom; it is exploiting samples where an early exit happens to be right
+# while the final layer is wrong. That is per-exit noise -- unavailable to any
+# router, and non-transferable across seeds by definition. If the in-seed
+# oracle sits above full compute, the optimism bias measures noise-harvesting,
+# which IS the paper's claim, but it has to be shown rather than assumed.
+print()
+print('--- reference lines (same runs, same samples) ---')
+print(f'  full compute, final exit   : {oc["acc_full"].median()*100:.2f} %')
+print(f'  best single exit, no routing: {oc["acc_best_exit"].median()*100:.2f} %')
+above = float((oc['oracle_in'] > oc['acc_full']).mean())
+print(f'  in-seed oracle ABOVE full compute in {above*100:.0f}% of runs '
+      f'(median {(oc["oracle_in"] - oc["acc_full"]).median()*100:+.2f} pt)')
+print(f'  samples where an early exit is right and the FINAL is wrong: '
+      f'{oc["frac_early_saves"].median()*100:.2f} %')
+print('  ^ this is the pool the in-seed oracle harvests from.')
+
+print()
+print('--- per architecture (is the bias driven by a few?) ---')
+pa = (oc.groupby('arch')[['ceiling_optimistic', 'ceiling_honest', 'bias_true']]
+        .median() * 100)
+print(pa.round(2).sort_values('bias_true', ascending=False).to_string())
 print(f'{len(bias)} (arch, score, seed-pair) rows')
 print(bias.groupby('score')[['bias', 'headroom_honest']].mean().round(4).to_string())
 """),

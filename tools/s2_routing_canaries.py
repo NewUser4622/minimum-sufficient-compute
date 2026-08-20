@@ -162,5 +162,39 @@ a_noise, _ = route_oracle(noise, cc, rho, 0.70)
 check(f'cross-seed with a noise instrument is worse ({(a_noise-a_same)*100:+.1f} pt)',
       a_noise < a_same - 0.01)
 
+# 14. THE BIAS MEASUREMENT ITSELF. Two seeds that are IDENTICAL must show
+#     exactly zero optimism bias. If the statistic manufactures a bias from a
+#     model compared with itself, every number in the study is that artifact.
+m_ = 6000
+sh = rng.random(m_)
+def _seeded(sd):
+    g = np.random.default_rng(sd)
+    p_ = np.clip(sh[:, None] * np.linspace(.5, 1.15, K)[None, :], 0, 1)
+    return (g.random((m_, K)) < p_).astype(float)
+c1 = _seeded(11)
+a1, _ = route_oracle(c1, c1, rho, 0.80)
+a2, _ = route_oracle(c1, c1, rho, 0.80)
+check(f'identical seeds -> bias exactly 0 ({(a1-a2)*100:+.4f} pt)',
+      abs(a1 - a2) < 1e-12)
+
+# 15. and INDEPENDENT seeds over the SAME underlying difficulty must show a
+#     clearly positive one -- otherwise the statistic cannot see bias at all.
+c2 = _seeded(22)
+ain, _ = route_oracle(c1, c1, rho, 0.80)
+acx, _ = route_oracle(c2, c1, rho, 0.80)
+check(f'independent seeds -> positive bias ({(ain-acx)*100:+.1f} pt)',
+      (ain - acx) * 100 > 1.0)
+
+# 16. THE MECHANISM. An oracle's excess over the network's own full-compute
+#     accuracy must be drawn from samples where an early exit is right and the
+#     FINAL layer is wrong -- per-exit noise, unavailable to any real router.
+#     These two quantities should coincide; if they diverge, the oracle is
+#     gaining from somewhere unexplained and the story is wrong.
+full = c1[:, -1].mean()
+pool = ((c1[:, :-1].max(axis=1) > 0) & (c1[:, -1] == 0)).mean()
+excess = ain - full
+check(f'oracle excess {excess*100:+.2f} pt == early-right/final-wrong pool '
+      f'{pool*100:.2f} pt', abs(excess - pool) < 0.005)
+
 print(f'\n{sum(res)}/{len(res)} routing canaries pass')
 sys.exit(0 if all(res) else 1)
