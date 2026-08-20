@@ -3,9 +3,52 @@
 Newest first. Every entry: what changed, what it cost, what it settled, what is
 next. Updated every session.
 
-**Current state: P0 and P1 both run. The pre-registered centrepiece (H3, the
-optimism bias) is NOT SUPPORTED. Two unplanned findings are stronger than the
-plan was. NB2 must be re-run — its baseline was mis-specified.**
+**Current state: COMPLETE. Written up in [`PAPER.md`](PAPER.md).**
+
+---
+
+## 2026-08-20 (final) · result verified against the CSVs, paper written
+
+Checked `analysis/s2_true_oracle.csv` directly rather than trusting the
+notebook's printout. Three defects found, one substantive.
+
+**The result (90 CIFAR pairs, rho = 0.80):**
+
+| | median |
+|---|---|
+| confidence baseline | 62.39 % |
+| full compute | 71.21 % |
+| oracle, in-seed | 78.30 % |
+| oracle, cross-seed | 54.50 % |
+| **optimism bias** | **+22.41 pt** |
+
+- in-seed oracle >= baseline on **90/90** rows — the invariant holds
+- cross-seed oracle below full compute on **90/90** pairs
+- **0 of 15** architectures with positive honest headroom
+- negative at every budget, rho = 0.40 … 0.95
+
+**The budget never binds.** `oracle_in == acc_full + frac_early_saves` exactly
+on all 90 rows, so the in-seed oracle is P(correct at ANY exit) and rho = 0.80
+is inactive. It spends *less* than the baseline while scoring higher — so this
+was never a matched-FLOPs comparison and the paper does not call it one. It
+stays a valid, conservative upper bound. The notebook now detects and says this.
+
+**Two presentation defects.** P0a computed its correlation matrix on
+`p0-resnet32x4-...-s1`, a pilot replicate dedupe had already dropped. And NB2
+printed `78.30 %`, `62.39 %` and `+12.20 pt` together, which do not subtract
+(78.30 − 62.39 = 15.91) — the deltas are medians of per-run differences, the
+levels are medians of levels. Both fixed.
+
+**Reassuring:** the bias was 22.41 both before and after dedupe because
+`resnet32x4` (22.88) and `wrn_40_2` (22.28) sat either side of the median. That
+is robustness, not a stuck number — checked in the CSV.
+
+**Added:** a mechanism test for the memorisation finding (§4.3). Saturation is
+currently a hypothesis; `S2_NB1` now correlates the reliability drop against
+train accuracy and the fraction of samples with top-1 probability > 0.99. If
+those come back weak, the subsection is withdrawn rather than reworded.
+
+**Written:** `PAPER.md`, `README.md` (both study2 and repo root).
 
 ---
 

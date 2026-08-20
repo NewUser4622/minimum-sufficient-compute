@@ -437,6 +437,57 @@ if len(side):
 """),
         md("""
 ---
+## The memorisation effect — and a test of why
+
+`ce_loss` reliability is 0.647 on the test split for `mixer_nano` and 0.108 on
+`train_holdout`. `train_holdout` is **a slice of train, not withheld from it**
+(`msc_lib._in100_loaders`), so the network has fit those samples.
+
+The proposed mechanism is **saturation**: on data it has memorised, a
+high-capacity network is confident on nearly everything, the per-sample ranking
+becomes degenerate, and seed agreement collapses. That is a hypothesis, so the
+cell below tests it rather than asserting it — if the collapse is saturation,
+the drop must track how completely each architecture fits the training data.
+"""),
+        code("""
+rows_m = []
+for (arch, dset), grp in base.groupby(['arch', 'dataset']):
+    if dset != 'cifar100':
+        continue
+    for r in sorted(grp['run_id']):
+        d_tr = pd.read_parquet(runs_dir / r / 'per_sample' / 'train_holdout.parquet')
+        d_te = pd.read_parquet(runs_dir / r / 'per_sample' / 'test.parquet')
+        ks = sorted(int(c.split('_d')[1]) for c in d_tr.columns
+                    if c.startswith('pred_d') and c.split('_d')[1].isdigit())
+        kf = f'pred_d{ks[-1]}'
+        acc_tr = float((d_tr[kf] == d_tr['label']).mean())
+        acc_te = float((d_te[kf] == d_te['label']).mean())
+        # how peaked is the softmax on memorised data?
+        sat = float((d_tr[f'top1p_d{ks[-1]}'] > 0.99).mean())
+        rows_m.append({'arch': arch, 'run_id': r, 'acc_train': acc_tr,
+                       'acc_test': acc_te, 'gap': acc_tr - acc_te,
+                       'frac_conf_over_99': sat})
+
+mem = pd.DataFrame(rows_m).groupby('arch').mean(numeric_only=True)
+drop = (main[main['score'] == 'ce_loss'].set_index('arch')['rho_seed']
+        - grid[(grid['split'] == 'train_holdout') & (grid['dataset'] == 'cifar100')
+               & (grid['score'] == 'ce_loss')].set_index('arch')['rho_seed'])
+mem['rho_drop'] = drop
+mem = mem.dropna().sort_values('rho_drop', ascending=False)
+M.save_analysis(sess.data_dir, 's2_memorisation', mem.reset_index())
+print(mem.round(3).to_string())
+
+for col in ['acc_train', 'gap', 'frac_conf_over_99']:
+    rr, pp = spearmanr(mem[col], mem['rho_drop'])
+    verdict = 'consistent with saturation' if rr > 0.5 and pp < 0.05 else \
+              ('AGAINST saturation' if rr < 0 else 'inconclusive')
+    print(f'  Spearman({col:18s}, rho_drop) = {rr:+.3f}  p = {pp:.4f}   {verdict}')
+print()
+print('If train accuracy and softmax saturation do NOT predict the drop, the')
+print('memorisation story is wrong and must be withdrawn, not reworded.')
+"""),
+        md("""
+---
 ## R1 — the verdict
 
 **H1:** ρ_seed varies across the grid by at least **0.15**.

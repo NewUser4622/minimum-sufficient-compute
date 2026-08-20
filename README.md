@@ -11,22 +11,46 @@ live in this repository:
 |---|---|---|---|---|
 | **Study 1 · CIFAR-100** | 50k @ 32px | small | 15 | complete — [`docs/cifar100/10_FINAL_RESULTS.md`](docs/cifar100/10_FINAL_RESULTS.md) |
 | **Study 1 · ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
-| **Study 2** | both, re-analysed | — | 15 + 2 | **proposal** — [`study2/README.md`](study2/README.md) |
+| **Study 2** | CIFAR-100, re-analysed | — | 15 | **complete** — [`study2/PAPER.md`](study2/PAPER.md) |
 
-**Study 2 is a design, not a result.** It reuses Study 1's 49 measured runs to
-ask a question that does not depend on MSC being a good metric, and it is built
-so the cheap measurements gate the expensive ones. Start at
-[`study2/README.md`](study2/README.md); the decisions it needs are in
-[`study2/05_OPEN_DECISIONS.md`](study2/05_OPEN_DECISIONS.md).
+### Study 2, in one line
+
+> **Oracle upper bounds for early-exit routing are inflated by +22.41 accuracy
+> points — more than the entire headroom they appear to show — and the excess is
+> per-exit noise that does not survive a change of training seed.**
+
+At ρ = 0.80, across 15 architectures × 3 seeds (90 ordered seed pairs): an
+oracle scored from the **same** seed it routes reaches **78.30 %**; scored from a
+**different** seed it reaches **54.50 %**; a deployable confidence baseline
+reaches **62.39 %**. **0 of 15** architectures keep positive honest headroom, at
+any budget from ρ = 0.40 to 0.95.
+
+The mechanism is exact: the in-seed oracle beats the network's *own full-compute
+accuracy* in 100 % of runs by a median of **+6.86 pt**, and the fraction of
+samples where an early exit is right while the final layer is wrong is
+**6.86 %** — the same number. The bound harvests per-exit noise.
+
+**This confirms Study 1 rather than overturning it.** B11's +0.00007 was read as
+a possible MSC artifact; it was not.
+
+Study 2 cost **no training and no new runs** — Study 1's per-sample parquets
+already held per-exit predictions, so it is CPU re-analysis. Start at
+[`study2/PAPER.md`](study2/PAPER.md).
 
 ---
 
 ## Start here
 
-**If you want the science** — what was predicted, what was measured, and what
-is actually new — read
-[`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md).
-It scores all five pre-registered hypotheses against **both** studies.
+**If you want the science**, read [`study2/PAPER.md`](study2/PAPER.md) — the
+newest and strongest result, and the one that does not depend on MSC being a
+good metric. For Study 1, read
+[`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md),
+which scores all five pre-registered hypotheses against **both** datasets.
+
+**If you want to know how the work goes wrong**, read
+[`study2/README.md`](study2/README.md) §"What actually went wrong" — the same
+measurement was implemented incorrectly three times, each producing a plausible
+number, before a canary caught it.
 
 **If you want the current operational state**, read
 [`docs/imagenet100/24_IN100_STATUS.md`](docs/imagenet100/24_IN100_STATUS.md).
