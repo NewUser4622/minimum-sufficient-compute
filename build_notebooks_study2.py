@@ -297,7 +297,7 @@ def collinearity(split, cols):
     # all-NaN matrix, and the conclusion "the scores carry distinct
     # information". A statistic that returns a reassuring answer from zero
     # samples is the D-37 shape: a check that cannot fail. This one refuses.
-    X = score_matrix(runs[0], split, cols)
+    X = score_matrix(REF_RUN, split, cols)
     cm = pd.DataFrame(np.nan, index=cols, columns=cols)
     npair = pd.DataFrame(0, index=cols, columns=cols)
     for a_ in range(len(cols)):
@@ -313,13 +313,20 @@ def collinearity(split, cols):
             'Refusing to conclude anything about collinearity.')
     return cm, nmin
 
+# runs[0] was 'p0-resnet32x4-...-s1' -- a pilot replicate that dedupe had
+# already dropped from `base`. The collinearity matrix was being computed on a
+# run excluded from every other result in this notebook.
+REF_RUN = sorted(base['run_id'])[0]
+print(f'reference run for P0a: {REF_RUN}')
+print()
+
 CM = {}
 for sp, cols in AVAIL.items():
     if len(cols) < 2:
         continue
     cm_, nmin_ = collinearity(sp, cols)
     CM[sp] = cm_
-    print(f'|Spearman| between scores -- {sp}, run {runs[0]}  '
+    print(f'|Spearman| between scores -- {sp}, run {REF_RUN}  '
           f'(pairwise, min n={nmin_:,})')
     print(cm_.round(2).to_string())
     print()
@@ -807,11 +814,19 @@ oc = orc[orc['dataset'] == 'cifar100']
 print()
 print('=== THE ORACLE CEILING (cheapest correct exit, matched budget) ===')
 print(f'{len(oc)} (arch, seed-pair) rows, CIFAR-100, rho = {TARGET_RHO}')
-print(f'  confidence baseline        : {oc["baseline"].median()*100:.2f} %')
-print(f'  oracle, in-seed            : {oc["oracle_in"].median()*100:.2f} %'
-      f'   (+{oc["ceiling_optimistic"].median()*100:.2f} pt)')
-print(f'  oracle, cross-seed (honest): {oc["oracle_cross"].median()*100:.2f} %'
-      f'   (+{oc["ceiling_honest"].median()*100:.2f} pt)')
+# Levels and deltas printed separately. A median of differences is NOT the
+# difference of medians -- the first version printed 78.30 %, 62.39 % and
+# "+12.20 pt" together, and those do not subtract (78.30-62.39 = 15.91). A
+# reader checking the arithmetic concludes the table is broken.
+print('  medians of the LEVELS:')
+print(f'    confidence baseline        : {oc["baseline"].median()*100:6.2f} %')
+print(f'    oracle, in-seed            : {oc["oracle_in"].median()*100:6.2f} %')
+print(f'    oracle, cross-seed (honest): {oc["oracle_cross"].median()*100:6.2f} %')
+print('  medians of the PER-RUN DIFFERENCES (what the hypotheses test):')
+print(f'    in-seed  - baseline        : '
+      f'{oc["ceiling_optimistic"].median()*100:+6.2f} pt')
+print(f'    cross-seed - baseline      : '
+      f'{oc["ceiling_honest"].median()*100:+6.2f} pt')
 print()
 print(f'  OPTIMISM BIAS (in - cross) : '
       f'{oc["bias_true"].median()*100:+.3f} accuracy points')
@@ -835,6 +850,19 @@ print(f'  in-seed oracle ABOVE full compute in {above*100:.0f}% of runs '
 print(f'  samples where an early exit is right and the FINAL is wrong: '
       f'{oc["frac_early_saves"].median()*100:.2f} %')
 print('  ^ this is the pool the in-seed oracle harvests from.')
+
+# If oracle_in is exactly acc_full + frac_early_saves, it is simply
+# P(correct at ANY exit): the rho constraint is inactive, the oracle spends
+# LESS than the baseline while scoring higher, and "matched FLOPs" is the wrong
+# phrase. It stays a valid upper bound, and a conservative one -- the baseline
+# at the oracle's lower cost would be worse still.
+slack = float((oc['oracle_in'] - oc['acc_full']
+               - oc['frac_early_saves']).abs().max())
+if slack < 1e-9:
+    print()
+    print(f'  NOTE: the rho={TARGET_RHO} budget NEVER BINDS for the in-seed oracle.')
+    print('  oracle_in == P(correct at ANY exit) exactly, on every run, so this')
+    print('  is the UNCONSTRAINED bound and is not a matched-FLOPs comparison.')
 
 print()
 print('--- per architecture (is the bias driven by a few?) ---')
@@ -987,6 +1015,22 @@ r, p = spearmanr(m['unreliability'], m['bias'])
 print(f'n = {len(m)} (arch, score) cells')
 print(f'Spearman(1 - rho_seed, bias) = {r:+.3f}   p = {p:.4f}')
 print(f'H4 (>= 0.5): {"SUPPORTED" if r >= 0.5 else "NOT SUPPORTED"}')
+
+# The test above uses the per-SCORE bias. The ORACLE bias is the study's actual
+# quantity, so test that too rather than letting the reader assume they agree.
+try:
+    orc2 = pd.read_csv(Path(sess.data_dir) / 'analysis' / 's2_true_oracle.csv')
+    orc2 = orc2[orc2['dataset'] == 'cifar100']
+    rel = (grid[grid['score'] == 'ce_loss'][['arch', 'rho_seed']]
+           .drop_duplicates('arch'))
+    jj = (orc2.groupby('arch')['bias_true'].median().reset_index()
+          .merge(rel, on='arch'))
+    r2, p2 = spearmanr(1 - jj['rho_seed'], jj['bias_true'])
+    print()
+    print(f'  same test on the ORACLE bias: rho = {r2:+.3f}  p = {p2:.4f}  '
+          f'(n = {len(jj)} architectures)')
+except Exception as e:
+    print(f'  [oracle-bias variant skipped: {type(e).__name__}: {e}]')
 print()
 print('per-score medians (the scatter behind the number):')
 print(j.groupby('score')[['rho_seed', 'bias']].median().round(4).to_string())
