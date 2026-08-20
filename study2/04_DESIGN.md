@@ -1,5 +1,17 @@
 # Study 2 — the plan
 
+> **SUPERSEDED by the results. Kept as the plan that was actually followed, so
+> the plan and the outcome can be compared.** Three things below are now known
+> to be wrong, all corrected in [`PAPER.md`](PAPER.md):
+>
+> 1. **"8 scores" is really 3 families.** `msp`/`margin`/`entropy`/`ce_loss`
+>    correlate at ρ = 0.997–1.000. Read every "× 8 scores" as "× 3 families";
+>    the grid's effective n is 3 × 15.
+> 2. **Only 5 scores exist on the test split.** `msc` is never persisted, and
+>    `el2n`/`forget_events` are NaN for samples with no training history.
+> 3. **P1 needed no GPU.** The "~6 GPU-h" below was wrong: per-exit predictions
+>    were already in the parquets, so the whole study ran on CPU.
+
 Three phases, ordered so the cheap measurements decide whether the expensive
 ones happen. This is the inversion of Study 1
 (`01_POSTMORTEM.md` §"The through-line").

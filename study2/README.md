@@ -26,16 +26,27 @@ Across 15 CIFAR-100 architectures × 3 seeds (90 ordered seed pairs), at ρ = 0.
 **0 of 15** architectures retain positive honest headroom, at any budget from
 ρ = 0.40 to 0.95.
 
-### The mechanism, exactly
+### The core claim, and what it rests on
 
-The in-seed oracle beats the network's **own full-compute accuracy** in 100 % of
-runs, by a median of **+6.86 pt**. The fraction of samples where an early exit is
-right while the final layer is wrong is **6.86 %**. Identical, because at ρ = 0.80
-the budget never binds and the oracle is simply *P(correct at any exit)*.
+The bias splits into two parts that are **not** equally well evidenced:
 
-An oracle bound above full compute is not finding headroom — it is harvesting
-samples the network gets right early and wrong at the end. That pool is noise:
-unreachable by any router, and gone when the seed changes.
+| | median | share | strength |
+|---|---|---|---|
+| **A** in-seed oracle above the network's **own full accuracy** | **+6.86 pt** | 31 % | **exact identity, unarguable** |
+| **B** cross-seed oracle below full accuracy | +15.33 pt | 69 % | weaker — see below |
+
+**A is the result.** `oracle_in − acc_full == frac_early_saves` to numerical
+precision on all 90 rows: at ρ = 0.80 the budget never binds, so the in-seed
+oracle is just *P(correct at any exit)*. The published-style bound therefore sits
+**6.86 points above the accuracy you get by simply running the whole network** —
+unreachable by any router, because the excess is entirely samples the net gets
+right early and **wrong at the end**. It needs no second seed to establish.
+
+**B is weaker and we say so.** It conflates "the signal does not transfer" with
+"acting on a non-transferring signal is worse than not acting". An earlier draft
+folded both into one +22.41 pt headline and attributed it all to noise
+harvesting; checking showed the bias does **not** correlate with the noise pool
+across architectures (ρ = +0.011), so the claim was decomposed instead.
 
 ### Hypotheses as pre-registered
 
@@ -62,7 +73,10 @@ negative across five scores and seven budgets, and Study 2 supplies the reason.
   the test split and `train_holdout` — which is a slice *of* train. Low-capacity
   nets barely move (`mobilenetv2` 0.874 → 0.849). `forget_events` stays at 0.852.
   Dataset pruning computes exactly these scores, on exactly this data, from one
-  seed. *(Saturation is the proposed mechanism; `S2_NB1` now tests it.)*
+  seed. **Mechanism confirmed:** the drop is predicted by softmax saturation
+  (ρ = **+0.832**) and train accuracy (**+0.746**), but **not** by test accuracy
+  (**−0.114**) — so it is not "weaker models are noisier". It is independent of
+  the oracle result (bias vs saturation: −0.214).
 
 ---
 

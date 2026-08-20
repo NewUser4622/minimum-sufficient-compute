@@ -88,6 +88,15 @@ disattenuation consequence for published cross-architecture comparisons.
 **This weakens R1 as a headline.** It should be positioned as the *instrument*
 for the optimism-bias result, not as the finding.
 
+**MEASURED 2026-08-20 — and this section understated what was available.** The
+seed instability of these scores is known qualitatively, but nobody appears to
+have reported that it is **conditional on whether the model has fit the data**:
+ce_loss ρ_seed falls from 0.647 to **0.108** for `mixer_nano` between held-out
+and memorised samples, predicted by softmax saturation (ρ = +0.832) and not by
+test accuracy (−0.114). Dataset-pruning methods compute these scores on training
+data, from one seed, for exactly the high-capacity models where the collapse is
+worst. See [`PAPER.md`](PAPER.md) §4.3.
+
 ## 5. Cross-architecture difficulty agreement — reported, uncorrected
 
 [Deep Learning Through the Lens of Example Difficulty](https://arxiv.org/pdf/2106.09647)
@@ -102,6 +111,10 @@ of number R2 says is attenuated by an unmeasured amount.
 > — [Does the Definition of Difficulty Matter?](https://arxiv.org/html/2411.00973)
 
 This is the one result that makes the plan *worse*, and it must not be buried.
+**MEASURED 2026-08-20: this risk was real and worse than the survey suggested.**
+The four softmax scores correlate at **ρ = 0.997–1.000**, not 70 %. Eight
+candidates are three families. See [`PAPER.md`](PAPER.md) §4.1.
+
 If eight scores are largely one score, then "8 scores × 15 architectures" is not
 120 independent cells, and R1/R4's effective n is much smaller than it looks.
 

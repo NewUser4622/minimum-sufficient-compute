@@ -1,8 +1,10 @@
 # Oracle upper bounds for early-exit routing are inflated by per-exit noise
 
-**Status: draft. Every number below is measured and traceable to a CSV in
-`analysis/`. One claim (§4, the saturation mechanism) is a hypothesis with a
-test attached that has not been run yet, and is marked as such.**
+**Status: draft, all measurements complete.** Every number is traceable to a CSV
+in `analysis/`. The saturation mechanism (§4.3) was a hypothesis in the first
+draft and is now tested and confirmed. §3.1 carries a correction: the first
+draft attributed the whole optimism bias to noise harvesting, which the data
+does not support — it is decomposed there instead.
 
 ---
 
@@ -18,17 +20,23 @@ above a deployable confidence baseline, but a cross-seed oracle sits
 **−7.90 points** below it. The optimism is **+22.41 accuracy points** — larger
 than the entire apparent headroom, in **0 of 15** architectures leaving any
 positive honest ceiling, and negative at every compute budget from ρ = 0.40 to
-0.95. We identify the mechanism exactly: the in-seed oracle's excess over the
-network's own full-compute accuracy equals, to numerical precision, the
-fraction of samples where some early exit is correct while the final layer is
-wrong. That pool is per-exit noise; it does not survive a change of seed, and
-no deployable router can reach it.
+0.95. The bias decomposes into two parts of unequal evidential weight. **+6.86 pt is
+an exact identity**: the in-seed oracle exceeds the network's *own full-compute
+accuracy* in 100 % of runs, by precisely the fraction of samples where some
+early exit is correct while the final layer is wrong. That component needs no
+second seed, cannot be reached by any router, and is the paper's core claim.
+The remaining +15.33 pt measures failure to transfer across seeds and is weaker
+evidence, since it conflates non-transfer with the cost of acting on a
+non-transferring signal; we report it separately rather than folded in.
 
 We also report a reliability atlas for five per-sample difficulty scores across
 the same grid, and two secondary findings: the four softmax-derived scores are
 **one signal** (ρ = 0.997–1.000), and score reliability **collapses on training
-data the network has fit** (ce_loss ρ_seed 0.647 → 0.108 for `mixer_nano`),
-which is precisely where the dataset-pruning literature computes them.
+data the network has fit** (ce_loss ρ_seed 0.647 → 0.108 for `mixer_nano`) —
+which is precisely where the dataset-pruning literature computes them. The
+collapse is predicted by softmax saturation (ρ = **+0.832**) and by train
+accuracy (**+0.746**), but **not** by test accuracy (−0.114), so it is not a
+generic "weaker model" effect.
 
 ---
 
@@ -109,6 +117,10 @@ from `analysis/s2_true_oracle.csv`.
 | **oracle, in-seed** | **78.30 %** | [76.11, 79.69] |
 | **oracle, cross-seed** | **54.50 %** | [52.13, 60.07] |
 
+The single most important comparison is **oracle in-seed (78.30 %) against full
+compute (71.21 %)**: the bound sits above the accuracy you get by simply running
+the whole network.
+
 | difference (per-run medians) | value |
 |---|---|
 | in-seed − baseline (the published-style bound) | **+12.20 pt** |
@@ -130,27 +142,56 @@ from +15.93 pt (`resnet8x4`) to +32.18 pt (`mixer_nano`) of bias.
 | best deployable score | −5.68 | −8.48 | −9.99 | −9.09 | −6.30 | −3.35 | −1.34 |
 | `pred_depth` (oracle-only) | −4.00 | −4.96 | −4.60 | −3.91 | −3.06 | −1.72 | −0.81 |
 
-### 3.1 The mechanism, exactly
+### 3.1 Decomposing the bias — and what is actually unarguable
 
-The in-seed oracle exceeds the network's **own full-compute accuracy** in
-**100 %** of runs, by a median of **+6.86 pt**. The fraction of samples where
-some early exit is correct while the final layer is wrong is **6.86 %**.
+**Correction applied after checking.** An earlier draft attributed the whole
++22.41 pt to per-exit noise harvesting. That is wrong: across architectures the
+bias does **not** correlate with the size of the noise pool
+(Spearman = **+0.011**). The bias has two components with very different
+evidential strength, and they must be separated.
 
-These are the same number because, at ρ = 0.80, **the budget never binds**:
-`oracle_in == acc_full + frac_early_saves` exactly, on all 90 rows. The in-seed
-oracle is simply *P(correct at any exit)*.
+```
+bias = (in-seed − full compute) + (full compute − cross-seed)
+     =        A                 +           B
+```
 
-That identity is the whole result. An oracle bound above full compute is not
-finding headroom — it is collecting samples the network gets right early **and
-wrong at the end**. That is per-exit noise. It cannot be predicted by any
-router, and it does not transfer across seeds, which is exactly why the
-cross-seed instrument removes it.
+| | median | range | share |
+|---|---|---|---|
+| **A** in-seed oracle **above** the network's own full accuracy | **+6.86 pt** | [4.81, 11.56] | 31 % |
+| **B** cross-seed oracle **below** full accuracy | **+15.33 pt** | [7.64, 27.81] | 69 % |
+| A + B | +22.19 pt | | |
+| measured bias (median of per-run values) | **+22.41 pt** | | |
 
-**A consequence for how this must be described:** because the budget is
-inactive, the in-seed oracle *spends less than the baseline while scoring
-higher*, so this is **not** a matched-FLOPs comparison and we do not call it
-one. It remains a valid upper bound, and a conservative one — the baseline at
-the oracle's lower cost would be worse still.
+Both are positive in **100 %** of runs.
+
+**A is unarguable and is the paper's core claim.** It is an exact identity:
+`oracle_in − acc_full == frac_early_saves` to numerical precision on all 90
+rows (max deviation 0.000000000 pt), because at ρ = 0.80 the budget never binds
+and the in-seed oracle is simply *P(correct at any exit)*.
+
+So the published-style bound sits **6.86 points above the accuracy the network
+achieves when you simply run all of it**. No router can reach that, whatever its
+signal, because the excess consists entirely of samples the network gets right
+at some early exit and **wrong at the final layer**. It is per-exit noise, it is
+not a property of the samples, and it does not survive a change of seed.
+
+*A needs no second seed to establish.* It follows from one trained network and
+its own per-exit predictions. That makes it the most robust result here.
+
+**B is weaker and we flag it as such.** It measures how badly seed *j*'s
+correctness transfers to seed *i* — but it conflates *"the signal does not
+transfer"* with *"acting on a non-transferring signal is worse than not
+acting at all"*. A cross-seed oracle maximises seed *j*'s accuracy, which at a
+fixed budget forces early exits that seed *i* may not survive. A reviewer may
+fairly read B as evidence about a mis-specified router rather than about a
+ceiling. We report it, decomposed, rather than folding it into a single headline
+number.
+
+**Consequence for how this is described.** Because the budget is inactive, the
+in-seed oracle *spends less than the baseline while scoring higher*, so this is
+**not** a matched-FLOPs comparison and we do not call it one. It remains a valid
+upper bound, and a conservative one — the baseline at the oracle's lower cost
+would be worse still.
 
 ### 3.2 Relation to Study 1
 
@@ -214,12 +255,26 @@ curriculum learning compute exactly these softmax scores, on exactly this data
 models those methods target, a single-seed softmax difficulty score on training
 data carries almost no reproducible signal, while EL2N and forgetting events do.
 
-> **Hypothesis, not yet confirmed.** The proposed mechanism is softmax
-> saturation: on memorised data the network is confident on nearly everything,
-> the ranking degenerates, and seed agreement collapses. `S2_NB1` now contains a
-> cell that tests it — the drop must track train accuracy and the fraction of
-> samples with top-1 probability > 0.99. **If those correlations come back weak
-> or negative, this subsection is withdrawn, not reworded.**
+**Mechanism: confirmed.** Saturation was a hypothesis in the first draft; the
+test is now run (`analysis/s2_memorisation.csv`, 15 architectures):
+
+| predictor of the reliability drop | Spearman |
+|---|---|
+| fraction of train samples with top-1 probability > 0.99 | **+0.832** |
+| train accuracy | **+0.746** |
+| train − test accuracy gap | +0.693 |
+| **test accuracy** (the control) | **−0.114** |
+
+`convnext_femto` fits 99.99 % of the training set with 71 % of samples above
+0.99 confidence and drops 0.558; `mobilenetv2` fits 83.1 % with 16 % saturated
+and drops 0.026. The near-zero correlation with *test* accuracy is the control
+that matters: this is not "worse models are noisier". It is that a network which
+has memorised its training data produces a degenerate ranking on it, and the
+ranking is what every one of these scores depends on.
+
+**This is independent of the oracle result.** The optimism bias does not
+correlate with saturation (−0.214) or train accuracy (−0.221). Two separate
+findings, not one mechanism seen twice.
 
 ## 5. Limitations
 
@@ -233,6 +288,10 @@ data carries almost no reproducible signal, while EL2N and forgetting events do.
   "a mis-specified router does badly" rather than "the ceiling is negative". The
   claim we defend is the **bias** (+22.41 pt), which is a difference between two
   oracles built identically and differing only in whose noise they see.
+- **H4 is not supported on the oracle bias either.** Testing
+  corr(1 − ρ_seed, oracle bias) across architectures gives ρ = +0.232 to +0.457
+  depending on which score supplies the reliability estimate — the right sign,
+  consistently, but below the pre-registered 0.5 on every one.
 - **R-03 fired.** Within-pair asymmetry (0.719 pt) exceeds the *per-score* bias
   (−0.57 pt), so the sign of that secondary quantity is not interpretable until
   seed accuracy is regressed out. It does not touch the oracle bias, which is

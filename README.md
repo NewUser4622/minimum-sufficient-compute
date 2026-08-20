@@ -25,10 +25,13 @@ oracle scored from the **same** seed it routes reaches **78.30 %**; scored from 
 reaches **62.39 %**. **0 of 15** architectures keep positive honest headroom, at
 any budget from ρ = 0.40 to 0.95.
 
-The mechanism is exact: the in-seed oracle beats the network's *own full-compute
-accuracy* in 100 % of runs by a median of **+6.86 pt**, and the fraction of
-samples where an early exit is right while the final layer is wrong is
-**6.86 %** — the same number. The bound harvests per-exit noise.
+The load-bearing part is an **exact identity**: the in-seed oracle beats the
+network's *own full-compute accuracy* (71.21 %) in 100 % of runs by a median of
+**+6.86 pt**, which equals the fraction of samples that are right at some early
+exit and **wrong at the final layer**. A bound above full compute cannot be
+reached by any router. That component needs no second seed; the remaining
++15.33 pt of the bias measures cross-seed non-transfer and is reported
+separately as weaker evidence.
 
 **This confirms Study 1 rather than overturning it.** B11's +0.00007 was read as
 a possible MSC artifact; it was not.

@@ -34,7 +34,19 @@ asserts, no 79-hour commitments before a cheap check.
 
 ---
 
-## R-01 · Both halves land as nulls · **HIGH → mitigated**
+## R-01 · Both halves land as nulls · **DID NOT OCCUR**
+
+**Outcome 2026-08-20.** H1 supported (range 0.667), H3 supported for the
+per-exit oracle (+22.41 pt), H5 supported (headroom negative everywhere). The
+fallback — the reliability atlas as a standalone artifact — was not needed, and
+an unplanned finding (§4.3, difficulty scores collapse on memorised data,
+mechanism confirmed at ρ = +0.832) turned out stronger than two of the planned
+hypotheses.
+
+---
+
+### original entry
+
 
 **Was the design flaw in v1.** R1 could come back flat and R3 *predicted* a
 null, so the paper could have been "two things we didn't find".
@@ -111,7 +123,17 @@ adjusted numbers.
 
 **This check is cheap and I would not have thought of it in Study 1.**
 
-## R-04 · The operating point drives the result · **MEDIUM**
+## R-04 · The operating point drives the result · **CHECKED, DID NOT OCCUR**
+
+**Outcome 2026-08-20.** The full budget sweep was run (ρ = 0.40 … 0.95,
+`s2_headroom_sweep.csv`). Honest headroom is negative at **every** operating
+point for **every** score, so the conclusion is not an artifact of ρ = 0.80. The
+detector below was the right one and it was used.
+
+---
+
+### original entry
+
 
 Study 1's B11 was evaluated at ρ = 0.806 — one point on a curve. A ceiling that
 is flat at 80% compute might not be at 40%.
@@ -132,7 +154,27 @@ cross-scale magnitude claim). If a reviewer-proof scale claim becomes necessary,
 `04_DESIGN.md` P2b adds `shufflenetv2` — present in **both** zoos — for
 ~18 GPU-h.
 
-## R-06 · I break something in the re-analysis · **MEDIUM**
+## R-06 · I break something in the re-analysis · **OCCURRED REPEATEDLY**
+
+**Outcome 2026-08-20.** This risk materialised more than any other. The routing
+measurement was implemented incorrectly **three times** (+5.165 / −10 / −8 pt),
+each producing a plausible publishable number; P0a reported a conclusion from
+**zero samples**; the corpus contained same-seed replicates pooled as distinct
+seeds; and the first mechanism story was unsupported by the data
+(ρ = +0.011) and had to be decomposed.
+
+**Every one was caught by the machinery below, and none by reading the code.**
+The single most valuable check was the canary requiring each statistic to
+*detect* an effect in a world where the effect certainly exists — because
+"headroom ≈ 0" and "instrument cannot see headroom" produce identical output.
+
+Canary counts: `s2_routing_canaries.py` 18/18, `s2_canaries.py` 3/3,
+`msc_lib --selftest` 459/459.
+
+---
+
+### original entry
+
 
 Study 1's log has 50 defects. The same hands are writing Study 2.
 

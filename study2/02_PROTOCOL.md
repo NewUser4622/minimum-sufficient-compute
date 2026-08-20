@@ -1,6 +1,41 @@
 # Study 2 — pre-registration
 
-**Status: DRAFT v2. Not yet committed to.** Once P0 runs this file is frozen and
+**Status: FROZEN 2026-08-19, SCORED 2026-08-20.** The hypotheses below are as
+pre-registered. The outcomes are in the scoreboard immediately following; the
+text of each R-section is unchanged from before the data was seen.
+
+## Scoreboard — as pre-registered, scored against the data
+
+| | hypothesis | threshold | measured | verdict |
+|---|---|---|---|---|
+| **H1** | ρ_seed varies across the grid | ≥ 0.15 | **0.667** | **SUPPORTED** |
+| **H2** | disattenuation changes published-style comparisons | — | see `s2_reliability_grid.csv` | reported, not gated |
+| **H3** | in-seed oracle is optimistic | ≥ 0.5 pt | **+22.41 pt** (A +6.86, B +15.33) | **SUPPORTED** for the true per-exit oracle; **NOT** supported for per-sample difficulty scores (−0.57 pt) |
+| **H4** | bias tracks unreliability | ρ ≥ 0.5 | **+0.232 … +0.457** | **NOT SUPPORTED** — right sign, below threshold on every score |
+| **H5** | nothing clears +1.0 pt honest headroom | +1.0 pt | negative at all 7 budgets, 0 of 15 architectures positive | **SUPPORTED** |
+
+**Amendments made after freezing**, each with a reason:
+
+1. **The oracle was re-specified** (2026-08-20). The pre-registration said
+   "oracle" without saying whether it was per-sample or per-exit. Three
+   implementations were tried before the ambiguity was noticed; the final one is
+   the per-exit Lagrangian maximum, which is what the early-exit literature
+   means. Both readings are reported: the per-exit oracle in §R3, the
+   per-sample-score variant alongside it.
+2. **"At matched FLOPs" withdrawn as a description** (2026-08-20). At ρ = 0.80
+   the budget does not bind for the in-seed oracle, which therefore spends *less*
+   than the baseline. Still a valid and conservative upper bound; the phrase was
+   simply wrong.
+3. **H3's headline decomposed** (2026-08-20). The bias does not correlate with
+   the noise pool across architectures (ρ = +0.011), so attributing all of it to
+   noise harvesting was unsupported. Split into A (exact identity) and B
+   (cross-seed non-transfer).
+
+---
+
+### original pre-registration follows, unedited
+
+Once P0 runs this file is frozen and
 every change is recorded with a date and a reason.
 
 **v2 changed the centrepiece.** v1 had two halves that could both land as nulls

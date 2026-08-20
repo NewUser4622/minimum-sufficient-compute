@@ -3,9 +3,73 @@
 Newest first. Every entry: what changed, what it cost, what it settled, what is
 next. Updated every session.
 
-**Current state: COMPLETE. Written up in [`PAPER.md`](PAPER.md).**
+**Current state: COMPLETE.** Written up in [`PAPER.md`](PAPER.md), protocol
+scored in [`02_PROTOCOL.md`](02_PROTOCOL.md).
 
 ---
+
+## 2026-08-20 (last) · notebooks re-run, mechanism confirmed, headline corrected
+
+Both notebooks re-executed. Two things settled, one of them a correction to my
+own draft.
+
+### The memorisation mechanism is CONFIRMED
+
+`analysis/s2_memorisation.csv`, 15 architectures. Saturation was a hypothesis;
+it is now measured:
+
+| predictor of the ρ_seed drop | Spearman |
+|---|---|
+| fraction of train samples with top-1 prob > 0.99 | **+0.832** |
+| train accuracy | **+0.746** |
+| train − test gap | +0.693 |
+| **test accuracy** (control) | **−0.114** |
+
+`convnext_femto` fits 99.99 % of train with 71 % of samples above 0.99
+confidence → drop 0.558. `mobilenetv2` fits 83.1 % with 16 % saturated → drop
+0.026. **The control is what makes this a result:** test accuracy does not
+predict the drop, so this is not "weaker models are noisier".
+
+### The headline was overstated — corrected
+
+I attributed the whole +22.41 pt bias to per-exit noise harvesting. **The data
+does not support that.** Across architectures the bias does not correlate with
+the noise pool at all (Spearman **+0.011**). Decomposed:
+
+| | median | share | evidential strength |
+|---|---|---|---|
+| **A** in-seed oracle above the network's **own full accuracy** | **+6.86 pt** | 31 % | exact identity — unarguable |
+| **B** cross-seed oracle below full accuracy | +15.33 pt | 69 % | weaker; conflates non-transfer with the cost of acting on it |
+
+Both positive in 100 % of runs. **A is now the paper's core claim** — it is an
+exact identity (`oracle_in − acc_full == frac_early_saves`, max deviation
+0.000000000 pt over 90 rows), it needs no second seed, and a bound above the
+network's own full-compute accuracy cannot be reached by any router.
+
+B is retained but flagged: a cross-seed oracle maximises seed *j*'s accuracy,
+which forces early exits seed *i* may not survive, so a reviewer can fairly read
+it as evidence about a mis-specified router.
+
+### H4, tested properly
+
+On the oracle bias rather than the per-score bias: ρ = **+0.232 … +0.457**
+depending on which score supplies ρ_seed. Right sign every time, below the
+pre-registered 0.5 every time. **NOT SUPPORTED**, reported as such.
+
+### The two findings are independent
+
+Optimism bias vs saturation: −0.214. vs train accuracy: −0.221. So the oracle
+result and the memorisation result are separate phenomena, not one mechanism
+seen twice. Stated explicitly in the paper.
+
+### Documents
+
+`PAPER.md` corrected · `README.md` (root and study2) updated ·
+`02_PROTOCOL.md` frozen and scored with three recorded amendments ·
+`06_RISK_REGISTER.md` outcomes written for R-01, R-04, R-06.
+
+---
+
 
 ## 2026-08-20 (final) · result verified against the CSVs, paper written
 
@@ -53,6 +117,14 @@ those come back weak, the subsection is withdrawn rather than reworded.
 ---
 
 ## 2026-08-20 · P0 + P1 complete — the centrepiece failed, something better fell out
+
+> **SUPERSEDED.** Kept as a record of what was believed at the time. The
+> numbers below predate three fixes: the oracle was re-specified from a
+> per-sample score to the per-exit Lagrangian maximum, pilot replicates were
+> deduplicated, and the ρ_seed figures shifted slightly as a result
+> (`resnet32x4` ce_loss 0.742 → 0.709). H3 and H5 were re-scored; see the top
+> of this file and `02_PROTOCOL.md`.
+
 
 ### Scoreboard, against what was pre-registered
 
