@@ -12,7 +12,7 @@ live in this repository:
 | **Study 1 · CIFAR-100** | 50k @ 32px | small | 15 | complete — [`docs/cifar100/10_FINAL_RESULTS.md`](docs/cifar100/10_FINAL_RESULTS.md) |
 | **Study 1 · ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
 | **Study 2** | CIFAR-100, re-analysed | — | 15 | **complete** — [`study2/PAPER.md`](study2/PAPER.md) |
-| **Study 3** | CIFAR-100 | — | 3 + pruning | **planned** — [`study3/README.md`](study3/README.md) |
+| **Study 3** | CIFAR-100 | — | 3 + pruning | **notebooks ready** — [`study3/03_LOG.md`](study3/03_LOG.md) |
 
 ### Study 2, in one line
 

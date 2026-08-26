@@ -3536,6 +3536,47 @@ def _subset_train(ds, cfg: Dict[str, Any]):
     correctly -- the D-49 property, which it would be easy to break here by
     subsetting the index space along with the data.
     """
+    # Study 3 Q3: an EXPLICIT keep-list, written by the pruning notebook.
+    # Distinct from train_subset_frac, which is a random smoke-test fraction --
+    # here the identity of the kept samples is the independent variable, so a
+    # random subset would silently destroy the experiment.
+    sp = cfg.get("subset_path")
+    if sp:
+        p_ = Path(sp)
+        if not p_.exists():
+            raise FileNotFoundError(
+                f"subset_path {sp} does not exist. Refusing to fall through to "
+                "full-data training: every pruning arm would then be identical "
+                "and return a null that looks like a finding.")
+        spec = json.loads(p_.read_text())
+        _raw = [int(i) for i in spec["keep"]]
+        keep = np.asarray(sorted(set(_raw)), dtype=np.int64)
+        if keep.size != len(_raw):
+            # A duplicate would train on that sample twice, quietly reweighting
+            # it. Collapse, but never silently -- a repeated index means the
+            # notebook that wrote this file has a bug worth finding.
+            log(f"subset_path {p_.name}: {len(_raw) - keep.size} duplicate "
+                f"index(es) collapsed -- check the notebook that wrote it",
+                "WARN")
+        if keep.size == 0:
+            raise ValueError(f"subset_path {sp} keeps zero samples")
+        if keep.max() >= len(ds) or keep.min() < 0:
+            raise IndexError(
+                f"subset_path {sp} indexes {keep.min()}..{keep.max()} but the "
+                f"train split has {len(ds)} items. These are GLOBAL sample_idx "
+                "values (D-49) and must be valid positions in this split.")
+        sub = torch.utils.data.Subset(ds, keep.tolist())
+        for attr in ("index_space", "order_hash", "classes", "class_names",
+                     "stored_res", "fingerprint"):
+            if hasattr(ds, attr):
+                setattr(sub, attr, getattr(ds, attr))
+        if not hasattr(sub, "index_space"):
+            sub.index_space = len(ds)
+        log(f"train split pruned to {keep.size}/{len(ds)} images "
+            f"({100*keep.size/len(ds):.0f}%) from {p_.name} "
+            f"[arm={spec.get('arm')} score={spec.get('score')}]", "DATA")
+        return sub
+
     f = float(cfg.get("train_subset_frac", 0.0) or 0.0)
     if not (0.0 < f < 1.0):
         return ds
@@ -6845,6 +6886,11 @@ def evaluate(model, loader, device, amp: bool = True, criterion=None,
         with torch.amp.autocast(device_type=device.type,
                                 enabled=(amp and device.type == "cuda")):
             logits = model(x)
+            if isinstance(logits, (list, tuple)):
+                # A jointly-trained MultiExitModel returns per-exit logits.
+                # The FINAL exit is the model's answer, so accuracy, calibration
+                # and best-checkpoint selection keep their existing meaning.
+                logits = logits[-1]
             loss = crit(logits, y)
         loss_sum += float(loss.item()) * y.size(0)
         pr = logits.argmax(1)
@@ -8152,8 +8198,26 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
     cfg["sample_order_hash"] = order_hash
     n_train = len(train_loader.dataset)
 
-    model = place_model(build_model(cfg["arch"], cfg["num_classes"]),
-                        device, cfg, tag=f'{cfg["arch"]} backbone')
+    # Study 3 Q1: `joint_exits` trains the exit heads WITH the backbone instead
+    # of afterwards on a frozen one. It is a guarded branch inside the existing
+    # function on purpose -- a parallel training loop would duplicate the resume,
+    # push and registry machinery, which is exactly the duplication that caused
+    # D-23/D-49. Default False, so every Study 1 run is bit-identical.
+    _joint = bool(cfg.get("joint_exits", False))
+    _backbone_only = place_model(build_model(cfg["arch"], cfg["num_classes"]),
+                                 device, cfg, tag=f'{cfg["arch"]} backbone')
+    if _joint:
+        model = place_model(MultiExitModel(_backbone_only, cfg["num_classes"],
+                                           freeze=False),
+                            device, cfg, tag=f'{cfg["arch"]} joint multi-exit')
+        _ew = exit_loss_weights(len(model.heads),
+                                str(cfg.get("exit_weight_scheme", "uniform")))
+        log(f'JOINT exit training: K={len(model.heads)} '
+            f'scheme={cfg.get("exit_weight_scheme", "uniform")} '
+            f'weights={[round(w, 4) for w in _ew]}', "TRAIN")
+    else:
+        model = _backbone_only
+        _ew = None
     optimizer, scheduler = build_optimizer(model, cfg)
     amp = bool(cfg.get("amp_enabled", True)) and device.type == "cuda"
     try:
@@ -8288,8 +8352,18 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
                     # 80 img/s on the first minute instead of the third day.
                     assert_layout_match(model, x, where=f'train {cfg["arch"]}')
                 with torch.amp.autocast(device_type=device.type, enabled=amp):
-                    logits = model(x)
-                    loss = criterion(logits, y)
+                    _out = model(x)
+                    if _ew is not None:
+                        # MultiExitModel returns a list of per-exit logits.
+                        # The reported logits are the FINAL exit, so accuracy,
+                        # dynamics and best-checkpoint selection all continue to
+                        # mean what they meant before.
+                        loss = sum(w * criterion(o, y)
+                                   for w, o in zip(_ew, _out))
+                        logits = _out[-1]
+                    else:
+                        logits = _out
+                        loss = criterion(logits, y)
                 scaler.scale(loss / accum).backward()
 
                 did_step, gn_val, clipped = False, None, False
@@ -8589,10 +8663,29 @@ def train_backbone(cfg: Dict[str, Any], hub: MSCHub, registry: RunRegistry,
             is_best = val_acc > best_metric
             if is_best:
                 best_metric = val_acc
+                # A joint run's `model` is a MultiExitModel, whose state_dict is
+                # prefixed `backbone.*` / `heads.*`. run_oracle loads ckpt_best
+                # into a PLAIN backbone with strict=True, so writing the wrapped
+                # dict here would break every downstream consumer. Save the
+                # backbone in the established format and the heads beside it, so
+                # measurement, budgets and the Study 2 analysis all work
+                # unchanged on joint runs.
+                _best_model = (_backbone_only.state_dict() if _joint
+                               else model.state_dict())
                 atomic_save_torch(ckpt_best, {
-                    "run_id": run_id, "model": model.state_dict(), "epoch": epoch,
+                    "run_id": run_id, "model": _best_model, "epoch": epoch,
                     "val_accuracy": val_acc, "config_hash": cfg["config_hash"],
                     "classes": classes, "config": cfg, "saved_utc": now_iso()})
+                if _joint:
+                    # THE accessor (D-23), never a second spelling.
+                    atomic_save_torch(exit_heads_path(work, run_id), {
+                        "heads": model.heads.state_dict(),
+                        "run_id": run_id, "epoch": epoch,
+                        "joint": True,
+                        "exit_weight_scheme": str(cfg.get("exit_weight_scheme",
+                                                          "uniform")),
+                        "config_hash": cfg["config_hash"],
+                        "saved_utc": now_iso()})
             state["epoch"], state["best"] = epoch, best_metric
 
             save_checkpoint(ckpt_last, cfg, model, optimizer, scheduler, scaler,
@@ -8767,6 +8860,40 @@ def _write_dynamics(log_dir, dynamics: TrainingDynamics) -> None:
 # =============================================================================
 # 14. oracle -- depth / resolution / precision sweeps -> per-sample Parquet
 # =============================================================================
+def exit_loss_weights(K: int, scheme: str = "uniform") -> List[float]:
+    """Per-exit loss weights for JOINT multi-exit training (Study 3 Q1).
+
+    Deep supervision has several standard weightings and the result can depend
+    on which, so the choice is named, explicit, and recorded in the config
+    rather than buried in a training loop (`study3/02_RISKS.md` R-03).
+
+        uniform      every exit weighted 1/K            (MSDNet-style)
+        linear       weight grows linearly with depth   (deeper exits matter more)
+        final_heavy  final exit 0.5, rest share 0.5     (backbone stays primary)
+
+    Always sums to 1.0, so the joint loss is directly comparable in magnitude to
+    the single-head loss of a frozen-backbone run -- otherwise "same LR" would
+    silently mean a different effective step size and the frozen/joint
+    comparison would confound optimisation with architecture.
+    """
+    if K < 1:
+        raise ValueError(f"K must be >= 1, got {K}")
+    if scheme == "uniform":
+        w = [1.0] * K
+    elif scheme == "linear":
+        w = [float(i + 1) for i in range(K)]
+    elif scheme == "final_heavy":
+        if K == 1:
+            w = [1.0]
+        else:
+            w = [0.5 / (K - 1)] * (K - 1) + [0.5]
+    else:
+        raise ValueError(f"unknown exit weight scheme {scheme!r}; "
+                         "expected uniform, linear or final_heavy")
+    t = float(sum(w))
+    return [x / t for x in w]
+
+
 def train_exit_heads(cfg: Dict[str, Any], backbone, train_loader, val_loader,
                      device, hub: Optional[MSCHub] = None,
                      run_dir=None, show_progress: bool = True) -> "MultiExitModel":

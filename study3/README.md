@@ -118,6 +118,7 @@ accuracy difference. Independent of P1 and P2 — it can run first if preferred.
 |---|---|
 | [`01_PROTOCOL.md`](01_PROTOCOL.md) | pre-registration — predictions and thresholds fixed before any run |
 | [`02_RISKS.md`](02_RISKS.md) | how this fails, with detectors and responses |
+| [`03_LOG.md`](03_LOG.md) | **live log** — status board, pre-registered predictions, what to do next |
 
 ---
 
