@@ -2656,6 +2656,36 @@ def locate_cifar100(prefer_scratch: bool = True, verbose: bool = True) -> Path:
         if verbose:
             log(m, "DATA")
 
+    # 0. AN EXPLICIT LOCATION, checked before anything that downloads.
+    #
+    # ImageNet-100 has had `MSC_IN100_DIR` since the port; CIFAR-100 had no
+    # equivalent, so "the data is already at <path>" was a thing the caller
+    # could not say. The result was a 169 MB torchvision download at 17 kB/s
+    # over a copy that was already on disk. Symmetry restored.
+    #
+    # Accepts either the folder CONTAINING `cifar-100-python` or that folder
+    # itself, because both are natural things to type.
+    _explicit = [os.environ.get("MSC_CIFAR_DIR")]
+    _explicit += [str(Path.home() / "Desktop" / "New folder"),
+                  str(Path.home() / "Desktop" / "cifar"),
+                  r"C:\msc_data", "/kaggle/temp/data"]
+    for cand in [c for c in _explicit if c]:
+        base = Path(cand)
+        # Unwrap ONLY when the path names the data folder itself. Checking the
+        # parent unconditionally would make a typo'd path resolve via whatever
+        # happens to sit beside it -- a silent wrong answer rather than a
+        # visible miss.
+        probes = [base]
+        if base.name == "cifar-100-python":
+            probes.append(base.parent)
+        for probe in probes:
+            try:
+                if _has_cifar100(probe):
+                    _say(f"using existing CIFAR-100 at {probe}")
+                    return probe
+            except OSError:
+                continue
+
     # 1. attached Kaggle datasets
     inp = Path("/kaggle/input")
     if inp.exists():
@@ -3536,6 +3566,47 @@ def _subset_train(ds, cfg: Dict[str, Any]):
     correctly -- the D-49 property, which it would be easy to break here by
     subsetting the index space along with the data.
     """
+    # Study 3 Q3: an EXPLICIT keep-list, written by the pruning notebook.
+    # Distinct from train_subset_frac, which is a random smoke-test fraction --
+    # here the identity of the kept samples is the independent variable, so a
+    # random subset would silently destroy the experiment.
+    sp = cfg.get("subset_path")
+    if sp:
+        p_ = Path(sp)
+        if not p_.exists():
+            raise FileNotFoundError(
+                f"subset_path {sp} does not exist. Refusing to fall through to "
+                "full-data training: every pruning arm would then be identical "
+                "and return a null that looks like a finding.")
+        spec = json.loads(p_.read_text())
+        _raw = [int(i) for i in spec["keep"]]
+        keep = np.asarray(sorted(set(_raw)), dtype=np.int64)
+        if keep.size != len(_raw):
+            # A duplicate would train on that sample twice, quietly reweighting
+            # it. Collapse, but never silently -- a repeated index means the
+            # notebook that wrote this file has a bug worth finding.
+            log(f"subset_path {p_.name}: {len(_raw) - keep.size} duplicate "
+                f"index(es) collapsed -- check the notebook that wrote it",
+                "WARN")
+        if keep.size == 0:
+            raise ValueError(f"subset_path {sp} keeps zero samples")
+        if keep.max() >= len(ds) or keep.min() < 0:
+            raise IndexError(
+                f"subset_path {sp} indexes {keep.min()}..{keep.max()} but the "
+                f"train split has {len(ds)} items. These are GLOBAL sample_idx "
+                "values (D-49) and must be valid positions in this split.")
+        sub = torch.utils.data.Subset(ds, keep.tolist())
+        for attr in ("index_space", "order_hash", "classes", "class_names",
+                     "stored_res", "fingerprint"):
+            if hasattr(ds, attr):
+                setattr(sub, attr, getattr(ds, attr))
+        if not hasattr(sub, "index_space"):
+            sub.index_space = len(ds)
+        log(f"train split pruned to {keep.size}/{len(ds)} images "
+            f"({100*keep.size/len(ds):.0f}%) from {p_.name} "
+            f"[arm={spec.get('arm')} score={spec.get('score')}]", "DATA")
+        return sub
+
     f = float(cfg.get("train_subset_frac", 0.0) or 0.0)
     if not (0.0 < f < 1.0):
         return ds

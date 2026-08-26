@@ -2656,6 +2656,36 @@ def locate_cifar100(prefer_scratch: bool = True, verbose: bool = True) -> Path:
         if verbose:
             log(m, "DATA")
 
+    # 0. AN EXPLICIT LOCATION, checked before anything that downloads.
+    #
+    # ImageNet-100 has had `MSC_IN100_DIR` since the port; CIFAR-100 had no
+    # equivalent, so "the data is already at <path>" was a thing the caller
+    # could not say. The result was a 169 MB torchvision download at 17 kB/s
+    # over a copy that was already on disk. Symmetry restored.
+    #
+    # Accepts either the folder CONTAINING `cifar-100-python` or that folder
+    # itself, because both are natural things to type.
+    _explicit = [os.environ.get("MSC_CIFAR_DIR")]
+    _explicit += [str(Path.home() / "Desktop" / "New folder"),
+                  str(Path.home() / "Desktop" / "cifar"),
+                  r"C:\msc_data", "/kaggle/temp/data"]
+    for cand in [c for c in _explicit if c]:
+        base = Path(cand)
+        # Unwrap ONLY when the path names the data folder itself. Checking the
+        # parent unconditionally would make a typo'd path resolve via whatever
+        # happens to sit beside it -- a silent wrong answer rather than a
+        # visible miss.
+        probes = [base]
+        if base.name == "cifar-100-python":
+            probes.append(base.parent)
+        for probe in probes:
+            try:
+                if _has_cifar100(probe):
+                    _say(f"using existing CIFAR-100 at {probe}")
+                    return probe
+            except OSError:
+                continue
+
     # 1. attached Kaggle datasets
     inp = Path("/kaggle/input")
     if inp.exists():

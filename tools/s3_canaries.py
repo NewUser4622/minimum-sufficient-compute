@@ -148,5 +148,47 @@ for bad_cfg, why, exc in [
 check("subset_path is NOT hash-excluded (it changes the training set)",
       "subset_path" not in ex)
 
+# --- locate_cifar100 must be TELLABLE, and check before downloading -------
+# The notebooks re-downloaded 169 MB at 17 kB/s over a copy already on disk,
+# because CIFAR-100 had no equivalent of ImageNet's MSC_IN100_DIR.
+import os as _os, tempfile as _tf
+fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+ns3 = {"Path": Path, "os": _os, "log": lambda *a, **k: None,
+       "subprocess": None, "sys": sys, "shell": None, "shutil": None,
+       "ensure_dir": lambda q: q, "SCRATCH_ROOT": Path("/nonexistent"),
+       "WORK_ROOT": Path("/nonexistent"), "KAGGLE_CIFAR100_SLUG": "x"}
+for _f in ("_has_cifar100", "locate_cifar100"):
+    exec(compile(ast.Module(body=[fns[_f]], type_ignores=[]), "<f>", "exec"), ns3)
+
+_root = Path(_tf.mkdtemp())
+_cd = _root / "cifar-100-python"
+_cd.mkdir()
+(_cd / "train").touch(); (_cd / "test").touch()
+
+_os.environ["MSC_CIFAR_DIR"] = str(_root)
+check("MSC_CIFAR_DIR pointing at the PARENT resolves",
+      str(ns3["locate_cifar100"](verbose=False)) == str(_root))
+_os.environ["MSC_CIFAR_DIR"] = str(_cd)
+check("MSC_CIFAR_DIR pointing at cifar-100-python ITSELF resolves",
+      str(ns3["locate_cifar100"](verbose=False)) == str(_root))
+_os.environ["MSC_CIFAR_DIR"] = str(_root / "nope")
+try:
+    ns3["locate_cifar100"](verbose=False)
+    check("a wrong MSC_CIFAR_DIR falls through rather than lying", False)
+except Exception:
+    check("a wrong MSC_CIFAR_DIR falls through rather than lying", True)
+_os.environ.pop("MSC_CIFAR_DIR", None)
+check("the explicit check runs BEFORE the Kaggle/torchvision download",
+      src.index("AN EXPLICIT LOCATION") < src.index("KAGGLE_CIFAR100_SLUG} via Kaggle CLI"))
+
+# --- notebooks must use sess.config, which fills in data_root -------------
+import json as _json
+for _nb in sorted(Path("notebooks_study3").glob("*.ipynb")):
+    _code = "\n".join("".join(c["source"]) for c in
+                       _json.loads(_nb.read_text(encoding="utf-8"))["cells"]
+                       if c["cell_type"] == "code")
+    check(f"{_nb.name}: no bare M.base_config (skips data_root)",
+          "M.base_config(" not in _code)
+
 print(f"\n{sum(res)}/{len(res)} Study 3 canaries pass")
 sys.exit(0 if all(res) else 1)

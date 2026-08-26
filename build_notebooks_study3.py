@@ -60,11 +60,20 @@ def paths_cell(phase="analysis", needs_data=False) -> str:
 DATA_DIR = None      # e.g. r'E:\\msc_data'      -- None = choose for me
 MSC_ROOT = None      # e.g. r'C:\\msc_results'   -- None = choose for me
 
+# WHERE CIFAR-100 ALREADY IS. Point this at the folder that contains
+# `cifar-100-python` (or at that folder itself -- both work). It is checked
+# BEFORE any download path, so nothing ever re-fetches 169 MB over a copy you
+# already have.
+CIFAR_DIR = r'C:\\Users\\Administrator\\Desktop\\New folder'
+
 # ---------------------------------------------------------------------------
 import os
 from pathlib import Path
 
 M = msc                       # Study 2's notebooks say `M`; same module.
+
+if CIFAR_DIR:
+    os.environ['MSC_CIFAR_DIR'] = str(CIFAR_DIR)
 
 _paths = M.resolve_storage(DATA_DIR, MSC_ROOT)
 if not _paths['ok']:
@@ -81,6 +90,17 @@ sess = M.Session(account='local', phase='{phase}', dataset='cifar100',
 print(f'msc_lib   {{M.__version__}}')
 print(f'MSC_ROOT  {{MSC_ROOT}}')
 print(f'data_dir  {{sess.data_dir}}')
+
+# Resolve CIFAR-100 now, loudly, rather than discovering mid-training that it
+# is about to download. `_has_cifar100` is the same check the loader uses.
+if CIFAR_DIR:
+    _cd = Path(CIFAR_DIR)
+    _cd = _cd if M._has_cifar100(_cd) else _cd.parent
+    if M._has_cifar100(_cd):
+        print(f'CIFAR-100  {{_cd}}  (found -- no download)')
+    else:
+        print(f'CIFAR-100  NOT at {{CIFAR_DIR}} -- expected a cifar-100-python/'
+              ' folder with train/ and test/ inside. It will try to download.')
 
 # A Session CREATES runs/, so "the directory exists" proves nothing. Count the
 # runs that actually carry a measurement -- that is what every cell below reads.
@@ -262,6 +282,28 @@ r_q, p_q = spearmanr(ex['exit_quality'], ex['excess'])
 print(f'Spearman(exit_quality, excess) = {r_q:+.3f}   p = {p_q:.4f}   '
       f'n = {len(ex)} runs')
 
+# THE CONFOUND, and it is not subtle: exit_quality = mean(acc_k / acc_full), so
+# acc_full is its own denominator. A low-accuracy network scores high
+# exit_quality with weak early exits -- and a low-accuracy network makes more
+# final-layer errors, which is exactly what `excess` counts. Reporting the raw
+# correlation alone would be reporting that circularity as a finding.
+r_a, p_a = spearmanr(ex['acc_full'], ex['excess'])
+print(f'Spearman(acc_full,     excess) = {r_a:+.3f}   p = {p_a:.4f}   '
+      '<- the confound')
+
+def _partial(x, y, z):
+    rx, ry, rz = (pd.Series(v).rank().to_numpy() for v in (x, y, z))
+    res = lambda t: t - np.polyval(np.polyfit(rz, t, 1), rz)
+    return spearmanr(res(rx), res(ry))
+
+r_p, p_p = _partial(ex['exit_quality'], ex['excess'], ex['acc_full'])
+print(f'PARTIAL, holding acc_full fixed = {r_p:+.3f}   p = {p_p:.4f}   '
+      '<- the one that counts')
+if abs(r_p) < 0.2:
+    print('  -> the raw relationship was mostly the confound. Treat the')
+    print('     extrapolation below as having no predictive power.')
+print()
+
 A = np.polyfit(ex['exit_quality'], ex['excess'], 1)
 slope, intercept = float(A[0]), float(A[1])
 print(f'OLS: excess = {slope:+.4f} * exit_quality {intercept:+.4f}')
@@ -421,10 +463,11 @@ ARCHS = {list(Q1_ARCHS)!r}
 SEED = 1
 SCHEME = 'uniform'        # uniform | linear | final_heavy
 
-cfgs = [M.base_config(a, 'cifar100', seed=SEED, phase='p4',
-                      method='jointexit',
-                      joint_exits=True,
-                      exit_weight_scheme=SCHEME)
+# `sess.config`, NOT `M.base_config`. The bound method calls prepare_data() and
+# fills in `data_root`; the raw function does not, so the loader fell through to
+# locate_cifar100()'s download path even though the data was already on disk.
+cfgs = [sess.config(a, seed=SEED, method='jointexit',
+                    joint_exits=True, exit_weight_scheme=SCHEME)
         for a in ARCHS]
 
 for c in cfgs:
@@ -870,7 +913,7 @@ def dump_features(run_id, cfg):
 paths = {}
 for a in ARCHS:
     for s in SEEDS:
-        cfg = M.base_config(a, 'cifar100', seed=s, phase='p1', method='base')
+        cfg = sess.config(a, seed=s, method='base')
         rid = cfg['run_id']
         if not (Path(MSC_ROOT) / 'runs' / rid / 'per_sample' / 'test.parquet').exists():
             print(f'  missing {rid}, skipped')
@@ -1175,14 +1218,13 @@ SEEDS = [1, 2]
 cfgs = []
 for sp in specs:
     for sd in SEEDS:
-        cfgs.append(M.base_config(
-            TARGET_ARCH, 'cifar100', seed=sd, phase='p5',
+        cfgs.append(sess.config(
+            TARGET_ARCH, seed=sd,
             method=f"prune{sp['arm']}{int(sp['rate']*100)}",
             subset_path=sp['path']))
 # full-data controls
 for sd in SEEDS:
-    cfgs.append(M.base_config(TARGET_ARCH, 'cifar100', seed=sd, phase='p5',
-                              method='prunefull'))
+    cfgs.append(sess.config(TARGET_ARCH, seed=sd, method='prunefull'))
 
 for c in cfgs:
     print(f"  {c['run_id']:44s} subset={Path(c.get('subset_path', '-')).name}")

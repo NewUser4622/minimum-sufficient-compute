@@ -9,18 +9,39 @@ number they existed to produce was never computed.
 
 ---
 
+## Machine facts — the answers to "where is X?"
+
+Recorded here because I asked twice and wasted a 169 MB download at 17 kB/s.
+Anything in this table belongs in code, not in a chat message.
+
+| | path | wired in as |
+|---|---|---|
+| CIFAR-100 (python format) | `C:\Users\Administrator\Desktop\New folder\cifar-100-python` | `CIFAR_DIR` at the top of every S3 notebook → `MSC_CIFAR_DIR` → `locate_cifar100()` |
+| results root | `C:\msc_results` | `MSC_ROOT`, auto-resolved |
+| ImageNet-100 pack | `C:\msc_data\in100` | `MSC_IN100_DIR` |
+| GPU | RTX 4000 Ada, 20 GB | — |
+
+`locate_cifar100()` now checks an explicit location **before** any download
+path, which it previously could not do — ImageNet-100 had `MSC_IN100_DIR` since
+the port and CIFAR-100 had no equivalent, so "the data is already here" was a
+thing the caller had no way to say.
+
+---
+
 ## Status board
 
 | | what | cost | state | artifact |
 |---|---|---|---|---|
-| **P0** | exit quality → excess extrapolation | ~15 min CPU | **ready to run** | `analysis/s3_exit_quality.csv` |
-| **P1** | Q1 joint exit training | ~10 GPU-h | ready — gated on P0 | 3 runs under `runs/p4-*-jointexit-s1` |
+| **P0** | exit quality → excess extrapolation | ~15 min CPU | **DONE** — predicts excess GROWS with exit quality | `analysis/s3_exit_quality.csv` |
+| **P1** | Q1 joint exit training | ~10 GPU-h | **ready — run next** | 3 runs under `runs/p4-*-jointexit-s1` |
 | **P2** | Q1 verdict, paired comparison | ~10 min CPU | ready — needs P1 | `analysis/s3_q1_comparison.csv` |
 | **P3** | Q2 learned router | ~5 GPU-h | ready — gated on P2 | `analysis/s3_router_capture.csv` |
 | **P4** | Q3 pruning | ~18 GPU-h | ready — independent | `analysis/s3_pruning.csv` |
 
-**Next action: run `S3_NB0_Extrapolate`.** It is free and it sets the
-expectation that `S3_NB1` will confirm or falsify.
+**Next action: run `S3_NB1_JointTrain`.** P0 predicts the excess will be
+**larger** than +6.86 pt under joint training, around +11 to +12 pt. If NB1
+comes back below 2.0 pt, P0's extrapolation had no power and that is worth
+recording as loudly as the result itself.
 
 ---
 
@@ -30,14 +51,91 @@ Written **before** any run. Do not edit the prediction column.
 
 | | prediction | threshold | measured | verdict |
 |---|---|---|---|---|
-| **H1** | oracle excess survives joint exit training | ≥ 2.0 pt, 3 of 3 archs | _pending_ | _pending_ |
+| **H1** | oracle excess survives joint exit training | ≥ 2.0 pt, 3 of 3 archs | _pending_ | P0 predicts **+11 to +12.5 pt** |
 | **H2** | a learned router captures little of the gap | < 25 % (cross-seed) | _pending_ | _pending_ |
 | **H3** | saturated-source pruning is worse | ≥ 1.0 pt at 30 % keep | _pending_ | _pending_ |
 | **H3b** | saturated source ≈ random pruning | ± 0.5 pt at 30 % keep | _pending_ | _pending_ |
 
 ---
 
-## 2026-08-20 (later) · S3_NB0 failed on first run — root cause was the paths cell
+## 2026-08-20 (P0 done) · NB0 ran — and predicts Study 2 SURVIVES
+
+**P0 complete.** 45 CIFAR-100 base runs, 15 architectures,
+`analysis/s3_exit_quality.csv`.
+
+```
+Spearman(exit_quality, excess) = +0.669   p < 0.0001   n = 45
+```
+
+**Positive — the opposite of what I expected.** Better early exits go with a
+*larger* oracle excess, not a smaller one. In hindsight the mechanism is
+obvious: a weak early exit is right on almost nothing, so it cannot rescue a
+sample the final layer gets wrong. Rescues require competent early exits. The
+pool grows with exit quality.
+
+**The extrapolation, therefore:**
+
+| exit_quality | predicted excess |
+|---|---|
+| 0.86 (best frozen run) | +10.98 pt |
+| 1.00 (extrapolated) | **+12.45 pt** |
+
+**GATE: expect Study 2 to SURVIVE joint training**, and the excess to be
+*larger* than the +6.86 pt measured on frozen heads — not smaller. That is now
+a pre-registered expectation `S3_NB1` can falsify.
+
+### A confound I nearly published
+
+`exit_quality = mean(acc_k / acc_full)` — **`acc_full` is its own denominator.**
+A low-accuracy network scores high exit_quality with weak exits, *and* makes
+more final-layer errors, which is exactly what `excess` counts. The raw
+correlation could have been pure circularity:
+
+```
+Spearman(acc_full, excess)               = -0.672     <- the confound
+PARTIAL (holding acc_full fixed)         = +0.617     <- what actually counts
+```
+
+The relationship survives, but **NB0 reported only the raw number**, so I would
+have been quoting a confounded statistic. The partial correlation is now
+computed and printed, with a message that says outright when the raw
+relationship was mostly the confound. Fixed before P1, not after.
+
+---
+
+## 2026-08-20 (P1 blocked) · NB1 tried to download CIFAR-100 that was already on disk
+
+```
+[DATA] not found locally -- downloading shanmuk4622/dataset-cifar100-python
+[DATA] falling back to torchvision auto-download
+  1%|          | 983k/169M [00:18<2:42:44, 17.2kB/s]
+```
+
+**Two causes, both mine.**
+
+1. **The notebooks called `M.base_config(...)` instead of `sess.config(...)`.**
+   The bound method calls `prepare_data()` and fills in `data_root`; the raw
+   function does not. So the loader fell through to the download path. This is
+   D-54 again — the same frozen-vs-bound distinction, in a new notebook.
+2. **`locate_cifar100()` could not be told where the data was.** It checked
+   `/kaggle/input` and a scratch folder, then downloaded. ImageNet-100 has had
+   `MSC_IN100_DIR` since the port; CIFAR-100 had no equivalent.
+
+**Fixes:** `locate_cifar100()` gained an explicit-location step that runs before
+anything that downloads, reading `MSC_CIFAR_DIR` plus a few common local paths.
+It accepts either the parent folder or `cifar-100-python` itself, but only
+unwraps the parent when the basename actually matches — checking the parent
+unconditionally would make a typo resolve via whatever sits beside it, which is
+a silent wrong answer rather than a visible miss. Every notebook now sets
+`CIFAR_DIR` at the top and reports what it resolved to, before training.
+
+Canaries: 41/41, including both spellings resolving, a wrong path *not*
+resolving, the explicit check ordering before the download, and every notebook
+being free of bare `M.base_config`.
+
+---
+
+## 2026-08-20 (earlier) · S3_NB0 failed on first run — root cause was the paths cell
 
 ```
 KeyError: 'method'
