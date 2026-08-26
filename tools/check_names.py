@@ -171,8 +171,17 @@ def check_notebook(path: Path) -> int:
         src = "".join(cell.get("source", []))
         try:
             tree = ast.parse(src)
-        except SyntaxError:
-            continue                      # the D-73 gate reports these
+        except SyntaxError as e:
+            # Do NOT skip silently. A cell that does not parse defines no
+            # names, so every later cell using them is reported as an
+            # "undefined name" -- a message pointing at the wrong cell
+            # entirely. This cost real time four times before it was said out
+            # loud: report the true cause here as well as in the parse gate.
+            print(f"  [FAIL] {path.name} cell {ci}: DOES NOT PARSE -- "
+                  f"{e.msg} (line {e.lineno}). Names it would define are "
+                  f"missing, so errors below may point at the wrong cell.")
+            problems.append((ci, "<unparseable>", e.lineno or 0))
+            continue
         loads, binds = [], set()
         for n in ast.walk(tree):
             if isinstance(n, ast.Name):

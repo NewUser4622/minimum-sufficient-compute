@@ -15,8 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from build_notebooks import (DATA_CELL, bootstrap_cell, code, md, notebook,
-                             worker_cell)
+from build_notebooks import DATA_CELL, bootstrap_cell, code, md, notebook
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "notebooks_study3"
@@ -29,30 +28,128 @@ OUT = ROOT / "notebooks_study3"
 Q1_ARCHS = ("resnet20", "resnet32x4", "vgg8")
 
 
-def alias_cell() -> str:
-    """Reconcile two naming conventions explicitly instead of by accident.
+def paths_cell(phase="analysis", needs_data=False) -> str:
+    """Locate the results root the same way Study 2 did, and PROVE data is there.
 
-    `build_notebooks.py` (CIFAR-100) imports the library as `msc` and locates
-    the results root through `sess.work`. Study 2's notebooks say `M` and
-    `MSC_ROOT`. Study 3 reads Study 2's outputs and reuses its analysis code
-    verbatim, so both spellings have to work. Declaring the aliases in one
-    visible cell is the accessor rule (rule 4) applied to names: one place to
-    look, rather than two conventions quietly interleaved across ten notebooks.
+    The first version of this used `build_notebooks.py`'s `worker_cell`, which
+    constructs a Session WITHOUT `work_root`. The Session then chose its own
+    default directory, which was not where the runs live, so `runs` came back
+    empty, `pd.DataFrame([])` had no columns, and the first `meta['method']`
+    raised `KeyError: 'method'` -- 40 lines from the real cause.
+
+    Two fixes, both here:
+      * resolve through `M.resolve_storage`, exactly as Study 2's notebooks do,
+        and pass `work_root=MSC_ROOT` to the Session;
+      * check for MEASURED RUNS, not merely that `runs/` is a directory. A
+        Session creates that directory itself, so its existence proved nothing.
+    """
+    data_note = "" if needs_data else (
+        "\n# This notebook only READS existing runs -- it trains nothing, so"
+        "\n# DATA_DIR is irrelevant to it.")
+    strict = ("    raise RuntimeError(\n"
+              "        f'no measured runs under {MSC_ROOT}/runs.\\n'\n"
+              "        'Study 3 re-analyses Study 1 output. Fetch it first with\\n'\n"
+              "        'notebooks_study2/S2_NB0_Fetch.ipynb, or set MSC_ROOT above\\n'\n"
+              "        'to the folder that already holds them.')")
+    return f"""\
+# === CELL 2 -- WHERE EVERYTHING LIVES ======================================
+# Leave both as None and they are CHOSEN FOR YOU: the roomiest drive that
+# actually exists on this machine. Set MSC_ROOT explicitly if your runs are
+# somewhere specific -- e.g. r'C:\\msc_results'.{data_note}
+
+DATA_DIR = None      # e.g. r'E:\\msc_data'      -- None = choose for me
+MSC_ROOT = None      # e.g. r'C:\\msc_results'   -- None = choose for me
+
+# ---------------------------------------------------------------------------
+import os
+from pathlib import Path
+
+M = msc                       # Study 2's notebooks say `M`; same module.
+
+_paths = M.resolve_storage(DATA_DIR, MSC_ROOT)
+if not _paths['ok']:
+    raise SystemExit('storage is not usable -- see the problems listed above')
+
+DATA_DIR = _paths['data_dir']
+MSC_ROOT = _paths['results_root']
+os.environ['MSC_SCRATCH'] = MSC_ROOT
+
+sess = M.Session(account='local', phase='{phase}', dataset='cifar100',
+                 work_root=MSC_ROOT, session_limit_h=0.0,
+                 worker_id=0, num_workers=1)
+
+print(f'msc_lib   {{M.__version__}}')
+print(f'MSC_ROOT  {{MSC_ROOT}}')
+print(f'data_dir  {{sess.data_dir}}')
+
+# A Session CREATES runs/, so "the directory exists" proves nothing. Count the
+# runs that actually carry a measurement -- that is what every cell below reads.
+_runs_dir = Path(MSC_ROOT) / 'runs'
+_measured = sorted(d.name for d in _runs_dir.iterdir()
+                   if d.is_dir() and (d / 'per_sample' / 'test.parquet').exists()
+                   ) if _runs_dir.is_dir() else []
+print(f'measured runs on disk: {{len(_measured)}}')
+if not _measured:
+{strict}
+print(f'  e.g. {{_measured[0]}}')
+"""
+
+
+def runs_cell() -> str:
+    """One accessor for "which runs do I analyse", used by every notebook.
+
+    `pd.DataFrame([])` has no columns, so the first `meta['method']` raised
+    `KeyError: 'method'` -- a message 40 lines from the actual cause, which was
+    an empty run list. Rule 3: column names are data, and they get validated at
+    build time rather than discovered mid-analysis.
     """
     return """\
-# === Names ================================================================
-# `msc` is how the CIFAR-100 notebooks import the library; `M` is how Study 2's
-# notebooks refer to it. Same module, two names, declared here once so no cell
-# below has to guess which convention it is in.
-M = msc
-MSC_ROOT = sess.work          # the results root: runs/, analysis/, budgets/
+# === Which runs am I analysing? ===========================================
+# One accessor, so the dedupe rule and the emptiness checks live in a single
+# place rather than being re-typed in each notebook (rule 4).
+import numpy as np, pandas as pd
 
-print(f'msc_lib {M.__version__}')
-print(f'MSC_ROOT  {MSC_ROOT}')
-print(f'data_dir  {sess.data_dir}')
-assert (Path(MSC_ROOT) / 'runs').is_dir(), (
-    f'no runs/ under {MSC_ROOT} -- fetch Study 1 data first (S2_NB0_Fetch)')
+runs_dir = Path(MSC_ROOT) / 'runs'
+
+def measured_runs(dataset='cifar100', methods=('base',), require=True):
+    ids = sorted(d.name for d in runs_dir.iterdir()
+                 if d.is_dir() and (d / 'per_sample' / 'test.parquet').exists())
+    if not ids:
+        raise RuntimeError(f'no measured runs under {runs_dir}')
+    df = pd.DataFrame([{**M.parse_run_id(r), 'run_id': r} for r in ids])
+
+    for col in ('method', 'dataset', 'arch', 'seed', 'phase'):
+        if col not in df.columns:
+            raise RuntimeError(
+                f'parse_run_id did not yield a {col!r} column. Columns present: '
+                f'{list(df.columns)}. Run ids look like: {ids[:3]}')
+
+    sel = df[(df['dataset'] == dataset) & (df['method'].isin(methods))]
+    if require and sel.empty:
+        raise RuntimeError('; '.join([
+            f'{len(df)} measured run(s) on disk, but NONE with '
+            f'dataset={dataset!r} and method in {tuple(methods)!r}',
+            f'datasets present: {sorted(df["dataset"].dropna().unique())}',
+            f'methods present: {sorted(df["method"].dropna().unique())}',
+            'either the wrong MSC_ROOT is set, or the runs you need have not '
+            'been fetched or trained yet']))
+
+    # p0 pilots and p1 runs share seed numbers, so pooling them counts one seed
+    # twice -- the contamination Study 2 found. Keep the highest phase.
+    before = len(sel)
+    sel = (sel.sort_values('phase')
+              .drop_duplicates(subset=['arch', 'dataset', 'method', 'seed'],
+                               keep='last'))
+    if len(sel) < before:
+        print(f'dropped {before - len(sel)} duplicate (arch, method, seed) '
+              f'run(s) -- pilot replicates')
+    return sel.reset_index(drop=True)
+
+_b = measured_runs()
+print(f'{len(_b)} CIFAR-100 base run(s); '
+      f'{_b["arch"].nunique()} architecture(s)')
 """
+
 
 # Q3 pruning: score sources at the two ends of the saturation range measured in
 # Study 2 (analysis/s2_memorisation.csv).
@@ -95,8 +192,8 @@ would shrink it further and we can estimate by how much. If the excess is
 > merely interesting.
 """),
         code(bootstrap_cell()),
-        code(worker_cell("analysis", note="Read-only. Nothing is trained here.")),
-        code(alias_cell()),
+        code(paths_cell()),
+        code(runs_cell()),
         md("""
 ---
 ## The quantities
@@ -121,19 +218,7 @@ from pathlib import Path
 from scipy.stats import spearmanr
 
 runs_dir = Path(MSC_ROOT) / 'runs'
-runs = sorted(d.name for d in runs_dir.iterdir()
-              if d.is_dir() and (d / 'per_sample' / 'test.parquet').exists())
-meta = pd.DataFrame([{**M.parse_run_id(r), 'run_id': r} for r in runs])
-base = meta[(meta['method'] == 'base') & (meta['dataset'] == 'cifar100')]
-
-# Study 2 defect: p0 pilots and p1 runs share seed numbers, so pooling them
-# counts one seed twice. Keep the highest phase per (arch, seed).
-_before = len(base)
-base = (base.sort_values('phase')
-            .drop_duplicates(subset=['arch', 'dataset', 'seed'], keep='last'))
-if len(base) < _before:
-    print(f'dropped {_before - len(base)} duplicate (arch, seed) run(s); '
-          f'{len(base)} remain')
+base = measured_runs()          # THE accessor -- checks and dedupes
 
 rows = []
 for r in sorted(base['run_id']):
@@ -187,7 +272,7 @@ print(f'observed exit_quality range (frozen heads): '
       f'{obs_lo:.3f} to {obs_hi:.3f}')
 print()
 print('predicted excess if joint training reaches:')
-for q in [obs_hi, 0.90, 0.95, 1.00]:
+for q in sorted({round(float(obs_hi), 4), 0.90, 0.95, 1.00}):
     pred = slope * q + intercept
     tag = '  <- best frozen run' if abs(q - obs_hi) < 1e-9 else ''
     extrap = '  (EXTRAPOLATION, outside observed range)' if q > obs_hi else ''
@@ -316,9 +401,8 @@ importantly — the **same measurement code**.
 {', '.join(Q1_ARCHS)}
 """),
         code(bootstrap_cell()),
-        code(worker_cell("p4", n_runs=len(Q1_ARCHS), hours=10,
-                         note="Study 3 Q1. Joint exit training.")),
-        code(alias_cell()),
+        code(paths_cell(phase="p4", needs_data=True)),
+        code(runs_cell()),
         code(DATA_CELL),
         md("""
 ---
@@ -506,8 +590,8 @@ confounds "better exits" with "different network". Both numbers are reported;
 if `acc_full` moves by more than 1 pt the conditioned one is primary.
 """),
         code(bootstrap_cell()),
-        code(worker_cell("analysis", note="Read-only.")),
-        code(alias_cell()),
+        code(paths_cell()),
+        code(runs_cell()),
         code("""
 import numpy as np, pandas as pd
 from pathlib import Path
@@ -532,19 +616,16 @@ def exit_stats(run_id):
         'K': len(ks),
     }
 
-all_runs = sorted(d.name for d in runs_dir.iterdir()
-                  if d.is_dir() and (d / 'per_sample' / 'test.parquet').exists())
-rows = []
-for r in all_runs:
-    m = M.parse_run_id(r)
-    if m['dataset'] != 'cifar100' or m['method'] not in ('base', 'jointexit'):
-        continue
-    rows.append({**m, 'run_id': r, 'arm': 'joint' if m['method'] == 'jointexit'
-                 else 'frozen', **exit_stats(r)})
-
-df = pd.DataFrame(rows)
-df = (df.sort_values('phase')
-        .drop_duplicates(subset=['arch', 'arm', 'seed'], keep='last'))
+# THE accessor -- it validates the columns and applies the dedupe rule, so
+# neither is re-typed here (rule 4). `require=False` because the joint arm may
+# legitimately not exist yet; the explicit check below says so clearly.
+sel = measured_runs(methods=('base', 'jointexit'), require=False)
+if sel.empty:
+    raise RuntimeError('no CIFAR-100 base or jointexit runs found')
+df = pd.DataFrame([
+    {**dict(row), 'arm': 'joint' if row['method'] == 'jointexit' else 'frozen',
+     **exit_stats(row['run_id'])}
+    for _, row in sel.iterrows()])
 M.save_analysis(sess.data_dir, 's3_frozen_vs_joint', df)
 
 joint_archs = sorted(df[df['arm'] == 'joint']['arch'].unique())
@@ -722,8 +803,8 @@ fraction alone is uninterpretable: a gate can fit one seed's noise perfectly.
 **Both numbers are reported, always.**
 """),
         code(bootstrap_cell()),
-        code(worker_cell("p4", note="Study 3 Q2. Feature dump + gate training.")),
-        code(alias_cell()),
+        code(paths_cell(phase="p4", needs_data=True)),
+        code(runs_cell()),
         code(DATA_CELL),
         md("""
 ---
@@ -993,9 +1074,8 @@ If the two sources keep nearly the same samples, no downstream difference is
 possible and 18 GPU-hours buy nothing. That check costs minutes.
 """),
         code(bootstrap_cell()),
-        code(worker_cell("p5", n_runs=14, hours=18,
-                         note="Study 3 Q3. Pruning demonstration.")),
-        code(alias_cell()),
+        code(paths_cell(phase="p5", needs_data=True)),
+        code(runs_cell()),
         code(DATA_CELL),
         md("""
 ---
@@ -1200,15 +1280,6 @@ def main() -> int:
         kb = (OUT / name).stat().st_size // 1024
         print(f"  {name:30s} {n_code:2d} code + {n_md:2d} md   {kb:5d} KB")
 
-    print("\n  checking for names no earlier cell defines")
-    files = [str(OUT / n) for n in NOTEBOOKS]
-    r = subprocess.run([sys.executable, str(ROOT / "tools" / "check_names.py"),
-                        *files], capture_output=True, text=True)
-    print(r.stdout.rstrip() or r.stderr.rstrip())
-    if r.returncode:
-        print("\n  Generation refused.")
-        return 1
-
     print("\n  parsing every cell as Python 3.10")
     import ast
     bad = 0
@@ -1226,6 +1297,15 @@ def main() -> int:
         print("\n  Generation refused.")
         return 1
     print("  all cells parse")
+    print("\n  checking for names no earlier cell defines")
+    files = [str(OUT / n) for n in NOTEBOOKS]
+    r = subprocess.run([sys.executable, str(ROOT / "tools" / "check_names.py"),
+                        *files], capture_output=True, text=True)
+    print(r.stdout.rstrip() or r.stderr.rstrip())
+    if r.returncode:
+        print("\n  Generation refused.")
+        return 1
+
     print(f"\nOK -- {len(NOTEBOOKS)} notebook(s) in {OUT}")
     return 0
 

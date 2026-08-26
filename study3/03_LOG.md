@@ -37,6 +37,57 @@ Written **before** any run. Do not edit the prediction column.
 
 ---
 
+## 2026-08-20 (later) · S3_NB0 failed on first run — root cause was the paths cell
+
+```
+KeyError: 'method'
+  base = meta[(meta['method'] == 'base') & (meta['dataset'] == 'cifar100')]
+```
+
+**Root cause, two layers deep.** I built the session with
+`build_notebooks.py`'s `worker_cell`, which constructs a `Session` **without**
+`work_root`. The Session then chose its own default directory instead of the
+one holding the runs, so the scan found nothing, `pd.DataFrame([])` had no
+columns, and the first column access raised `KeyError` — a message pointing at
+pandas, 40 lines from the real problem.
+
+The alias cell's guard did not catch it because it asserted `runs/` **is a
+directory**, and a Session *creates* that directory. The check proved nothing.
+
+**Fixes:**
+
+1. **`paths_cell()`** replaces `worker_cell` + `alias_cell` in all five
+   notebooks. It resolves through `M.resolve_storage`, exactly as Study 2's
+   notebooks do, and passes `work_root=MSC_ROOT` to the Session. `MSC_ROOT` is
+   settable at the top if the runs live somewhere specific.
+2. **It counts MEASURED RUNS, not directories**, and raises with the fix
+   instructions if there are none.
+3. **`runs_cell()` / `measured_runs()`** — one accessor for "which runs do I
+   analyse", validating that every expected column exists and applying the
+   pilot-replicate dedupe in a single place. NB0 and NB2 both use it instead of
+   each re-typing the logic.
+
+**A tooling defect, found because this was the fourth time.** An escaped `\n`
+inside a generated f-string kept collapsing into a real newline, breaking a
+cell. `check_names.py` silently skipped unparseable cells, so the symptom
+appeared as *"undefined name three cells later"* rather than *"this cell does
+not parse"*. Two changes:
+
+* `check_names.py` now **reports** an unparseable cell instead of skipping it;
+* the generator runs the **parse gate before the name check**, so a syntax
+  error is reported as a syntax error.
+
+It paid for itself within the hour: the very next mistake (a `**` on a
+conditional expression) was reported at the right line instead of surfacing as
+a phantom missing name.
+
+**`tools/s3_nb0_harness.py`** added — executes S3_NB0's real cells against
+synthetic frames built so that excess *falls* as exit quality rises, and
+requires the notebook to recover that sign. It does (slope −0.32). The three
+in-notebook canaries pass inside the harness too. NB0 no longer ships unrun.
+
+---
+
 ## 2026-08-20 · Study 3 built
 
 **Library changes** (`src/msc_lib.py`, selftest 459/459 still passing):
