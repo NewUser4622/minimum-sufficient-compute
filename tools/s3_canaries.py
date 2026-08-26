@@ -190,5 +190,48 @@ for _nb in sorted(Path("notebooks_study3").glob("*.ipynb")):
     check(f"{_nb.name}: no bare M.base_config (skips data_root)",
           "M.base_config(" not in _code)
 
+# --- D-87: ONE flag must not have TWO defaults ---------------------------
+# place_model defaulted channels_last True while build_loaders defaulted it
+# False. Every CIFAR config omitted the key, so the model went NHWC and the
+# batches stayed NCHW -- caught by assert_layout_match on batch one of the
+# first joint run, having silently applied to every CIFAR run before that.
+_pm = src[src.index("def place_model"):]
+_pm = _pm[:_pm.index("\ndef ")]
+_bl = src[src.index("def build_loaders"):]
+_bl = _bl[:_bl.index("\ndef ")]
+check("place_model defaults channels_last to False",
+      'cfg.get("channels_last", False)' in _pm)
+check("place_model and the loader now agree on the default",
+      ('cfg.get("channels_last", True)' not in _pm)
+      and ('cfg.get("channels_last", True)' not in _bl))
+
+# and the CIFAR recipe now STATES it, so nothing depends on a default
+_cif = src[src.index('"train_holdout_n": 5000'):]
+_cif = src[:src.index('"train_holdout_n": 5000')]
+check("the CIFAR recipe states channels_last explicitly",
+      _cif.rindex('"channels_last": False') > _cif.rindex('"deterministic": False'))
+
+# --- offline-first: training notebooks must not touch HuggingFace ---------
+import json as _j
+_nbs = {q.name: "\n".join("".join(c["source"]) for c in
+                           _j.loads(q.read_text(encoding="utf-8"))["cells"]
+                           if c["cell_type"] == "code")
+        for q in sorted(Path("notebooks_study3").glob("*.ipynb"))}
+for _name, _code in _nbs.items():
+    if _name.endswith("NB5_Publish.ipynb"):
+        check(f"{_name}: HF is ON (it is the publisher)", "enable_hf=True" in _code)
+    else:
+        check(f"{_name}: HF is OFF (offline training)", "enable_hf=False" in _code)
+
+check("every notebook points at the CIFAR repo, not the ImageNet one",
+      all("msc-cifar100" in c for c in _nbs.values()))
+check("the publisher checks the token BEFORE uploading",
+      _nbs["S3_NB5_Publish.ipynb"].index("hf_token_check")
+      < _nbs["S3_NB5_Publish.ipynb"].index("hf_upload_resilient"))
+check("the publisher verifies by resolve, not by the queue draining (rules 9/10)",
+      "resolve_meta" in _nbs["S3_NB5_Publish.ipynb"])
+check("hf_upload_resilient is called with `items=`, its real parameter",
+      "items=items" in _nbs["S3_NB5_Publish.ipynb"])
+
 print(f"\n{sum(res)}/{len(res)} Study 3 canaries pass")
 sys.exit(0 if all(res) else 1)

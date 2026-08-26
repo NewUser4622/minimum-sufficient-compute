@@ -32,6 +32,12 @@ identity. Architectures chosen to span the range and stay cheap:
 Joint training adds a forward/backward through K heads: budget **+30–40 %**, so
 ≈ 9–10 GPU-h total.
 
+> **These timings may be pessimistic (D-87).** Study 1's CIFAR runs predate
+> `assert_layout_match` and were most likely paying a layout-conversion tax
+> on every convolution. Correctness is unaffected — it is a throughput bug —
+> so the results stand, but the wall-clock figures they are derived from may
+> be too high. Re-measure from Study 3's own runs rather than trusting these.
+
 **H1 (pre-registered).** With jointly trained exits, the oracle still exceeds
 full-compute accuracy:
 

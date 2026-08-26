@@ -20,6 +20,8 @@ Anything in this table belongs in code, not in a chat message.
 | results root | `C:\msc_results` | `MSC_ROOT`, auto-resolved |
 | ImageNet-100 pack | `C:\msc_data\in100` | `MSC_IN100_DIR` |
 | GPU | RTX 4000 Ada, 20 GB | — |
+| HuggingFace repo | `Shanmuk4622/msc-cifar100` | `MSC_HF_REPO`; the library default is the **ImageNet** repo |
+| network | **intermittent** | Study 3 trains OFFLINE; `S3_NB5_Publish` uploads once, at the end |
 
 `locate_cifar100()` now checks an explicit location **before** any download
 path, which it previously could not do — ImageNet-100 had `MSC_IN100_DIR` since
@@ -37,8 +39,10 @@ thing the caller had no way to say.
 | **P2** | Q1 verdict, paired comparison | ~10 min CPU | ready — needs P1 | `analysis/s3_q1_comparison.csv` |
 | **P3** | Q2 learned router | ~5 GPU-h | ready — gated on P2 | `analysis/s3_router_capture.csv` |
 | **P4** | Q3 pruning | ~18 GPU-h | ready — independent | `analysis/s3_pruning.csv` |
+| **P5** | publish everything, once | minutes | ready — run LAST, with a network | `Shanmuk4622/msc-cifar100` |
 
-**Next action: run `S3_NB1_JointTrain`.** P0 predicts the excess will be
+**Next action: re-run `S3_NB1_JointTrain`.** It is now offline and the layout
+bug is fixed; it should reach epoch 1 and stay there. P0 predicts the excess will be
 **larger** than +6.86 pt under joint training, around +11 to +12 pt. If NB1
 comes back below 2.0 pt, P0's extrapolation had no power and that is worth
 recording as loudly as the result itself.
@@ -55,6 +59,80 @@ Written **before** any run. Do not edit the prediction column.
 | **H2** | a learned router captures little of the gap | < 25 % (cross-seed) | _pending_ | _pending_ |
 | **H3** | saturated-source pruning is worse | ≥ 1.0 pt at 30 % keep | _pending_ | _pending_ |
 | **H3b** | saturated source ≈ random pruning | ± 0.5 pt at 30 % keep | _pending_ | _pending_ |
+
+---
+
+## 2026-08-20 (P1 crashed) · D-87 — one flag, two defaults; and Study 3 goes offline
+
+`S3_NB1` passed its dry run, claimed the run, started epoch 1, and died on
+batch one:
+
+```
+[PERF] resnet20 joint multi-exit: channels_last on cuda:0
+RuntimeError: [train resnet20] memory-format mismatch: input is contiguous
+but conv weights are channels_last.  ... This is D-55
+```
+
+### D-87 — the same defect as D-55, from the other side
+
+`place_model` defaulted `channels_last` to **True**. `build_loaders` defaulted
+the same key to **False**. Only `_imagenet_config` ever set it explicitly, so
+**every CIFAR-100 config omitted it** — and the two functions then gave
+different answers to the same question. Model NHWC, batches NCHW.
+
+D-55 was "the config said channels_last and nothing enforced it". D-87 is "two
+places enforced it and disagreed". Same root: an invariant with more than one
+home.
+
+**Study 1's CIFAR runs predate `assert_layout_match`**, which is why this was
+never seen. Those runs were most likely paying the conversion tax the whole
+time — it costs throughput, not correctness, so the results stand, but the
+timings in `01_PROTOCOL.md` may be pessimistic.
+
+**Fix:** `place_model`'s default is now `False`, matching the loader; and the
+CIFAR recipe **states** `channels_last: False` outright so nothing depends on a
+default at all. D-59 measured channels_last as 6.7× slower on this GPU, so
+False is also the fast answer. Canaries assert both halves and that the two
+defaults agree.
+
+### Study 3 now trains completely offline
+
+```
+[HF:hub] AUTH FAILURE -- check HF_TOKEN write scope
+[HF:hub] BATCH FAILED after 8 attempts (17 files): 403 Forbidden
+```
+
+Two problems, and the second is the structural one.
+
+1. **It was pushing to `msc-imagenet100`** during a CIFAR study, because
+   `HF_REPO` defaults to the ImageNet repo. Every notebook now sets
+   `MSC_HF_REPO=Shanmuk4622/msc-cifar100`.
+2. **It was pushing at all.** A background uploader retrying every 30 minutes
+   turns *"no network right now"* into *"the run failed"*. On a machine without
+   a permanent connection that is the wrong default, and it killed a run that
+   had already passed its dry run.
+
+**Every Study 3 notebook now runs with `enable_hf=False`.** Nothing is uploaded
+during training; everything is written to disk in full — configs, epoch
+histories, telemetry, per-sample parquets, checkpoints, environment records.
+
+**`S3_NB5_Publish` is new** and is the only notebook that touches the network:
+
+* checks the token first with `hf_token_check` — valid, **write** scope, right
+  namespace — so a 403 names its own cause instead of arriving under forty
+  lines of traceback (D-84);
+* lists and **sizes** everything before a byte moves, so a 40 GB surprise is
+  visible while it is still cancellable;
+* uploads folder-at-a-time through `hf_upload_resilient`, which survives a DNS
+  drop mid-run (D-86);
+* verifies with `resolve_meta` on specific paths — **a drained queue is not
+  confirmation** (rules 9 and 10).
+
+The local tree is the source of truth. HuggingFace is a copy.
+
+Canaries: **55/55**, including "every training notebook has HF off", "the
+publisher has it on", "token check precedes upload", and "verification is by
+resolve".
 
 ---
 

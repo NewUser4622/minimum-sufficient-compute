@@ -115,6 +115,27 @@ probe, before any full run.
 **Response.** Reduce batch size rather than risk the machine. Study 1's timings
 (1.3–3.7 GPU-h per run) assume a 20 GB card is not being pushed to its limit.
 
+## R-09 · The network drops mid-run · **OCCURRED — now designed out**
+
+**It happened on the first joint run.** A background HuggingFace uploader
+retried, hit a 403 (read-only token, and the wrong repo), and the run stopped.
+
+**Response, already applied.** Training and analysis notebooks run with
+`enable_hf=False`. Nothing is uploaded while work is in progress; the local
+tree is complete and authoritative. `S3_NB5_Publish` uploads once, at the end,
+with a network you know is up, and it:
+
+* checks the token BEFORE uploading (`hf_token_check` — valid / **write** /
+  right namespace), so a 403 names its own cause (D-84);
+* sizes the upload before moving a byte;
+* uploads folder-at-a-time via `hf_upload_resilient`, which survives a DNS drop
+  (D-86);
+* verifies with `resolve_meta` — a drained queue is not confirmation
+  (rules 9, 10).
+
+**Detector:** the canary suite asserts HF is off in every training notebook and
+on only in the publisher. **Trigger:** build time, every time.
+
 ---
 
 ## What success means

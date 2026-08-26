@@ -6053,6 +6053,14 @@ def base_config(arch: str, dataset: str = "cifar100", seed: int = 1,
         "gradient_accumulation_steps": 1,
         "deterministic": False,
 
+        # D-87. STATED, not defaulted. This key was absent from the CIFAR recipe
+        # while `place_model` defaulted it True and `build_loaders` defaulted it
+        # False -- one flag with two answers, which is how a jointly-trained
+        # resnet20 got NHWC weights and NCHW batches on batch one. The CIFAR
+        # loader emits contiguous tensors, and D-59 measured channels_last as
+        # 6.7x SLOWER on this GPU anyway, so False is also the fast answer.
+        "channels_last": False,
+
         # Q4 instrumentation
         "el2n_epoch": 10,
         "train_holdout_n": 5000,
@@ -8105,9 +8113,21 @@ def place_model(model, device, cfg: Optional[Dict[str, Any]] = None,
     This function is now the only sanctioned way to put a model on a device.
     One place to read, one place to change, and `assert_layout_match` below
     turns the invariant into something that fails loudly on batch one.
+
+    **D-87, and it is D-55 wearing the opposite coat.** The default here was
+    `True` while the LOADER's default (`build_loaders`) was `False`. For any
+    config that omitted the key -- which is every CIFAR-100 config, since only
+    `_imagenet_config` set it explicitly -- the model became NHWC while the
+    batches stayed NCHW. Study 1's CIFAR runs predate `assert_layout_match`, so
+    nothing ever told us; Study 3's first joint run hit the assert on batch one.
+
+    One flag, two defaults, in two files. The fix is not to pick the "right"
+    layout, it is to stop having two answers to the same question: this default
+    now matches the loader's, and `base_config` states it outright so nothing
+    depends on a default at all.
     """
     model = model.to(device)
-    want_cl = True if cfg is None else bool(cfg.get("channels_last", True))
+    want_cl = False if cfg is None else bool(cfg.get("channels_last", False))
     if want_cl:
         model = model.to(memory_format=torch.channels_last)
     if tag:

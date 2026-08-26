@@ -112,6 +112,23 @@ accuracy difference. Independent of P1 and P2 — it can run first if preferred.
 
 ---
 
+## How Study 3 runs: offline, then publish once
+
+This machine does not always have a network. A background uploader that retries
+mid-epoch turns a missing connection into a failed run — which is exactly what
+killed the first joint run, after it had already passed its dry run.
+
+So **every training and analysis notebook runs with `enable_hf=False`**.
+Nothing is uploaded while work is happening. Everything is written to disk in
+full: configs, epoch histories, telemetry, per-sample parquets, checkpoints,
+environment records. **`S3_NB5_Publish` is the only notebook that touches the
+network**, it runs last, and it uploads the finished tree in one pass —
+checking the token before it starts and verifying by `resolve` afterwards.
+
+The local tree is the source of truth. HuggingFace is a copy of it.
+
+---
+
 ## Files
 
 | file | what it is |

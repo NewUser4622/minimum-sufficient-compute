@@ -28,7 +28,7 @@ OUT = ROOT / "notebooks_study3"
 Q1_ARCHS = ("resnet20", "resnet32x4", "vgg8")
 
 
-def paths_cell(phase="analysis", needs_data=False) -> str:
+def paths_cell(phase="analysis", needs_data=False, hf=False) -> str:
     """Locate the results root the same way Study 2 did, and PROVE data is there.
 
     The first version of this used `build_notebooks.py`'s `worker_cell`, which
@@ -75,6 +75,11 @@ M = msc                       # Study 2's notebooks say `M`; same module.
 if CIFAR_DIR:
     os.environ['MSC_CIFAR_DIR'] = str(CIFAR_DIR)
 
+# Study 3 is CIFAR-100. The library's default repo is the ImageNet one, so
+# without this every push would land in msc-imagenet100 -- which is exactly what
+# happened on the first joint run.
+os.environ.setdefault('MSC_HF_REPO', 'Shanmuk4622/msc-cifar100')
+
 _paths = M.resolve_storage(DATA_DIR, MSC_ROOT)
 if not _paths['ok']:
     raise SystemExit('storage is not usable -- see the problems listed above')
@@ -83,9 +88,16 @@ DATA_DIR = _paths['data_dir']
 MSC_ROOT = _paths['results_root']
 os.environ['MSC_SCRATCH'] = MSC_ROOT
 
+# OFFLINE BY DEFAULT. This machine does not always have a network, and a
+# background uploader that retries mid-epoch turns a missing connection into a
+# failed run. Everything is written to disk in full; S3_NB5_Publish uploads it
+# in ONE pass at the end. `enable_hf` is the only switch that decides this.
 sess = M.Session(account='local', phase='{phase}', dataset='cifar100',
                  work_root=MSC_ROOT, session_limit_h=0.0,
+                 enable_hf={hf!r},
                  worker_id=0, num_workers=1)
+print('HuggingFace: ' + ('ON -- publishing' if {hf!r} else
+                         'OFF -- fully offline, nothing is uploaded here'))
 
 print(f'msc_lib   {{M.__version__}}')
 print(f'MSC_ROOT  {{MSC_ROOT}}')
@@ -1302,12 +1314,214 @@ print('memorising model is worth no more than chance.')
     ])
 
 
+# ---------------------------------------------------------------------------
+# S3_NB5 -- publish, once, at the end
+# ---------------------------------------------------------------------------
+def nb5():
+    return notebook([
+        md("""
+# S3_NB5 — publish everything to HuggingFace, in one pass
+
+**Run this LAST, when you have a network. Nothing else in Study 3 touches
+HuggingFace at all.**
+
+## Why this notebook exists
+
+The first joint run died like this:
+
+```
+[HF:hub] AUTH FAILURE -- check HF_TOKEN write scope
+[HF:hub] BATCH FAILED after 8 attempts (17 files): 403 Forbidden
+```
+
+Two problems, and the second is the structural one.
+
+1. **It was pushing to `msc-imagenet100`** — the library's default repo — during
+   a CIFAR-100 study.
+2. **It was pushing at all.** A background uploader that retries every 30
+   minutes turns *"the network is down right now"* into *"the training run
+   failed"*. On a machine without a permanent connection that is the wrong
+   default, and it cost a run that had already passed its dry run.
+
+So Study 3 trains **completely offline**. Every artifact is written to disk in
+full — configs, epoch histories, telemetry, per-sample parquets, checkpoints,
+environment records — and this notebook uploads the finished tree in one pass.
+
+**The local tree is the source of truth.** HuggingFace is a copy of it.
+"""),
+        code(bootstrap_cell()),
+        code(paths_cell(phase="analysis", hf=True)),
+        md("""
+---
+## Check the token BEFORE uploading anything
+
+`hf_token_check` was written after a 403 arrived under forty lines of
+traceback (D-84). It answers three questions separately — is the token valid,
+does it have **write** scope, and does it reach **this** repo — so a failure
+names its own cause.
+"""),
+        code("""
+import os
+TOKEN = os.environ.get('HF_TOKEN') or ''
+REPO  = os.environ.get('MSC_HF_REPO', 'Shanmuk4622/msc-cifar100')
+
+print(f'repo  : {REPO}')
+print(f'token : {"set, " + str(len(TOKEN)) + " chars" if TOKEN else "NOT SET"}')
+print()
+
+chk = M.hf_token_check(TOKEN or None, REPO)
+for k in ('ok', 'valid', 'can_write', 'user', 'namespace', 'reason'):
+    if k in chk:
+        print(f'  {k:12s} {chk[k]}')
+
+if not chk.get('ok'):
+    raise RuntimeError(
+        'token check FAILED -- fix this before uploading. The most common cause '
+        'is a READ token: HuggingFace -> Settings -> Access Tokens -> New token '
+        'with the WRITE role, then set HF_TOKEN. Nothing has been uploaded.')
+print()
+print('token OK -- safe to upload')
+"""),
+        md("""
+---
+## What is about to be uploaded
+
+Listed and sized **before** anything moves, so a 40 GB surprise is visible
+while it is still cancellable.
+"""),
+        code("""
+from pathlib import Path
+import pandas as pd
+
+root = Path(MSC_ROOT)
+INCLUDE = ['runs', 'analysis', 'budgets', 'registry', 'tables', 'paper']
+SKIP_SUFFIX = {'.tmp', '.lock'}
+
+rows = []
+for top in INCLUDE:
+    d = root / top
+    if not d.is_dir():
+        continue
+    for p in d.rglob('*'):
+        if p.is_file() and p.suffix not in SKIP_SUFFIX:
+            rows.append({'top': top, 'path': str(p.relative_to(root)),
+                         'mb': p.stat().st_size / 2**20,
+                         'ckpt': p.suffix == '.pt'})
+
+files = pd.DataFrame(rows)
+if files.empty:
+    raise RuntimeError(f'nothing to upload under {root}')
+
+by_top = files.groupby('top')['mb'].agg(['count', 'sum']).rename(
+    columns={'count': 'files', 'sum': 'MB'})
+print(by_top.round(1).to_string())
+print()
+ck = files[files['ckpt']]['mb'].sum()
+print(f'TOTAL      {len(files):,} files   {files["mb"].sum()/1024:.2f} GB')
+print(f'  of which checkpoints (.pt): {ck/1024:.2f} GB')
+print()
+print('Checkpoints are ~95% of the bytes and are rarely re-opened. Set')
+print('UPLOAD_CHECKPOINTS = False below to skip them if bandwidth is scarce --')
+print('every analysis in Studies 2 and 3 runs from the parquets alone.')
+"""),
+        md("""
+---
+## Upload
+
+`hf_upload_resilient` batches, retries with backoff, and respects the 128
+commits/hour ceiling. It is the same path the training notebooks used to call
+in the background — the difference is that here it runs **once**, deliberately,
+with a network you know is up.
+
+Interrupting is safe: it uploads in batches and re-running skips what already
+landed.
+"""),
+        code("""
+UPLOAD_CHECKPOINTS = True     # <<< False to skip the ~95% that is .pt files
+
+# the file-level view, used for the size report and the resolve probe below
+sel = files if UPLOAD_CHECKPOINTS else files[~files['ckpt']]
+print(f'{len(sel):,} file(s), {sel["mb"].sum()/1024:.2f} GB')
+
+# hf_upload_resilient takes (local_path, path_in_repo, label) triples and
+# uploads FOLDER AT A TIME -- that is the unit it can retry and resume at.
+items = []
+for top in INCLUDE:
+    d = root / top
+    if not d.is_dir():
+        continue
+    if top == 'runs':
+        for run in sorted(x for x in d.iterdir() if x.is_dir()):
+            items.append((str(run), f'runs/{run.name}', run.name))
+    else:
+        items.append((str(d), top, top))
+
+if not UPLOAD_CHECKPOINTS:
+    print('NOTE: UPLOAD_CHECKPOINTS=False, but hf_upload_resilient uploads whole')
+    print('folders. Checkpoints live inside each run folder, so skipping them')
+    print('means excluding them here rather than filtering the file list.')
+    import shutil, tempfile
+    stage = Path(tempfile.mkdtemp(prefix='msc_nockpt_'))
+    items = []
+    for run in sorted(x for x in (root / 'runs').iterdir() if x.is_dir()):
+        dst = stage / run.name
+        shutil.copytree(run, dst,
+                        ignore=shutil.ignore_patterns('*.pt', 'checkpoints'))
+        items.append((str(dst), f'runs/{run.name}', run.name))
+    for top in INCLUDE:
+        if top != 'runs' and (root / top).is_dir():
+            items.append((str(root / top), top, top))
+
+print(f'uploading {len(items)} folder(s)')
+res = M.hf_upload_resilient(token=TOKEN, repo_id=REPO, repo_type='dataset',
+                            items=items)
+print()
+for k, v in (res or {}).items():
+    print(f'  {k}: {v}')
+"""),
+        md("""
+---
+## Verify by `resolve`, not by the queue draining
+
+**Rule 9 and rule 10.** A drained upload queue is not confirmation that the
+files are there, and `list_repo_files` has lied before. The only trustworthy
+check is asking HuggingFace to resolve specific paths and seeing a 200.
+"""),
+        code("""
+# `sess.hub.resolve_meta` is THE rule-9 check: it asks HuggingFace to resolve a
+# specific path and returns None only for a genuine 404, raising instead of
+# reporting absence when the lookup itself failed.
+probe = sorted(set(
+    sel.sample(min(8, len(sel)), random_state=0)['path'].tolist()
+    + [p for p in sel['path'] if p.endswith('per_sample/test.parquet')][:3]
+    + [p for p in sel['path'] if p.endswith('summary.json')][:3]))
+
+ok = miss = 0
+for rel in probe:
+    meta = sess.hub.resolve_meta(Path(rel).as_posix())
+    print(f'  {"OK  " if meta else "MISS"} {rel}'
+          + (f'  ({meta["size"]:,} B)' if meta and meta.get('size') else ''))
+    ok, miss = ok + bool(meta), miss + (not meta)
+
+print()
+if miss:
+    raise RuntimeError(
+        f'{miss} of {ok + miss} probed files did NOT resolve. A drained upload '
+        'queue is not confirmation (rule 10) -- re-run the upload cell.')
+print(f'{ok} probed file(s) resolve on HuggingFace')
+print()
+print('The local tree remains the source of truth. This is a copy of it.')
+"""),
+    ])
+
+
 NOTEBOOKS = {
     "S3_NB0_Extrapolate.ipynb": nb0,
     "S3_NB1_JointTrain.ipynb": nb1,
     "S3_NB2_Compare.ipynb": nb2,
     "S3_NB3_Router.ipynb": nb3,
     "S3_NB4_Pruning.ipynb": nb4,
+    "S3_NB5_Publish.ipynb": nb5,
 }
 
 
