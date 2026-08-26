@@ -47,6 +47,19 @@ The oracle early-exit bound in common use is:
 > exit at the first layer whose prediction matches that of the last layer —
 > an ideal upper bound for how much computation could be saved.
 
+**The definition we target is the standard one.** A survey of early-exit
+networks states it directly: *"the oracle is an ideal model that can always
+enable each sample to exit at the shallowest internal classifier that provides a
+correct label prediction"* — a **label** oracle, which is exactly
+`pred_dk == label` as implemented here (not the weaker "matches the final
+prediction" variant, which is capped at full accuracy by construction).
+
+And the inference we are challenging is made explicitly. DE3-BERT observes that
+*"the oracle outperforms the backbone model and existing exiting strategies by a
+large margin… which indicates significant room for improving the estimation of
+prediction correctness."* That reading — oracle above backbone, therefore
+headroom — is the one this paper argues is unsafe.
+
 Every quantity in it comes from one trained network. Our claim is not that this
 is arithmetically wrong; it is that **it is an upper bound on the wrong thing**.
 It bounds what a router could achieve *if it had access to this network's own
@@ -278,6 +291,19 @@ findings, not one mechanism seen twice.
 
 ## 5. Limitations
 
+- **The exits are post-hoc heads on a frozen backbone, not a trained
+  early-exit network.** This is the most serious limitation and the first thing
+  a reviewer will raise. Study 1 trained exit heads with the backbone **frozen**
+  (`msc_lib.py`, "exit heads: backbone frozen"), whereas MSDNet, BranchyNet and
+  DE3-BERT-style networks train exits *jointly*, producing stronger and
+  better-calibrated early classifiers. Weaker exits plausibly **enlarge** the
+  early-right/final-wrong pool, so the **+6.86 pt magnitude is likely an
+  overestimate** for a properly trained early-exit model. The *direction* is
+  structural — a cheapest-correct-exit oracle can never fall below full accuracy
+  and will exceed it whenever any early exit is right where the final layer is
+  wrong — but the magnitude must be re-measured on a jointly-trained network
+  before it is quoted as a general number. **This is the single highest-value
+  follow-up experiment.**
 - **One dataset, one scale.** CIFAR-100 at 32px, 15 architectures. ImageNet-100
   (2 architectures × 2 seeds) shows the same direction on the reliability atlas
   but cannot support a cross-seed bias estimate — one pair per architecture, no
