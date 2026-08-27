@@ -919,8 +919,25 @@ only thing standing between us and a learned router.
 import numpy as np, pandas as pd, torch, torch.nn as nn
 from pathlib import Path
 
-ARCHS = ['resnet20', 'resnet32x4', 'vgg8']
-SEEDS = [1, 2]          # two seeds: the cross-seed control needs them
+# WHICH RUNS. Q2 needs >= 2 seeds per architecture for the cross-seed control,
+# so it uses the FROZEN base runs (3 seeds each). The joint runs from Q1 have
+# one seed apiece and cannot support the control -- noted as a limitation
+# rather than worked around, since Q1 showed the excess is LARGER on joint runs
+# and a router evaluated only on frozen runs is therefore a conservative test.
+#
+# Runs are FOUND, not constructed. The first version built
+# `p4-{arch}-cifar100-base-s{seed}` from the session phase, but the base runs
+# are phase p1 -- so every id missed, `0 feature dump(s)`, and the empty frame
+# surfaced as `KeyError: 'kind'` four cells later.
+_base = measured_runs()                       # THE accessor
+_per = _base.groupby('arch')['seed'].nunique()
+ARCHS = [a for a in ['resnet20', 'resnet32x4', 'vgg8'] if _per.get(a, 0) >= 2]
+if not ARCHS:
+    raise RuntimeError(
+        'no architecture has >= 2 measured seeds, so the cross-seed control is '
+        f'impossible. Seeds per arch: {_per.to_dict()}')
+print(f'architectures with >= 2 seeds: {ARCHS}')
+
 feat_dir = Path(MSC_ROOT) / 'features'
 feat_dir.mkdir(parents=True, exist_ok=True)
 
@@ -971,16 +988,22 @@ def dump_features(run_id, cfg):
 
 paths = {}
 for a in ARCHS:
-    for s in SEEDS:
-        cfg = sess.config(a, seed=s, method='base')
-        rid = cfg['run_id']
-        if not (Path(MSC_ROOT) / 'runs' / rid / 'per_sample' / 'test.parquet').exists():
-            print(f'  missing {rid}, skipped')
-            continue
+    sub = _base[_base['arch'] == a].sort_values('seed').head(2)
+    for _, row in sub.iterrows():
+        rid = row['run_id']
+        # Rebuild the config for THIS run's real phase, not the session's.
+        cfg = sess.config(a, seed=int(row['seed']), method='base')
+        cfg['run_id'] = rid
+        cfg['phase'] = row['phase']
         paths[rid] = dump_features(rid, cfg)
-        mb = paths[rid].stat().st_size / 2**20
-        print(f'  {rid:38s} {mb:6.1f} MB')
-print(f'\\n{len(paths)} feature dump(s)')
+        print(f'  {rid:40s} {paths[rid].stat().st_size / 2**20:6.1f} MB')
+
+print()
+print(f'{len(paths)} feature dump(s)')
+if len(paths) < 2:
+    raise RuntimeError(
+        f'only {len(paths)} feature dump(s); the cross-seed control needs at '
+        'least two runs of the same architecture. Nothing below can run.')
 """),
         md("""
 ---
@@ -1089,6 +1112,11 @@ for a in ARCHS:
                      'capture': (gt - base) / gap if gap > 1e-9 else np.nan})
 
 cap = pd.DataFrame(rows)
+if cap.empty:
+    raise RuntimeError(
+        'no capture rows were produced, so every number below would be a '
+        f'KeyError on an empty frame. Feature dumps: {sorted(paths)}. Check '
+        'that each architecture has two runs with per_sample/test.parquet.')
 M.save_analysis(sess.data_dir, 's3_router_capture', cap)
 print(cap.round(3).to_string(index=False))
 print()
@@ -1331,6 +1359,11 @@ for c in cfgs:
                  'acc': d.get('best_accuracy') or d.get('final_acc')})
 
 pr = pd.DataFrame(rows).dropna()
+if pr.empty:
+    raise RuntimeError(
+        f'no summary.json with an accuracy was found for any of the '
+        f'{len(cfgs)} pruning runs, so the table below would be a KeyError on '
+        'an empty frame. Did the training cell actually complete?')
 M.save_analysis(sess.data_dir, 's3_pruning', pr)
 tab = pr.groupby(['rate', 'arm'])['acc'].agg(['mean', 'std', 'count'])
 print((tab * 100).round(2).to_string())

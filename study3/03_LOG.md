@@ -35,18 +35,14 @@ thing the caller had no way to say.
 | | what | cost | state | artifact |
 |---|---|---|---|---|
 | **P0** | exit quality → excess extrapolation | ~15 min CPU | **DONE** — predicts excess GROWS with exit quality | `analysis/s3_exit_quality.csv` |
-| **P1** | Q1 joint exit training | ~10 GPU-h | **TRAINED** — measurement pass still needed (D-88) | 3 runs under `runs/p4-*-jointexit-s1` |
-| **P2** | Q1 verdict, paired comparison | ~10 min CPU | ready — needs P1 | `analysis/s3_q1_comparison.csv` |
-| **P3** | Q2 learned router | ~5 GPU-h | ready — gated on P2 | `analysis/s3_router_capture.csv` |
+| **P1** | Q1 joint exit training | ~10 GPU-h | **DONE** | 3 runs under `runs/p4-*-jointexit-s1` |
+| **P2** | Q1 verdict, paired comparison | ~10 min CPU | **DONE — H1 SUPPORTED** | `analysis/s3_q1_comparison.csv` |
+| **P3** | Q2 learned router | ~5 GPU-h | **ready — run next** | `analysis/s3_router_capture.csv` |
 | **P4** | Q3 pruning | ~18 GPU-h | ready — independent | `analysis/s3_pruning.csv` |
 | **P5** | publish everything, once | minutes | ready — run LAST, with a network | `Shanmuk4622/msc-cifar100` |
 
-**Next action: re-run the MEASUREMENT cell in `S3_NB1_JointTrain`.** Training
-is done and intact; only the oracle/measurement pass is missing (D-88), and it
-is inference-only, ~30-40 min. P0 predicts the excess will be
-**larger** than +6.86 pt under joint training, around +11 to +12 pt. If NB1
-comes back below 2.0 pt, P0's extrapolation had no power and that is worth
-recording as loudly as the result itself.
+**Next action: run `S3_NB3_Router` (Q2).** Q1 is settled and Study 2's
+archival blocker is cleared.
 
 ---
 
@@ -56,10 +52,107 @@ Written **before** any run. Do not edit the prediction column.
 
 | | prediction | threshold | measured | verdict |
 |---|---|---|---|---|
-| **H1** | oracle excess survives joint exit training | ≥ 2.0 pt, 3 of 3 archs | _pending_ | P0 predicts **+11 to +12.5 pt** |
+| **H1** | oracle excess survives joint exit training | ≥ 2.0 pt, 3 of 3 archs | **8.55 / 9.15 / 10.64 pt** | **SUPPORTED** (3 of 3) |
 | **H2** | a learned router captures little of the gap | < 25 % (cross-seed) | _pending_ | _pending_ |
 | **H3** | saturated-source pruning is worse | ≥ 1.0 pt at 30 % keep | _pending_ | _pending_ |
 | **H3b** | saturated source ≈ random pruning | ± 0.5 pt at 30 % keep | _pending_ | _pending_ |
+
+---
+
+## 2026-08-20 (Q1 SETTLED) · H1 SUPPORTED — Study 2 is not an artifact
+
+**The blocker is cleared.** Jointly trained exits do not remove the oracle
+excess. They make it **larger**.
+
+| arch | frozen | **joint** | change | Δacc_full | exit_quality |
+|---|---|---|---|---|---|
+| `resnet20` | 6.69 | **10.64** | +3.95 | −1.53 | 0.413 → 0.756 |
+| `resnet32x4` | 6.42 | **8.55** | +2.13 | +1.39 | 0.535 → 0.919 |
+| `vgg8` | 7.95 | **9.15** | +1.20 | +1.08 | 0.634 → 0.753 |
+
+**H1 threshold was ≥ 2.0 pt in 3 of 3. Measured: 8.55, 9.15, 10.64 — SUPPORTED**,
+by more than four times the bar, and the excess **grew in 3 of 3**.
+
+### The experiment was a real test
+
+`exit_quality` rose in all three, by +0.119 to +0.384 (`resnet32x4` reaching
+0.919). Joint training changed exactly what it was supposed to change, so H1
+was genuinely at risk rather than untested.
+
+### R-02 fired, and conditioning makes it stronger
+
+Backbone accuracy moved by more than 1 pt in all three (−1.53, +1.39, +1.08),
+so the conditioned number is primary. Using the slope of excess on `acc_full`
+measured across the 45 frozen runs (−0.2559 pt per pt):
+
+| arch | raw Δ | **conditioned Δ** |
+|---|---|---|
+| `resnet20` | +3.95 | +3.56 |
+| `resnet32x4` | +2.13 | +2.49 |
+| `vgg8` | +1.20 | +1.48 |
+| **median** | +2.13 | **+2.49** |
+
+The effect survives, slightly *larger* once accuracy is held fixed. `resnet20`
+gained most partly because its accuracy fell; `resnet32x4` and `vgg8` gained
+despite theirs rising.
+
+### P0's free extrapolation was right
+
+P0 predicted, from 45 frozen runs and no GPU time, that the excess would **grow**
+with exit quality — reaching ~+10.98 pt at exit_quality 0.86. Measured: **8.55
+to 10.64 pt at exit_quality 0.75–0.92.** Direction correct, magnitude within a
+couple of points, and the prediction was written down before the runs.
+
+That is the strongest argument yet for the cheap-gate-before-expensive-run rule.
+It also means the +12.45 pt figure at exit_quality = 1.0 was an extrapolation
+past the observed range and should not be quoted.
+
+### What this means for the paper
+
+`study2/PAPER.md`'s blocking limitation is **removed**. The oracle excess is not
+a property of weak post-hoc exits — it is larger when the exits are trained the
+way the field trains them. The paper should now report both numbers, with the
+joint figures as the primary evidence and the frozen ones as the conservative
+case.
+
+---
+
+## 2026-08-20 (Q2 blocked) · NB3 constructed run ids instead of finding them
+
+```
+missing p4-resnet20-cifar100-base-s1, skipped     (x6)
+0 feature dump(s)
+...
+KeyError: 'kind'
+```
+
+NB3 built `p4-{arch}-cifar100-base-s{seed}` from the **session** phase. The base
+runs are phase **p1**. Every id missed, no features were dumped, and the empty
+frame surfaced four cells later as `KeyError: 'kind'`.
+
+Third time this exact shape has appeared: a run id assembled from parts instead
+of looked up, plus an empty DataFrame indexed by column name. `measured_runs()`
+was written for precisely this and NB3 was not using it.
+
+**Fixes:** NB3 now **finds** its runs through `measured_runs()`, picks the
+architectures that actually have ≥ 2 seeds, rebuilds each config against the
+run's real phase, and refuses with a clear message if fewer than two dumps
+exist. Two new canaries:
+
+* no notebook may build a run id from an f-string phase prefix;
+* every notebook that builds a DataFrame from a scan must guard it empty before
+  indexing a column.
+
+**The second canary immediately caught the same latent bug in `S3_NB4`**, which
+would have failed the same way after 18 GPU-hours of pruning runs. That is the
+canary paying for itself before the cost was incurred.
+
+Q2 runs on the **frozen** base runs, because the cross-seed control needs ≥ 2
+seeds and the joint runs have one apiece. Given Q1 showed the excess is *larger*
+on joint runs, a router evaluated on frozen runs is a conservative test —
+recorded as a limitation, not worked around.
+
+69/69 canaries; selftest 461/461.
 
 ---
 

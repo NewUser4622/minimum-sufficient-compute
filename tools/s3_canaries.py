@@ -250,5 +250,20 @@ check("S3_NB1 verifies test.parquet exists after measuring",
 check("S3_NB2 distinguishes 'not trained' from 'trained but not measured'",
       "TRAINED but have no" in _nbs["S3_NB2_Compare.ipynb"])
 
+# --- run ids are FOUND, never CONSTRUCTED from the session phase ----------
+# NB3 built p4-{arch}-cifar100-base-s{seed} from the session phase while the
+# base runs are p1. Every id missed, '0 feature dump(s)', and the empty frame
+# surfaced as KeyError: 'kind' four cells later.
+for _name, _code in _nbs.items():
+    check(f"{_name}: no run_id built from an f-string phase prefix",
+          not _re.search(r"f['\"]p\d+-\{", _code))
+
+# --- every notebook that builds a DataFrame from a scan guards it empty ---
+for _name, _code in _nbs.items():
+    if "pd.DataFrame(rows)" in _code:
+        _tail = _code.split("pd.DataFrame(rows)", 1)[1][:400]
+        check(f"{_name}: guards the empty frame before indexing a column",
+              ".empty" in _tail or "len(" in _tail, _tail[:80])
+
 print(f"\n{sum(res)}/{len(res)} Study 3 canaries pass")
 sys.exit(0 if all(res) else 1)

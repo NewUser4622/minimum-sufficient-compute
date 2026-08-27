@@ -1,6 +1,11 @@
 # Oracle upper bounds for early-exit routing are inflated by per-exit noise
 
-**Status: draft, all measurements complete.** Every number is traceable to a CSV
+**Status: draft. The blocking limitation is RESOLVED** — Study 3 Q1 retrained
+three architectures with jointly supervised exits and the excess came out
+*larger*, not smaller (8.55 / 9.15 / 10.64 pt vs 6.42 / 7.95 / 6.69 frozen),
+surviving conditioning on accuracy. §5's first bullet carries the numbers.
+
+**All measurements complete.** Every number is traceable to a CSV
 in `analysis/`. The saturation mechanism (§4.3) was a hypothesis in the first
 draft and is now tested and confirmed. §3.1 carries a correction: the first
 draft attributed the whole optimism bias to noise harvesting, which the data
@@ -291,9 +296,20 @@ findings, not one mechanism seen twice.
 
 ## 5. Limitations
 
-- **The exits are post-hoc heads on a frozen backbone, not a trained
-  early-exit network.** This is the most serious limitation and the first thing
-  a reviewer will raise. Study 1 trained exit heads with the backbone **frozen**
+- **RESOLVED (Study 3 Q1, 2026-08-20).** ~~The exits are post-hoc heads on a
+  frozen backbone.~~ This *was* the most serious limitation. It has now been
+  tested directly: three architectures retrained with exits **jointly**
+  supervised give an excess of **8.55 / 9.15 / 10.64 pt** — every one *larger*
+  than its frozen counterpart (6.42 / 7.95 / 6.69), and the effect survives
+  conditioning on backbone accuracy (median +2.49 pt adjusted). The mechanism
+  is now clear: a weak early exit is right on almost nothing, so it cannot
+  rescue a sample the final layer gets wrong. **Rescues require competent
+  exits, so the pool grows with exit quality.** See `study3/03_LOG.md`.
+  The original text is kept below because the concern was correct to raise.
+
+- ~~**The exits are post-hoc heads on a frozen backbone, not a trained
+  early-exit network.**~~ *(superseded — see above)* This is the most serious
+  limitation and the first thing a reviewer will raise. Study 1 trained exit heads with the backbone **frozen**
   (`msc_lib.py`, "exit heads: backbone frozen"), whereas MSDNet, BranchyNet and
   DE3-BERT-style networks train exits *jointly*, producing stronger and
   better-calibrated early classifiers. Weaker exits plausibly **enlarge** the
