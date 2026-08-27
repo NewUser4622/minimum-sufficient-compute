@@ -63,6 +63,62 @@ Written **before** any run. Do not edit the prediction column.
 
 ---
 
+## 2026-08-20 (P1 measure) · the D-88 fix hit D-67 — the call needs all three
+
+My D-88 fix passed `fn=sess.oracle` but left `stage` at its default, so **D-67
+fired instead**:
+
+```
+ValueError: run_all(fn=sess.oracle) with stage='train' would ask 'is it
+TRAINED?' to decide whether to MEASURE it, so every trained run is skipped.
+  Use: sess.run_all(cfgs, fn=sess.oracle, done_fn=sess.measured, stage='measure')
+```
+
+The guard was right and its message contained the answer. **The correct call
+names all three**, because they answer three different questions:
+
+| | |
+|---|---|
+| `fn` | what to run — the oracle, not the trainer |
+| `done_fn` | what *"already done"* MEANS here — measured, not trained |
+| `stage` | the label the plan prints |
+
+### Why the auto-inference never saved us
+
+`run_all` does contain a shortcut for this:
+
+```python
+if fn is getattr(self, "oracle", None):
+    done_fn, stage = self.measured, "measure"
+```
+
+**A bound method is a new object on every attribute lookup**, so
+`sess.oracle is sess.oracle` is `False` and that branch can never be taken. It
+is dead code for the oracle path — D-67 is what actually catches the mistake,
+and D-67 compares `__func__`, which is why *it* works.
+
+Left as-is deliberately: D-67's selftest encodes "the caller must be explicit"
+as the intended contract, and for a call that decides whether 10 GPU-hours of
+measurement happen, explicit is the right default. Recorded here so the next
+person does not spend an hour wondering why the shortcut looks broken — it is.
+
+**Verified rather than assumed.** Both failure shapes and the notebook's exact
+call were exercised against the real guards:
+
+```
+stage='oracle' only (the D-88 bug)   -> REFUSED
+fn=oracle only      (the D-67 bug)   -> REFUSED
+fn + done_fn + stage (the notebook)  -> passes both guards
+```
+
+Canary tightened from "passes fn=sess.oracle" to "passes fn AND done_fn AND
+stage". 59/59.
+
+**Next: re-run the measurement cell in `S3_NB1`.** Third time; the call now
+satisfies both guards.
+
+---
+
 ## 2026-08-20 (P1 trained) · D-88 — the measurement stage silently did nothing
 
 **Joint training finished.** All three runs completed their full schedules and

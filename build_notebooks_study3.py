@@ -602,11 +602,26 @@ for c in cfgs:
           f"scheme={blob.get('exit_weight_scheme')}  epoch={blob.get('epoch')}")
 
 print()
-# `fn=sess.oracle`, NOT `stage='oracle'`. The stage string only LABELS the
-# plan; `fn` is what selects the work and the completion predicate. Passing the
-# label alone plans the TRAINING stage, finds every run already trained, and
-# measures nothing while printing 'MY REMAINING WORK: 0' (D-88).
-res = sess.run_all(cfgs, fn=sess.oracle, title='Study 3 Q1 / measurement')
+# ALL THREE arguments, which is the call D-67's own error message prescribes:
+#
+#   sess.run_all(cfgs, fn=sess.oracle, done_fn=sess.measured, stage='measure')
+#
+#   fn       what to run                     -> the oracle, not the trainer
+#   done_fn  what "already done" MEANS here  -> measured, not trained
+#   stage    the label the plan prints
+#
+# Passing `stage='oracle'` alone plans TRAINING, finds every run already
+# trained, and measures nothing while printing 'MY REMAINING WORK: 0' (D-88).
+# Passing `fn=sess.oracle` alone is refused by D-67, because the completion
+# predicate would still ask "is it trained?".
+#
+# `run_all` does contain an auto-inference for this, but it compares
+# `fn is getattr(self, 'oracle', None)` -- and a bound method is a NEW object on
+# every attribute lookup, so that identity test is never true. The inference is
+# dead code for the oracle path; D-67 is what actually catches the mistake.
+# Being explicit here is correct regardless of whether that is ever repaired.
+res = sess.run_all(cfgs, fn=sess.oracle, done_fn=sess.measured,
+                   stage='measure', title='Study 3 Q1 / measurement')
 for r in res:
     print(f"  {r.get('status','?'):9s} {r.get('run_id','?')}")
 

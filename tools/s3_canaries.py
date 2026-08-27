@@ -238,8 +238,10 @@ import re as _re
 for _name, _code in _nbs.items():
     for _call in _re.findall(r"sess\.run_all\([^)]*\)", _code, _re.S):
         if "oracle" in _call or "measure" in _call:
-            check(f"{_name}: measuring run_all passes fn=sess.oracle",
-                  "fn=sess.oracle" in _call, _call[:90])
+            # D-67 requires all three; D-88 requires fn to match the stage.
+            check(f"{_name}: measuring run_all passes fn/done_fn/stage",
+                  ("fn=sess.oracle" in _call and "done_fn=sess.measured" in _call
+                   and "stage='measure'" in _call), _call[:110])
 
 # and NB1 must OPEN the artifact rather than trust the plan (rule 5 / D-79)
 check("S3_NB1 verifies test.parquet exists after measuring",

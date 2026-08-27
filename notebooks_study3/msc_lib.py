@@ -12027,6 +12027,33 @@ class Session:
                 done_fn, stage = self.measured, "measure"
             else:
                 done_fn = self.trained
+
+        # D-88. `stage` is a LABEL; `fn` is what selects the work. Study 3's
+        # NB1 called `run_all(cfgs, stage='oracle')` without `fn=sess.oracle`,
+        # so `fn` defaulted to `self.train`, `done_fn` became `self.trained`,
+        # and all three already-trained runs were reported
+        #
+        #   already finished (GLOBAL, from HF): 3 ... MY REMAINING WORK: 0
+        #
+        # The measurement stage silently did nothing, `test.parquet` was never
+        # written, and the failure surfaced two notebooks later as "no joint
+        # runs found". A caller that names a stage clearly intends that stage,
+        # so a mismatch is a mistake, not a preference.
+        # D-67 below guards the mirror case (fn=oracle planned as training).
+        # This guards the direction D-67 cannot see: a stage NAMED as
+        # measurement while `fn` is the trainer. Compare the underlying
+        # function -- `is` on bound methods is False for two separate lookups
+        # of the same attribute.
+        _same = lambda a, b: (a is not None and b is not None
+                              and getattr(a, "__func__", a) is getattr(b, "__func__", b))
+        if str(stage) in ("measure", "oracle") and not _same(fn, getattr(self, "oracle", None)):
+            raise ValueError(
+                f"run_all(stage={stage!r}) but fn="
+                f"{getattr(fn, '__name__', fn)!r}. `stage` only LABELS the plan; "
+                "`fn` decides what runs and which completion predicate is used. "
+                "As written this plans the TRAINING stage, finds every run "
+                "already trained, reports 'MY REMAINING WORK: 0' and measures "
+                "nothing. Pass fn=sess.oracle.")
         # D-54. FAIL BEFORE THE PLAN, not once per run inside it.
         #
         # `run_all` calls `fn(cfg, **kw)` -- one positional argument. The raw
@@ -13389,6 +13416,31 @@ def _selftest() -> bool:
     except Exception:
         pass
     check("D-67 canary: the correct call is NOT refused", not _f67)
+
+    # -- D-88: naming a stage without passing its fn -------------------------
+    # Study 3's NB1 called run_all(cfgs, stage='oracle') with no fn. `fn`
+    # defaulted to train, done_fn to `trained`, and three already-trained runs
+    # were filtered out as complete -- so the measurement stage ran nothing,
+    # test.parquet was never written, and it surfaced two notebooks later.
+    _c88 = False
+    try:
+        Session.run_all(_s67, [{"run_id": "x"}], stage="oracle")
+    except ValueError as _e:
+        _c88 = "only LABELS the plan" in str(_e)
+    except Exception:
+        pass
+    check("D-88: run_all(stage='oracle') without fn=sess.oracle is refused",
+          _c88, "otherwise it plans TRAINING, skips every trained run and "
+                "measures nothing while reporting success")
+
+    _f88 = False
+    try:
+        Session.run_all(_s67, [{"run_id": "x"}], fn=_orc, stage="oracle")
+    except ValueError as _e:
+        _f88 = "only LABELS the plan" in str(_e)
+    except Exception:
+        pass
+    check("D-88 canary: the correct call is NOT refused", not _f88)
 
     # -- D-64: the artifact spec must agree with the code that writes ---------
     #
