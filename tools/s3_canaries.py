@@ -233,5 +233,20 @@ check("the publisher verifies by resolve, not by the queue draining (rules 9/10)
 check("hf_upload_resilient is called with `items=`, its real parameter",
       "items=items" in _nbs["S3_NB5_Publish.ipynb"])
 
+# --- D-88: every run_all that measures must pass fn=sess.oracle ----------
+import re as _re
+for _name, _code in _nbs.items():
+    for _call in _re.findall(r"sess\.run_all\([^)]*\)", _code, _re.S):
+        if "oracle" in _call or "measure" in _call:
+            check(f"{_name}: measuring run_all passes fn=sess.oracle",
+                  "fn=sess.oracle" in _call, _call[:90])
+
+# and NB1 must OPEN the artifact rather than trust the plan (rule 5 / D-79)
+check("S3_NB1 verifies test.parquet exists after measuring",
+      "test.parquet" in _nbs["S3_NB1_JointTrain.ipynb"]
+      and "reported success but" in _nbs["S3_NB1_JointTrain.ipynb"])
+check("S3_NB2 distinguishes 'not trained' from 'trained but not measured'",
+      "TRAINED but have no" in _nbs["S3_NB2_Compare.ipynb"])
+
 print(f"\n{sum(res)}/{len(res)} Study 3 canaries pass")
 sys.exit(0 if all(res) else 1)

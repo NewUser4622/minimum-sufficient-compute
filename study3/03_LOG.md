@@ -35,14 +35,15 @@ thing the caller had no way to say.
 | | what | cost | state | artifact |
 |---|---|---|---|---|
 | **P0** | exit quality → excess extrapolation | ~15 min CPU | **DONE** — predicts excess GROWS with exit quality | `analysis/s3_exit_quality.csv` |
-| **P1** | Q1 joint exit training | ~10 GPU-h | **ready — run next** | 3 runs under `runs/p4-*-jointexit-s1` |
+| **P1** | Q1 joint exit training | ~10 GPU-h | **TRAINED** — measurement pass still needed (D-88) | 3 runs under `runs/p4-*-jointexit-s1` |
 | **P2** | Q1 verdict, paired comparison | ~10 min CPU | ready — needs P1 | `analysis/s3_q1_comparison.csv` |
 | **P3** | Q2 learned router | ~5 GPU-h | ready — gated on P2 | `analysis/s3_router_capture.csv` |
 | **P4** | Q3 pruning | ~18 GPU-h | ready — independent | `analysis/s3_pruning.csv` |
 | **P5** | publish everything, once | minutes | ready — run LAST, with a network | `Shanmuk4622/msc-cifar100` |
 
-**Next action: re-run `S3_NB1_JointTrain`.** It is now offline and the layout
-bug is fixed; it should reach epoch 1 and stay there. P0 predicts the excess will be
+**Next action: re-run the MEASUREMENT cell in `S3_NB1_JointTrain`.** Training
+is done and intact; only the oracle/measurement pass is missing (D-88), and it
+is inference-only, ~30-40 min. P0 predicts the excess will be
 **larger** than +6.86 pt under joint training, around +11 to +12 pt. If NB1
 comes back below 2.0 pt, P0's extrapolation had no power and that is worth
 recording as loudly as the result itself.
@@ -59,6 +60,72 @@ Written **before** any run. Do not edit the prediction column.
 | **H2** | a learned router captures little of the gap | < 25 % (cross-seed) | _pending_ | _pending_ |
 | **H3** | saturated-source pruning is worse | ≥ 1.0 pt at 30 % keep | _pending_ | _pending_ |
 | **H3b** | saturated source ≈ random pruning | ± 0.5 pt at 30 % keep | _pending_ | _pending_ |
+
+---
+
+## 2026-08-20 (P1 trained) · D-88 — the measurement stage silently did nothing
+
+**Joint training finished.** All three runs completed their full schedules and
+wrote checkpoints and jointly-trained exit heads:
+
+```
+p4-resnet20-cifar100-jointexit-s1      joint heads OK  scheme=uniform  epoch=236
+p4-resnet32x4-cifar100-jointexit-s1    joint heads OK  scheme=uniform  epoch=182
+p4-vgg8-cifar100-jointexit-s1          joint heads OK  scheme=uniform  epoch=219
+```
+
+**Then the measurement stage ran nothing**, and said so as if it were good news:
+
+```
+already finished (GLOBAL, from HF): 3   <- for the 'oracle' stage
+MY REMAINING WORK                 : 0
+(nothing to do -- either finished, or owned by other workers)
+```
+
+`confirm_on_disk` had the truth in it the whole time —
+`per_sample/test.parquet: missing` for all three — but it is printed as a dict
+among twenty other keys, so it read as noise. `S3_NB2` then failed with *"no
+joint runs found"*, two notebooks from the cause.
+
+### D-88 — `stage` is a label, `fn` selects the work
+
+I wrote `sess.run_all(cfgs, stage='oracle', ...)`. But `run_all` infers what to
+do from **`fn`**, not from `stage`:
+
+```python
+fn = fn or self.train                    # <- defaulted to TRAINING
+if done_fn is None:
+    if fn is getattr(self, "oracle", None):
+        done_fn, stage = self.measured, "measure"
+    else:
+        done_fn = self.trained           # <- "is it trained?"  yes, x3
+```
+
+So it planned the *training* stage, asked "is it trained?", got yes three
+times, filtered all three out, and reported success.
+
+**This is D-67 from the other side.** D-67 already guarded `fn=sess.oracle`
+planned as training, and its docstring describes this exact trap — but only in
+that one direction. Documenting a trap is not removing it (rule 7), and I fell
+into its mirror image.
+
+**Fixes:**
+
+1. **`run_all` now refuses** `stage='oracle'`/`'measure'` unless `fn` really is
+   `sess.oracle`, with a message that says the label does not select the work.
+   Selftest 459 → **461**, including a canary that the correct call is *not*
+   refused.
+2. **NB1 opens the artifact** after measuring instead of trusting the plan
+   (rule 5, D-79): it checks `per_sample/test.parquet` exists and is non-empty
+   for every run, and raises naming the file NB2 will read.
+3. **NB2 distinguishes** "never trained" from "trained but not measured" and
+   tells you which cell to re-run.
+
+**Nothing is lost.** The 3 trained runs are intact — checkpoints, exit heads,
+epoch histories, telemetry all on disk. Only the measurement pass is missing,
+and it is inference-only, ~30–40 min.
+
+**Next: re-run the measurement cell in `S3_NB1`.** It will now do the work.
 
 ---
 

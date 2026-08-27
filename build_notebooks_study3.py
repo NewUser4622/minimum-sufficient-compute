@@ -602,9 +602,29 @@ for c in cfgs:
           f"scheme={blob.get('exit_weight_scheme')}  epoch={blob.get('epoch')}")
 
 print()
-res = sess.run_all(cfgs, stage='oracle', title='Study 3 Q1 / measurement')
+# `fn=sess.oracle`, NOT `stage='oracle'`. The stage string only LABELS the
+# plan; `fn` is what selects the work and the completion predicate. Passing the
+# label alone plans the TRAINING stage, finds every run already trained, and
+# measures nothing while printing 'MY REMAINING WORK: 0' (D-88).
+res = sess.run_all(cfgs, fn=sess.oracle, title='Study 3 Q1 / measurement')
 for r in res:
     print(f"  {r.get('status','?'):9s} {r.get('run_id','?')}")
+
+# Rule 5 / D-79: a plan that says 'nothing to do' is not evidence the artifact
+# exists. Open the file the next notebook will read.
+print()
+missing = []
+for c in cfgs:
+    ps = M.run_layout(sess.work, c['run_id'])['per_sample'] / 'test.parquet'
+    if ps.exists() and ps.stat().st_size > 0:
+        print(f"  {c['run_id']:38s} test.parquet {ps.stat().st_size/2**20:.1f} MB")
+    else:
+        missing.append(c['run_id'])
+if missing:
+    raise RuntimeError(
+        f'measurement reported success but per_sample/test.parquet is missing '
+        f'for {missing}. S3_NB2 reads exactly this file, so it would fail with '
+        '"no joint runs found" two steps from the real cause.')
 """),
         md("""
 ---
@@ -685,7 +705,19 @@ M.save_analysis(sess.data_dir, 's3_frozen_vs_joint', df)
 
 joint_archs = sorted(df[df['arm'] == 'joint']['arch'].unique())
 if not joint_archs:
-    raise RuntimeError('no joint runs found -- run S3_NB1 first.')
+    # Distinguish 'never trained' from 'trained but not measured'. The second
+    # is what actually happened (D-88), and the two need different actions.
+    trained = sorted(d.name for d in runs_dir.iterdir()
+                     if d.is_dir() and 'jointexit' in d.name
+                     and (d / 'summary.json').exists())
+    if trained:
+        raise RuntimeError(
+            f'{len(trained)} joint run(s) are TRAINED but have no '
+            f'per_sample/test.parquet: {trained}. Training finished; the '
+            'MEASUREMENT stage did not run. Re-run the measurement cell in '
+            'S3_NB1 -- it is inference only, ~30-40 min, and the checkpoints '
+            'are already on disk.')
+    raise RuntimeError('no joint runs at all -- run S3_NB1 first.')
 print(f'{len(df)} run(s); joint architectures: {joint_archs}')
 """),
         md("""
