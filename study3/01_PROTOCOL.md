@@ -97,6 +97,13 @@ interesting way** — that would be a method, not a bound.
 **This is the experiment most likely to produce something publishable in its own
 right**, because all three outcomes say something and two of them are positive.
 
+> **RESULT 2026-08-20: H2 SUPPORTED, cross-seed capture 1.7 %.** In-seed
+> (3.8 / 2.4 / −0.4 %) is barely distinguishable from cross-seed
+> (1.7 / 4.6 / −0.2 %), so the gate is not even memorising seed noise —
+> there is nothing in exit-local confidence to capture. Features were
+> exit-local confidence rather than embeddings (checkpoints were not
+> downloaded), so this is a **lower bound**.
+
 ---
 
 ## Q3 — Does the memorisation collapse damage downstream pruning?
@@ -105,6 +112,19 @@ right**, because all three outcomes say something and two of them are positive.
 network has fit; predicted by saturation (+0.832), not by test accuracy
 (−0.114). Dataset pruning computes these scores on training data, from one seed,
 for exactly the high-capacity models where the collapse is worst.
+
+> **AMENDED 2026-08-20 — the pool is 5,000 samples, not 50,000.** `ce_loss` is
+> written only to `train_holdout.parquet` (5,000 samples).
+> `train_dynamics.parquet` covers more but carries only `el2n` and
+> `forget_events` — the *stable* scores, which cannot test this hypothesis.
+> Q3 is therefore a controlled comparison **within a fixed 5,000-sample pool**:
+> three selection rules, one target, two seeds. It tests H3, but it is a
+> narrower claim than "pruning CIFAR-100", and at 30 % retention the target
+> trains on ~1,500 images so absolute accuracies are low by design — the
+> comparison **between arms** is the test, not the level. Scaling to 50,000
+> needs `ce_loss` recomputed over all of train, which needs the source
+> checkpoints (excluded from the fetch): a separate ~2 GPU-h job. Revised cost:
+> **~6 GPU-h**, not 18.
 
 **Design.** Score CIFAR-100's training set with a single seed of:
 

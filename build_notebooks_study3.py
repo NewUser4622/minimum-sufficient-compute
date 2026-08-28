@@ -1182,6 +1182,22 @@ retention, and the gap widens as retention falls.
 **H3b:** the saturated source is indistinguishable from **random** pruning
 (±0.5 pt) at 30 %. If true, that is the headline.
 
+## Scope: this prunes a 5,000-sample pool, not the full training set
+
+**Checked, not assumed.** `ce_loss` -- the score whose reliability collapses --
+is written only to `train_holdout.parquet`, which is a **5,000-sample** slice of
+train. `train_dynamics.parquet` covers more samples but carries only `el2n` and
+`forget_events`, which are the *stable* scores and therefore cannot test this
+hypothesis.
+
+So the experiment is: **one fixed 5,000-sample pool, three selection rules, same
+target, same seeds.** That is a real controlled comparison and it does test H3 --
+but it is a smaller claim than "pruning CIFAR-100", and the notebook says so.
+
+Scaling to the full 50,000 would need `ce_loss` recomputed over all of train,
+which needs the source models' checkpoints. Those were deliberately excluded
+from the HuggingFace fetch, so it is a separate ~2 GPU-h job, not a free one.
+
 ## The cheap gate runs first
 
 If the two sources keep nearly the same samples, no downstream difference is
@@ -1221,6 +1237,10 @@ s_sat = train_score(SATURATED)
 s_uns = train_score(UNSATURATED)
 common = s_sat.index.intersection(s_uns.index)
 print(f'{{len(common):,}} samples scored by both sources')
+print(f'  -> subsets are drawn from this pool, NOT from the full 50,000 train')
+print(f'  -> at 30% retention the target trains on ~{{int(len(common)*0.3):,}} '
+      f'images, so absolute accuracies will be low by design')
+print('  -> the comparison BETWEEN arms is what H3 tests, not the absolute level')
 
 print()
 print('kept-set overlap (keeping the HARDEST samples):')
@@ -1301,17 +1321,30 @@ for c in cfgs:
     print(f"  {c['run_id']:44s} subset={Path(c.get('subset_path', '-')).name}")
 print(f'\\n{len(cfgs)} run(s)')
 
-# The library must actually honour subset_path. If it silently ignores an
-# unknown config key, every arm trains on the full dataset and the experiment
+# The library must actually honour subset_path -- if an unknown config key is
+# silently ignored, every arm trains on the full dataset and the experiment
 # returns a perfect null that looks like a result.
-import inspect
-_src = inspect.getsource(M.build_loaders)
-if 'subset_path' not in _src:
+#
+# The first version of this grepped `build_loaders` for the string
+# 'subset_path' and raised. But the handling lives in `_subset_train`, which
+# build_loaders CALLS, so the check failed on working code. Grepping for a
+# feature is not testing it: EXERCISE the behaviour instead.
+class _ProbeDS:
+    def __init__(self, n): self._n = n; self.index_space = n; self.classes = ['a']
+    def __len__(self): return self._n
+
+_probe = M._subset_train(_ProbeDS(50000),
+                         {'subset_path': specs[0]['path']})
+_want = specs[0]['n']
+if len(_probe) != _want:
     raise RuntimeError(
-        'build_loaders does not read subset_path. Every arm would train on the '
-        'FULL dataset and produce identical results -- a null that looks like a '
-        'finding. Implement subset support before spending 18 GPU-hours.')
-print('build_loaders honours subset_path')
+        f'_subset_train returned {len(_probe)} items for a keep-list of '
+        f'{_want}. Every arm would train on the wrong data.')
+if getattr(_probe, 'index_space', None) != 50000:
+    raise RuntimeError('index_space was renumbered; global sample_idx (D-49) '
+                       'would no longer be valid.')
+print(f'subset_path honoured: keep-list of {_want} -> {len(_probe)} samples, '
+      f'index_space preserved')
 """),
         code("""
 ok = all(M.backbone_dry_run(c) for c in cfgs[:2])

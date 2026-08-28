@@ -37,12 +37,11 @@ thing the caller had no way to say.
 | **P0** | exit quality → excess extrapolation | ~15 min CPU | **DONE** — predicts excess GROWS with exit quality | `analysis/s3_exit_quality.csv` |
 | **P1** | Q1 joint exit training | ~10 GPU-h | **DONE** | 3 runs under `runs/p4-*-jointexit-s1` |
 | **P2** | Q1 verdict, paired comparison | ~10 min CPU | **DONE — H1 SUPPORTED** | `analysis/s3_q1_comparison.csv` |
-| **P3** | Q2 learned router | **minutes, CPU** | **ready — run next** | `analysis/s3_router_capture.csv` |
-| **P4** | Q3 pruning | ~18 GPU-h | ready — independent | `analysis/s3_pruning.csv` |
+| **P3** | Q2 learned router | minutes, CPU | **DONE — H2 SUPPORTED** | `analysis/s3_router_capture.csv` |
+| **P4** | Q3 pruning | ~6 GPU-h (5k pool) | **ready — run next** | `analysis/s3_pruning.csv` |
 | **P5** | publish everything, once | minutes | ready — run LAST, with a network | `Shanmuk4622/msc-cifar100` |
 
-**Next action: run `S3_NB3_Router` (Q2).** Q1 is settled and Study 2's
-archival blocker is cleared.
+**Next action: run `S3_NB4_Pruning` (Q3).** Q1 and Q2 are both settled.
 
 ---
 
@@ -53,9 +52,82 @@ Written **before** any run. Do not edit the prediction column.
 | | prediction | threshold | measured | verdict |
 |---|---|---|---|---|
 | **H1** | oracle excess survives joint exit training | ≥ 2.0 pt, 3 of 3 archs | **8.55 / 9.15 / 10.64 pt** | **SUPPORTED** (3 of 3) |
-| **H2** | a learned router captures little of the gap | < 25 % (cross-seed) | _pending_ | _pending_ |
+| **H2** | a learned router captures little of the gap | < 25 % (cross-seed) | **1.7 %** | **SUPPORTED** |
 | **H3** | saturated-source pruning is worse | ≥ 1.0 pt at 30 % keep | _pending_ | _pending_ |
 | **H3b** | saturated source ≈ random pruning | ± 0.5 pt at 30 % keep | _pending_ | _pending_ |
+
+---
+
+## 2026-08-20 (Q2 SETTLED) · H2 SUPPORTED — a deployable gate captures ~nothing
+
+`analysis/s3_router_capture.csv`, ρ = 0.80, exit-local confidence features:
+
+| arch | baseline | router | oracle | gap | **capture (cross-seed)** |
+|---|---|---|---|---|---|
+| `resnet20` | 60.58 | 60.85 | 76.22 | 15.64 | **1.7 %** |
+| `resnet32x4` | 66.68 | 67.21 | 78.30 | 11.62 | **4.6 %** |
+| `vgg8` | 70.07 | 70.05 | 79.25 | 9.18 | **−0.2 %** |
+
+**H2 threshold was < 25 %. Measured median: 1.7 % — SUPPORTED.** A learned
+per-exit gate, given everything the baseline sees plus the margin, recovers
+essentially none of the 9–16 point oracle gap.
+
+**And it is not overfitting.** In-seed capture (3.8 / 2.4 / −0.4 %) is barely
+distinguishable from cross-seed (1.7 / 4.6 / −0.2 %). If the gate were
+memorising seed noise, in-seed would be high and cross-seed near zero. Both are
+near zero, which says something stronger: **there is nothing in exit-local
+confidence to capture.** The gap is not merely non-transferable — it is not
+expressible in the signal a deployed gate can read.
+
+This tightens Study 2 rather than contradicting it. Study 2 showed a second
+*seed* cannot reach the gap; Q2 shows a *learned gate on the deployable signal*
+cannot either.
+
+**Stated limitation, printed by the notebook itself:** these are exit-local
+confidence features, so this is a **lower bound**. A gate with access to pooled
+embeddings might do better; measuring that needs checkpoints that were
+deliberately not downloaded.
+
+---
+
+## 2026-08-20 (Q3 blocked, twice) · a guard that grepped instead of testing
+
+```
+RuntimeError: build_loaders does not read subset_path.
+```
+
+**The guard was wrong, not the library.** `subset_path` handling lives in
+`_subset_train`, which `build_loaders` *calls*. I grepped `build_loaders`'s
+source for the string and raised when it was absent — so a correct
+implementation was rejected.
+
+**Grepping for a feature is not testing it.** The guard now *exercises* the
+behaviour: it passes a real keep-list through `_subset_train`, checks the subset
+length matches, and checks `index_space` was preserved so global `sample_idx`
+stays valid (D-49). Verified against the real library: keep-list of 1500 → 1500
+samples, `index_space` 50000.
+
+### And a scope correction that matters more
+
+`ce_loss` — the score whose reliability collapses — is written **only to
+`train_holdout.parquet`, 5,000 samples**. `train_dynamics.parquet` covers more
+but carries only `el2n` and `forget_events`, which are the *stable* scores and
+so cannot test this hypothesis.
+
+So Q3 is: **one fixed 5,000-sample pool, three selection rules, one target, two
+seeds.** A real controlled comparison, and it does test H3 — but it is a
+narrower claim than "pruning CIFAR-100", and the notebook now says so in its
+markdown and in its output. At 30 % retention the target trains on ~1,500
+images, so absolute accuracies will be low by design; **the comparison between
+arms is what H3 tests, not the level.**
+
+Scaling to the full 50,000 needs `ce_loss` recomputed across all of train, which
+needs the source checkpoints — excluded from the fetch, so a separate ~2 GPU-h
+job. Cost estimate for Q3 revised from ~18 GPU-h to **~6**.
+
+**The kept-set gate passed:** 51.6 % overlap at 50 % retention, 33.5 % at 30 %.
+The two sources genuinely disagree about which samples are hard, so a downstream
+difference is possible.
 
 ---
 
