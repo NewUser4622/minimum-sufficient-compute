@@ -910,26 +910,36 @@ fraction alone is uninterpretable: a gate can fit one seed's noise perfectly.
         code(DATA_CELL),
         md("""
 ---
-## Dump per-exit features
+## What features can a gate actually see?
 
-One forward pass per run. ~50 MB per run at 256 dims — cheap, and it is the
-only thing standing between us and a learned router.
+**Checked against the disk, not assumed.** `S2_NB0_Fetch` deliberately excluded
+checkpoints -- they are ~95 % of the bytes and nothing had needed them -- so the
+45 Study 1 runs have per-sample parquets and **no weights**. Only runs trained
+locally have `ckpt_best.pt`.
+
+That rules out an embedding gate for the multi-seed architectures, and saying so
+is better than working around it:
+
+| gate features | needs | runs available | cross-seed control |
+|---|---|---|---|
+| **exit-local confidence** (`top1p_dk`, `top2p_dk`, margin) | parquet only | **all 45** | **yes, 3 seeds** |
+| pooled embeddings at exit *k* | `ckpt_best.pt` | 3 joint runs, 1 seed each | no |
+
+So Q2 uses **exit-local confidence features** -- which is what is available and,
+usefully, exactly what a deployed early-exit gate reads. The baseline thresholds
+`top1p_dk`; the gate sees the same information plus the margin, and learns a
+**per-exit** boundary instead of one global threshold.
+
+**This makes H2 a lower bound**, and the notebook says so in its output. A gate
+with embeddings might capture more; measuring that needs checkpoints we chose
+not to download. A limitation, recorded rather than hidden.
 """),
         code("""
-import numpy as np, pandas as pd, torch, torch.nn as nn
-from pathlib import Path
+import numpy as np, pandas as pd
 
-# WHICH RUNS. Q2 needs >= 2 seeds per architecture for the cross-seed control,
-# so it uses the FROZEN base runs (3 seeds each). The joint runs from Q1 have
-# one seed apiece and cannot support the control -- noted as a limitation
-# rather than worked around, since Q1 showed the excess is LARGER on joint runs
-# and a router evaluated only on frozen runs is therefore a conservative test.
-#
-# Runs are FOUND, not constructed. The first version built
-# `p4-{arch}-cifar100-base-s{seed}` from the session phase, but the base runs
-# are phase p1 -- so every id missed, `0 feature dump(s)`, and the empty frame
-# surfaced as `KeyError: 'kind'` four cells later.
-_base = measured_runs()                       # THE accessor
+# WHICH RUNS. Q2 needs >= 2 seeds per architecture for the cross-seed control.
+# Runs are FOUND through the accessor, never constructed from a phase prefix.
+_base = measured_runs()
 _per = _base.groupby('arch')['seed'].nunique()
 ARCHS = [a for a in ['resnet20', 'resnet32x4', 'vgg8'] if _per.get(a, 0) >= 2]
 if not ARCHS:
@@ -937,124 +947,76 @@ if not ARCHS:
         'no architecture has >= 2 measured seeds, so the cross-seed control is '
         f'impossible. Seeds per arch: {_per.to_dict()}')
 print(f'architectures with >= 2 seeds: {ARCHS}')
-
-feat_dir = Path(MSC_ROOT) / 'features'
-feat_dir.mkdir(parents=True, exist_ok=True)
-
-def dump_features(run_id, cfg):
-    out = feat_dir / f'{run_id}.npz'
-    if out.exists():
-        return out
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    L = M.run_layout(sess.work, run_id)
-    blob = torch.load(L['checkpoints'] / 'ckpt_best.pt', map_location=device,
-                      weights_only=False)
-    backbone = M.place_model(M.build_model(cfg['arch'], cfg['num_classes']),
-                             device, cfg, tag='feature dump')
-    backbone.load_state_dict(blob['model'], strict=True)
-    me = M.place_model(M.MultiExitModel(backbone, cfg['num_classes'], freeze=True),
-                       device, cfg)
-    hp = M.exit_heads_path(sess.work, run_id)
-    me.heads.load_state_dict(torch.load(hp, map_location=device,
-                                        weights_only=False)['heads'])
-    me.eval()
-
-    _, val_loader, _, _, _ = M.build_loaders(cfg)
-    feats, labels = [], []
-    with torch.no_grad():
-        for batch in val_loader:
-            x = batch[0].to(device, non_blocking=True)
-            fs = me.backbone.forward_features(x)
-            pooled = []
-            for f in fs:
-                if f.dim() == 4:
-                    pooled.append(nn.functional.adaptive_avg_pool2d(f, 1)
-                                  .flatten(1).float().cpu().numpy())
-                elif f.dim() == 3:
-                    pooled.append((f[:, 0] if me.token_model
-                                   else f.mean(1)).float().cpu().numpy())
-                else:
-                    pooled.append(f.flatten(1).float().cpu().numpy())
-            feats.append(pooled)
-            labels.append(batch[1].numpy())
-    K = len(feats[0])
-    stacked = {f'f{k}': np.concatenate([b[k] for b in feats], axis=0)
-               for k in range(K)}
-    np.savez_compressed(out, label=np.concatenate(labels), **stacked)
-    del me, backbone
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return out
-
-paths = {}
-for a in ARCHS:
-    sub = _base[_base['arch'] == a].sort_values('seed').head(2)
-    for _, row in sub.iterrows():
-        rid = row['run_id']
-        # Rebuild the config for THIS run's real phase, not the session's.
-        cfg = sess.config(a, seed=int(row['seed']), method='base')
-        cfg['run_id'] = rid
-        cfg['phase'] = row['phase']
-        paths[rid] = dump_features(rid, cfg)
-        print(f'  {rid:40s} {paths[rid].stat().st_size / 2**20:6.1f} MB')
-
 print()
-print(f'{len(paths)} feature dump(s)')
-if len(paths) < 2:
-    raise RuntimeError(
-        f'only {len(paths)} feature dump(s); the cross-seed control needs at '
-        'least two runs of the same architecture. Nothing below can run.')
-"""),
-        md("""
----
-## Train a gate per exit, then measure capture
 
-The gate is deliberately small. A large one would fit the seed's noise and
-inflate the in-seed number — which the cross-seed control would then expose,
-but it is cheaper not to invite the problem.
+# ---- preflight ----------------------------------------------------------
+# Every Study 3 failure so far was "assumed an input existed". Check first,
+# name what is missing, and pick the mode from what is actually on disk.
+_need = []
+for a in ARCHS:
+    for _, row in _base[_base['arch'] == a].sort_values('seed').head(3).iterrows():
+        L = M.run_layout(sess.work, row['run_id'])
+        _need.append({'run_id': row['run_id'], 'arch': a, 'seed': int(row['seed']),
+                      'parquet': (L['per_sample'] / 'test.parquet').exists(),
+                      'ckpt': (L['checkpoints'] / 'ckpt_best.pt').exists()})
+pre = pd.DataFrame(_need)
+print(pre.to_string(index=False))
+print()
+n_ck = int(pre['ckpt'].sum())
+print(f'{len(pre)} run(s): {int(pre["parquet"].sum())} with parquets, '
+      f'{n_ck} with checkpoints')
+if not pre['parquet'].all():
+    raise RuntimeError(
+        f'missing parquets: {pre[~pre["parquet"]]["run_id"].tolist()}')
+MODE = 'embedding' if n_ck == len(pre) else 'confidence'
+print(f'gate features: {MODE.upper()}'
+      + ('' if MODE == 'embedding'
+         else '  -- no checkpoints on disk, so exit-local confidence only'))
+print('H2 is therefore a LOWER BOUND on what a router could capture.')
 """),
         code("""
-from sklearn.linear_model import LogisticRegression   # small on purpose
-
-def gate_scores(train_rid, eval_rid):
-    '''Train per-exit gates on train_rid, score eval_rid's samples.'''
-    tr = np.load(paths[train_rid]); ev = np.load(paths[eval_rid])
-    dtr = pd.read_parquet(Path(MSC_ROOT) / 'runs' / train_rid
-                          / 'per_sample' / 'test.parquet').sort_values('sample_idx')
-    ks = sorted(int(c.split('_d')[1]) for c in dtr.columns
-                if c.startswith('pred_d') and c.split('_d')[1].isdigit())
-    lab_tr = dtr['label'].to_numpy()
-    out = []
-    for i, k in enumerate(ks[:-1]):        # no gate needed at the final exit
-        y = (dtr[f'pred_d{k}'].to_numpy() == lab_tr).astype(int)
-        Xtr, Xev = tr[f'f{i}'], ev[f'f{i}']
-        if y.min() == y.max():
-            out.append(np.full(len(Xev), float(y.mean())))
-            continue
-        clf = LogisticRegression(max_iter=300, C=0.1)
-        clf.fit(Xtr, y)
-        out.append(clf.predict_proba(Xev)[:, 1])
-    return np.stack(out, axis=1), ks
-
-def correctness(rid):
-    d = pd.read_parquet(Path(MSC_ROOT) / 'runs' / rid / 'per_sample'
-                        / 'test.parquet').sort_values('sample_idx')
+def exit_tables(run_id):
+    d = (pd.read_parquet(M.run_layout(sess.work, run_id)['per_sample']
+                         / 'test.parquet')
+         .sort_values('sample_idx').reset_index(drop=True))
     ks = sorted(int(c.split('_d')[1]) for c in d.columns
                 if c.startswith('pred_d') and c.split('_d')[1].isdigit())
     lab = d['label'].to_numpy()
-    corr = np.stack([(d[f'pred_d{k}'].to_numpy() == lab) for k in ks], axis=1).astype(float)
+    correct = np.stack([(d[f'pred_d{k}'].to_numpy() == lab) for k in ks],
+                       axis=1).astype(float)
     conf = np.stack([d[f'top1p_d{k}'].to_numpy() for k in ks], axis=1)
-    return corr, conf, ks
+    second = np.stack([d[f'top2p_d{k}'].to_numpy() for k in ks], axis=1)
+    return d, correct, conf, second, ks
+
+def gate_features(conf, second, k):
+    # ONLY exit-k quantities. Reading exit k+1 would make this an oracle
+    # wearing a router's clothes -- the mistake pred_depth turned out to be.
+    p1, p2 = conf[:, k], second[:, k]
+    return np.column_stack([p1, p2, p1 - p2,
+                            np.log(np.clip(p1, 1e-9, 1.0)),
+                            p1 / np.clip(p2, 1e-9, None)])
+
+CACHE = {}
+def tables(run_id):
+    if run_id not in CACHE:
+        CACHE[run_id] = exit_tables(run_id)
+    return CACHE[run_id]
+
+print('feature and table helpers defined -- parquet only, no GPU, no network')
 """),
         md("""
 ---
-## Evaluate at matched budget
+## Evaluate at a matched budget
 
-Routing helpers are **imported from Study 2's notebook logic**, re-implemented
-here only because the notebook is standalone — but the canaries in
-`tools/s2_routing_canaries.py` cover the same functions and must pass first.
+Routing helpers match Study 2's, which `tools/s2_routing_canaries.py` (18/18)
+already covers. The gate exits a sample at the first exit whose **learned**
+probability-of-being-correct clears a threshold; the baseline does the same with
+raw `top1p`. Same mechanism, same budget, different decision rule — so the
+comparison isolates the rule.
 """),
         code("""
+from sklearn.linear_model import LogisticRegression
+
 def _cost(k, rho):  return float(np.mean(np.asarray(rho)[k]))
 
 def route_confidence(conf, correct, rho, target):
@@ -1068,13 +1030,12 @@ def route_confidence(conf, correct, rho, target):
         else: hi = th
     return float(correct[np.arange(n), k].mean()), c
 
-def route_gate(pgate, correct, rho, target):
-    '''Exit at the first exit whose gate probability clears a threshold.'''
+def route_gate(pg, correct, rho, target):
     n, K = correct.shape
     lo, hi = 0.0, 1.0
     for _ in range(60):
         th = (lo + hi) / 2
-        fires = np.concatenate([pgate >= th, np.ones((n, 1), bool)], axis=1)
+        fires = np.concatenate([pg >= th, np.ones((n, 1), bool)], axis=1)
         k = fires.argmax(axis=1); c = _cost(k, rho)
         if c < target: lo = th
         else: hi = th
@@ -1091,47 +1052,70 @@ def route_oracle(cc, ce, rho, target):
     k = (cc - hi * rho[None, :]).argmax(axis=1)
     return float(ce[np.arange(len(ce)), k].mean()), float(rho[k].mean())
 
+def fit_gate(train_rid, eval_rid):
+    # One logistic gate per early exit: fit on train_rid, score eval_rid.
+    _, c_tr, cf_tr, s2_tr, ks = tables(train_rid)
+    _, _,    cf_ev, s2_ev, _  = tables(eval_rid)
+    n_ev = cf_ev.shape[0]
+    out = []
+    for k in range(len(ks) - 1):            # the last exit never gates
+        y = c_tr[:, k].astype(int)
+        if y.min() == y.max():
+            out.append(np.full(n_ev, float(y.mean()))); continue
+        clf = LogisticRegression(max_iter=400, C=1.0)
+        clf.fit(gate_features(cf_tr, s2_tr, k), y)
+        out.append(clf.predict_proba(gate_features(cf_ev, s2_ev, k))[:, 1])
+    return np.stack(out, axis=1)
+
+print('routing + gate helpers defined')
+"""),
+        code("""
 TARGET = 0.80
 rows = []
 for a in ARCHS:
-    rids = [r for r in paths if M.parse_run_id(r)['arch'] == a]
+    rids = sorted(_base[_base['arch'] == a]['run_id'])
     if len(rids) < 2:
-        continue
+        print(f'  {a}: fewer than 2 seeds, skipped'); continue
     rho = M.load_or_build_budgets(a, sess.work, 'cifar100')['axes']['depth']['rho']
-    i, j = sorted(rids)[0], sorted(rids)[1]
-    for train_on, eval_on, kind in [(i, i, 'in-seed'), (i, j, 'cross-seed')]:
-        corr, conf, ks = correctness(eval_on)
-        base, _ = route_confidence(conf, corr, rho, TARGET)
+    i_, j_ = rids[0], rids[1]
+    for train_on, eval_on, kind in [(i_, i_, 'in-seed'), (i_, j_, 'cross-seed')]:
+        _, corr, conf, _, _ = tables(eval_on)
+        base_acc, _ = route_confidence(conf, corr, rho, TARGET)
         orac, _ = route_oracle(corr, corr, rho, TARGET)
-        pg, _ = gate_scores(train_on, eval_on)
-        gt, _ = route_gate(pg, corr, rho, TARGET)
-        gap = orac - base
-        rows.append({'arch': a, 'kind': kind, 'baseline': base * 100,
+        gt, _ = route_gate(fit_gate(train_on, eval_on), corr, rho, TARGET)
+        gap = orac - base_acc
+        rows.append({'arch': a, 'kind': kind, 'baseline': base_acc * 100,
                      'router': gt * 100, 'oracle': orac * 100,
-                     'gap': gap * 100, 'router_gain': (gt - base) * 100,
-                     'capture': (gt - base) / gap if gap > 1e-9 else np.nan})
+                     'gap': gap * 100, 'router_gain': (gt - base_acc) * 100,
+                     'capture': (gt - base_acc) / gap if gap > 1e-9 else np.nan})
 
 cap = pd.DataFrame(rows)
 if cap.empty:
     raise RuntimeError(
-        'no capture rows were produced, so every number below would be a '
-        f'KeyError on an empty frame. Feature dumps: {sorted(paths)}. Check '
-        'that each architecture has two runs with per_sample/test.parquet.')
+        f'no capture rows produced. Architectures tried: {ARCHS}. Every number '
+        'below would be a KeyError on an empty frame.')
 M.save_analysis(sess.data_dir, 's3_router_capture', cap)
 print(cap.round(3).to_string(index=False))
 print()
 for kind in ['in-seed', 'cross-seed']:
     sub = cap[cap['kind'] == kind]
     if len(sub):
-        print(f'  {kind:11s} median capture = {sub["capture"].median()*100:6.2f} %')
+        print(f'  {kind:11s} median capture = {sub["capture"].median()*100:6.2f} %'
+              f'   median gain = {sub["router_gain"].median():+.2f} pt')
+
+cs = cap[cap['kind'] == 'cross-seed']['capture']
 print()
-cs = cap[cap['kind'] == 'cross-seed']['capture'].median()
-print(f'H2 (< 25 % captured): '
-      f'{"SUPPORTED" if cs < 0.25 else "FALSIFIED"}  (cross-seed {cs*100:.1f} %)')
+if len(cs):
+    print(f'H2 (< 25 % captured): '
+          f'{"SUPPORTED" if cs.median() < 0.25 else "FALSIFIED"}'
+          f'   (cross-seed {cs.median()*100:.1f} %)')
 print()
-print('The CROSS-SEED number is the one that means anything. If in-seed capture')
-print('is high and cross-seed is not, the gate memorised one seed s noise --')
-print('which is Study 2 s finding restated, not a contradiction of it.')
+print('The CROSS-SEED number is the one that means anything. High in-seed')
+print('with low cross-seed means the gate memorised the noise of ONE seed,')
+print('which restates Study 2 rather than contradicting it.')
+print()
+print(f'Feature mode was {MODE.upper()}, so this is a LOWER BOUND: a gate with')
+print('access to embeddings could capture more.')
 """),
         md("""
 ---

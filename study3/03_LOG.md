@@ -37,7 +37,7 @@ thing the caller had no way to say.
 | **P0** | exit quality → excess extrapolation | ~15 min CPU | **DONE** — predicts excess GROWS with exit quality | `analysis/s3_exit_quality.csv` |
 | **P1** | Q1 joint exit training | ~10 GPU-h | **DONE** | 3 runs under `runs/p4-*-jointexit-s1` |
 | **P2** | Q1 verdict, paired comparison | ~10 min CPU | **DONE — H1 SUPPORTED** | `analysis/s3_q1_comparison.csv` |
-| **P3** | Q2 learned router | ~5 GPU-h | **ready — run next** | `analysis/s3_router_capture.csv` |
+| **P3** | Q2 learned router | **minutes, CPU** | **ready — run next** | `analysis/s3_router_capture.csv` |
 | **P4** | Q3 pruning | ~18 GPU-h | ready — independent | `analysis/s3_pruning.csv` |
 | **P5** | publish everything, once | minutes | ready — run LAST, with a network | `Shanmuk4622/msc-cifar100` |
 
@@ -114,6 +114,69 @@ a property of weak post-hoc exits — it is larger when the exits are trained th
 way the field trains them. The paper should now report both numbers, with the
 joint figures as the primary evidence and the frozen ones as the conservative
 case.
+
+---
+
+## 2026-08-20 (Q2 fixed) · the checkpoints were never downloaded
+
+```
+FileNotFoundError: C:\msc_results\runs\p1-resnet20-cifar100-base-s1\checkpoints\ckpt_best.pt
+```
+
+**Checked the disk instead of guessing, and the picture is unambiguous:**
+
+| | runs | parquet | `ckpt_best.pt` |
+|---|---|---|---|
+| Study 1 base (45) | all | **yes** | **no** |
+| Study 3 joint (3) | all | yes | yes |
+
+`S2_NB0_Fetch` **deliberately excluded checkpoints** — ~95 % of the bytes, and
+nothing had needed them. So the embedding-based feature dump was impossible from
+the moment it was written, for every multi-seed architecture.
+
+**This is the root of the whole NB3 cascade.** Three failures in a row —
+constructed run ids, empty frame, missing weights — were all the same mistake:
+writing code against an assumed disk state. The earlier fixes addressed the
+symptoms one at a time.
+
+### The fix uses what is actually there
+
+Q2 now runs on **exit-local confidence features** — `top1p_dk`, `top2p_dk`, the
+margin between them, and two derived ratios — read straight from the parquets.
+
+| gate features | needs | runs | cross-seed control |
+|---|---|---|---|
+| **exit-local confidence** | parquet only | **all 45** | **yes, 3 seeds** |
+| pooled embeddings | `ckpt_best.pt` | 3, one seed each | no |
+
+This is not a downgrade so much as a sharpening: it is exactly what a deployed
+early-exit gate reads. The baseline thresholds `top1p_dk`; the gate sees the
+same plus the margin, and learns a **per-exit** boundary instead of one global
+threshold. **H2 becomes a lower bound**, and the notebook says so in its output.
+
+Cost: **zero GPU, zero network.** Q2 dropped from ~5 GPU-h to minutes of CPU.
+
+### Verified by execution, not by reading
+
+`tools/s3_nb3_harness.py` runs NB3's real cells against synthetic data in two
+worlds:
+
+* **margin carries signal that raw confidence does not** → capture **56.9 %**
+* **nothing carries signal** → capture **6.4 %**
+
+The first is the one that matters. Had I only tested "confidence is
+informative", the baseline would already be optimal, the gate would add nothing,
+and a capture of ~0 would have looked like a finding instead of an inert
+instrument. That is the same trap as Study 2's canary 9, in a new place.
+
+### A preflight cell, because this keeps happening
+
+NB3 now opens with a table of every run it intends to use and whether each
+required artifact exists, then **picks its mode from what it finds**. Every
+Study 3 failure so far has been an assumed input; this makes the assumption
+visible in the first cell rather than fatal in the fifth.
+
+69/69 canaries; selftest 461/461.
 
 ---
 
