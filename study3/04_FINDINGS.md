@@ -196,10 +196,9 @@ Each Study 3 run carries `config.yaml`, `config_hash.txt`, `summary.json`,
 `STATUS.json`, `exit_heads.pt`, and `checkpoints/ env/ metrics/ per_sample/
 telemetry/`.
 
-> **Outstanding:** the `analysis/s3_*.csv` files are **not yet on HuggingFace** —
-> that folder still holds only Study 1's 8 files. All six exist locally under
-> `C:\msc_results\analysis\`. Re-running `S3_NB5_Publish`'s upload cell should
-> complete it; it uploads folder-at-a-time and skips what already landed.
+**`analysis/` is complete on HuggingFace too** — 51 files, including all seven
+`s2_*` and all five `s3_*` CSVs, verified **byte-identical** to the local copies
+(12/12). Consolidated in [`../RESULTS.md`](../RESULTS.md).
 
 ---
 

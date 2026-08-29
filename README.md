@@ -59,6 +59,19 @@ a confounded design, recorded rather than re-cut. See
 
 ---
 
+## The results, and what to do with them
+
+| | |
+|---|---|
+| [`RESULTS.md`](RESULTS.md) / [`RESULTS.csv`](RESULTS.csv) | **every headline number**, generated from the artifacts by `tools/build_results.py` — never hand-edited |
+| [`PAPER_CLAIM.md`](PAPER_CLAIM.md) | **what is publishable, where, and what is missing** — two papers, with a costed gap analysis |
+
+All source CSVs are on
+[`Shanmuk4622/msc-cifar100`](https://huggingface.co/datasets/Shanmuk4622/msc-cifar100)
+under `analysis/`, verified byte-identical to the local copies (12/12).
+
+---
+
 ## Start here
 
 **If you want the science**, read [`study2/PAPER.md`](study2/PAPER.md) — the
