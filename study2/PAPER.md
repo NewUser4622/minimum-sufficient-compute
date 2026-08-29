@@ -5,7 +5,8 @@ three architectures with jointly supervised exits and the excess came out
 *larger*, not smaller (8.55 / 9.15 / 10.64 pt vs 6.42 / 7.95 / 6.69 frozen),
 surviving conditioning on accuracy. §5's first bullet carries the numbers.
 
-**All measurements complete.** Every number is traceable to a CSV
+**Study 3 Q2 also narrows one overstatement** — see §1. **All measurements
+complete.** Every number is traceable to a CSV
 in `analysis/`. The saturation mechanism (§4.3) was a hypothesis in the first
 draft and is now tested and confirmed. §3.1 carries a correction: the first
 draft attributed the whole optimism bias to noise harvesting, which the data
@@ -69,6 +70,16 @@ Every quantity in it comes from one trained network. Our claim is not that this
 is arithmetically wrong; it is that **it is an upper bound on the wrong thing**.
 It bounds what a router could achieve *if it had access to this network's own
 per-exit correctness*, and no deployable router does.
+
+> **Study 3 Q2 tested that last clause rather than asserting it.** A logistic
+> gate trained per exit, seeing everything the confidence baseline sees plus the
+> margin, captures **1.7 %** of the gap (cross-seed, 3 architectures). In-seed
+> capture is no higher, so the gate is not memorising seed noise — there is
+> nothing in the deployable signal to capture. This paper's original wording
+> ("cannot be reached by any router") overstated what had been shown; the
+> measured version is that a second seed cannot reach it, and neither can a
+> learned gate on exit-local confidence. That is a lower bound: a gate with
+> pooled embeddings is untested.
 
 The instrument is a second training seed. Same architecture, same recipe,
 different initialisation:

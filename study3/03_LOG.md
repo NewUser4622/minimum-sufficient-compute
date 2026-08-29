@@ -59,6 +59,58 @@ Written **before** any run. Do not edit the prediction column.
 
 ---
 
+## 2026-08-20 (HF verified) · I reported a false negative from a truncated response
+
+**I claimed HuggingFace had none of Study 3. That was wrong.** All 17 runs are
+published.
+
+`GET /api/datasets/Shanmuk4622/msc-cifar100/tree/main/runs`:
+
+| | on HF |
+|---|---|
+| `p4-*-jointexit-s1` | **3** — resnet20, resnet32x4, vgg8 |
+| `p5-*-prune*` | **14** — sat/uns/rand × 30/50 × 2 seeds, plus 2 full-data |
+| p0 / p1 / p3 (Studies 1–2) | 90 |
+| **total** | **107 run directories** |
+
+Spot-checked `runs/p4-resnet20-cifar100-jointexit-s1`: `config.yaml`,
+`config_hash.txt`, `summary.json`, `STATUS.json`, `exit_heads.pt` (100 KB, LFS),
+and `checkpoints/`, `env/`, `metrics/`, `per_sample/`, `telemetry/`.
+
+### How I got it wrong
+
+I fetched `/api/datasets/{id}` and the response was **truncated at 68,717
+characters mid-JSON**. The parse failed, so I fell back to regex-scraping the
+partial text. `runs/p1-*` sorts before `runs/p4-*` and `runs/p5-*`, so a
+truncated listing shows the Study 1 runs and **silently omits Study 3's
+entirely**. I then read that absence as evidence.
+
+**This is rule 9 and rule 10 in one.** A negative finding deserves the same
+verification standard as a positive one, and the library's own `resolve_meta`
+docstring says exactly that: *"Refusing to report absence on a failed lookup."*
+I did the thing my own code refuses to do — and I did it while writing a section
+about verification.
+
+The right query was the scoped one: `tree/main/runs`, which returns a complete
+directory listing small enough not to truncate.
+
+### What is genuinely missing
+
+`analysis/` on HF still holds only Study 1's 8 files. **None of the `s3_*.csv`
+are there:**
+
+```
+s3_exit_quality.csv  s3_frozen_vs_joint.csv  s3_q1_comparison.csv
+s3_router_capture.csv  s3_pruning.csv  s3_memorisation.csv
+```
+
+The runs uploaded; the `analysis` folder item did not. All six exist locally
+under `C:\msc_results\analysis\`. **Re-running `S3_NB5_Publish`'s upload cell
+should complete it** — it uploads folder-at-a-time and skips what already
+landed, so it costs only the missing files.
+
+---
+
 ## 2026-08-20 (Q3 DONE) · H3 falsified backwards — and the design is confounded
 
 | keep | saturated | unsaturated | random | full |

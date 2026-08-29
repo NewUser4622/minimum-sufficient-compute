@@ -12,7 +12,7 @@ live in this repository:
 | **Study 1 · CIFAR-100** | 50k @ 32px | small | 15 | complete — [`docs/cifar100/10_FINAL_RESULTS.md`](docs/cifar100/10_FINAL_RESULTS.md) |
 | **Study 1 · ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
 | **Study 2** | CIFAR-100, re-analysed | — | 15 | **complete** — [`study2/PAPER.md`](study2/PAPER.md) |
-| **Study 3** | CIFAR-100 | — | 3 + pruning | **Q1 SETTLED — H1 supported** — [`study3/03_LOG.md`](study3/03_LOG.md) |
+| **Study 3** | CIFAR-100 | — | 3 + pruning | **complete** — [`study3/04_FINDINGS.md`](study3/04_FINDINGS.md) |
 
 **Study 3 runs offline.** Training and analysis notebooks never touch the network; `S3_NB5_Publish` uploads the finished tree in one pass at the end.
 
@@ -43,12 +43,19 @@ Study 2 cost **no training and no new runs** — Study 1's per-sample parquets
 already held per-exit predictions, so it is CPU re-analysis. Start at
 [`study2/PAPER.md`](study2/PAPER.md).
 
-**That blocker is now cleared.** Study 3 Q1 retrained three architectures with
-exits trained **jointly** — the way MSDNet and BranchyNet do it — and the excess
-came out **larger**, not smaller: **8.55 / 9.15 / 10.64 pt** against 6.42 / 7.95
-/ 6.69 frozen, surviving conditioning on backbone accuracy. Weak exits are right
+**That blocker is cleared.** Study 3 Q1 retrained three architectures with exits
+trained **jointly** — the way MSDNet and BranchyNet do it — and the excess came
+out **larger**, not smaller: **8.55 / 9.15 / 10.64 pt** against 6.42 / 7.95 /
+6.69 frozen, surviving conditioning on backbone accuracy. Weak exits are right
 on almost nothing, so they cannot rescue a sample the final layer gets wrong;
 rescues need competent exits, and the pool grows with exit quality.
+
+Study 3 Q2 then asked whether a *learned* gate can reach that gap. It captures
+**1.7 %** — and in-seed capture is no higher than cross-seed, so it is not even
+memorising noise: **there is nothing in the deployable signal to capture.**
+Q3 (does the memorisation collapse damage pruning?) came back inconclusive with
+a confounded design, recorded rather than re-cut. See
+[`study3/04_FINDINGS.md`](study3/04_FINDINGS.md).
 
 ---
 

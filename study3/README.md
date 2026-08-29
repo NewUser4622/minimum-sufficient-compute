@@ -1,10 +1,20 @@
-# Study 3 — plan
+# Study 3 — complete
 
-**Nothing here has been run.** This is a design, written before any compute is
-spent, so the decision to start is made on paper.
+**All three questions answered.** Results: [`04_FINDINGS.md`](04_FINDINGS.md).
+Narrative and every defect: [`03_LOG.md`](03_LOG.md).
 
-Study 2 (`study2/PAPER.md`) is complete. It ends with one blocking limitation
-and one unanswered question, and this folder is about both.
+| | question | verdict |
+|---|---|---|
+| **Q1** | does the oracle excess survive **jointly trained** exits? | **YES — and it grows.** 8.55 / 9.15 / 10.64 pt vs 6.42 / 7.95 / 6.69 frozen |
+| **Q2** | how much can a **learned router** capture? | **1.7 %.** Not seed noise — there is nothing in the deployable signal to capture |
+| **Q3** | does the memorisation collapse damage **pruning**? | **inconclusive.** Falsified in reverse, and the design is confounded |
+
+**Cost: ~16 GPU-hours.** Study 1 spent 215.
+
+**The headline: Study 2's blocking limitation is removed.** The oracle excess is
+not an artifact of weak post-hoc exits — it is *larger* when exits are trained
+the way the field trains them, because rescuing a sample the final layer gets
+wrong requires a *competent* early exit.
 
 ---
 
@@ -135,7 +145,8 @@ The local tree is the source of truth. HuggingFace is a copy of it.
 |---|---|
 | [`01_PROTOCOL.md`](01_PROTOCOL.md) | pre-registration — predictions and thresholds fixed before any run |
 | [`02_RISKS.md`](02_RISKS.md) | how this fails, with detectors and responses |
-| [`03_LOG.md`](03_LOG.md) | **live log** — status board, pre-registered predictions, what to do next |
+| [`03_LOG.md`](03_LOG.md) | **live log** — status board, predictions, every defect |
+| [`04_FINDINGS.md`](04_FINDINGS.md) | **the results** — read this for the numbers |
 
 ---
 
