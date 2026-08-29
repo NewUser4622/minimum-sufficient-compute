@@ -33,12 +33,13 @@ and checked**.
 
 | | what | cost | state | artifact |
 |---|---|---|---|---|
-| **P0** | Figure 1 (ρ-sweep) + bootstrap CIs | **free**, CPU min | planned | `analysis/s4_bootstrap.csv`, `paper/figures/fig1_headroom.png` |
-| **P1** | margin + patience baselines | **free**, CPU min | planned | `analysis/s4_baselines.csv` |
-| **P2** | ImageNet-100 + transformer | ~20 GPU-h | planned — gated on P0/P1 | `runs/p6-*-jointexit-s1` |
-| **P3** | MSDNet, a designed early-exit net | ~15 GPU-h | planned — highest risk | `runs/p7-msdnet-*` |
+| **P0** | Figure 1 (ρ-sweep) + bootstrap CIs | **free**, CPU min | **built — ready to run** | `analysis/s4_bootstrap.csv`, `paper/figures/fig1_headroom.png` |
+| **P1** | margin + patience baselines | **free**, CPU min | **built — ready to run** | `analysis/s4_baselines.csv` |
+| **P2** | ImageNet-100 + transformer | ~20 GPU-h | **built** — gated on P0/P1 | `runs/p6-*-jointexit-s1` |
+| **P3** | MSDNet, a designed early-exit net | ~15 GPU-h | **not built yet** — needs new zoo code, own pass | `runs/p7-msdnet-*` |
 
-**Next action: build and run P0 + P1.** They cost nothing, they produce the
+**Next action: run `S4_NB0_Figures`, then `S4_NB1_Baselines`.** Both are
+built, both are free, both were executed against synthetic data first. They cost nothing, they produce the
 paper's main figure and its intervals, and P1 can overturn the headline numbers
 by finding a stronger baseline — which is exactly why it runs before any GPU
 time is spent.
@@ -55,6 +56,64 @@ Do not edit the prediction column.
 | **H4** | excess holds at ImageNet-100 scale | ≥ 2.0 pt, 2 of 2 | _pending_ | _pending_ |
 | **H4b** | it holds on the **transformer** specifically | ≥ 2.0 pt, `vit_small_p16` | _pending_ | _pending_ |
 | **H5** | excess holds on MSDNet | ≥ 2.0 pt, 2 of 2 seeds | _pending_ | _pending_ |
+
+---
+
+## 2026-08-20 (built) · four notebooks, and three defects the harness caught
+
+`build_notebooks_study4.py` → `notebooks_study4/`. All gates pass, including a
+**new** one: every `M.*` and `sess.*` the notebooks reference is checked against
+the library AST at build time. `check_names` cannot see attributes, which is how
+`sess.hub.resolve_meta` reached a GPU in Study 3.
+
+| notebook | phase | cost |
+|---|---|---|
+| `S4_NB0_Figures` | P0 | free, CPU minutes |
+| `S4_NB1_Baselines` | P1 | free, CPU minutes |
+| `S4_NB2_ImageNet` | P2 | ~20 GPU-h |
+| `S4_NB3_Publish` | — | minutes, the only online notebook |
+
+**MSDNet (P3) is deliberately not built yet.** It needs a new architecture in
+the zoo rather than a config flag, and this authoring environment has no torch —
+so it would ship entirely unexecuted, which is the pattern that has cost the most
+in this project. It gets its own pass, after P0–P2 have produced something.
+
+### Three defects caught by executing the notebooks, not reading them
+
+`tools/s4_harness.py` runs NB0 and NB1's **real cells** against synthetic data
+with a known answer. It found:
+
+1. **A canary that could not fail.** The bootstrap "CI narrows with n" check
+   sliced a *sorted* array, so the small sample had zero excess and zero width —
+   the canary reported FAIL while the code was correct. Now samples randomly.
+2. **A hardcoded `n=10,000`** in the manuscript label, printed regardless of the
+   actual split size. Now read from the data: quoting 10,000 when the split is
+   smaller would be a fabricated detail in the paper itself.
+3. **An unfair baseline ranking — the serious one.** `winner = idxmax()` over
+   raw accuracy let **patience win by overspending**: it reached 0.747 at a 0.70
+   budget, bought accuracy it was not entitled to, and would have been declared
+   "the strongest baseline", triggering a recomputation of every headroom figure
+   in Studies 2–3 against a baseline that had simply cheated on cost.
+
+The fix took three attempts, each caught by the harness:
+
+* symmetric ±0.05 tolerance — **still let patience win**, because it overshot
+  *within* tolerance;
+* asymmetric (may underspend, never overspend) — **still unfair**, because
+  patience then qualified at only some budgets and its median was computed over
+  a different set;
+* **common budgets only** — rank on the budgets where every baseline has a
+  qualifying row. Correct.
+
+**And one of my own harness assumptions was wrong.** I expected confidence to
+win, but the synthetic world gave patience perfect agreement signal too, so
+patience winning was right. The discriminating test is that the **noise**
+baseline must never win — which is what the harness now asserts.
+
+PABEE has only K discrete operating points and frequently cannot hit a
+requested budget. That is a property of the method, and the notebook now reports
+achieved cost beside accuracy rather than tabulating them as if the budgets
+matched.
 
 ---
 
