@@ -265,5 +265,19 @@ for _name, _code in _nbs.items():
         check(f"{_name}: guards the empty frame before indexing a column",
               ".empty" in _tail or "len(" in _tail, _tail[:80])
 
+# --- every sess.hub.X the notebooks use must exist on MSCHub -------------
+# NB5 called sess.hub.resolve_meta, which lives on BackgroundUploader.
+# MSCHub has only repo_id and token, so it died at the verification step --
+# after the upload had already run.
+_hub = next(n for n in ast.walk(tree)
+            if isinstance(n, ast.ClassDef) and n.name == "MSCHub")
+_have = {m.name for m in _hub.body if isinstance(m, ast.FunctionDef)}
+_have |= {n.attr for n in ast.walk(_hub) if isinstance(n, ast.Attribute)
+          and isinstance(n.value, ast.Name) and n.value.id == "self"}
+for _name, _code in _nbs.items():
+    _used = set(_re.findall(r"sess\.hub\.([A-Za-z_]\w*)", _code))
+    check(f"{_name}: every sess.hub attribute exists on MSCHub",
+          not (_used - _have), str(sorted(_used - _have)))
+
 print(f"\n{sum(res)}/{len(res)} Study 3 canaries pass")
 sys.exit(0 if all(res) else 1)

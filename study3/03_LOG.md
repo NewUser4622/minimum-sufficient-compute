@@ -38,10 +38,11 @@ thing the caller had no way to say.
 | **P1** | Q1 joint exit training | ~10 GPU-h | **DONE** | 3 runs under `runs/p4-*-jointexit-s1` |
 | **P2** | Q1 verdict, paired comparison | ~10 min CPU | **DONE — H1 SUPPORTED** | `analysis/s3_q1_comparison.csv` |
 | **P3** | Q2 learned router | minutes, CPU | **DONE — H2 SUPPORTED** | `analysis/s3_router_capture.csv` |
-| **P4** | Q3 pruning | ~6 GPU-h (5k pool) | **ready — run next** | `analysis/s3_pruning.csv` |
-| **P5** | publish everything, once | minutes | ready — run LAST, with a network | `Shanmuk4622/msc-cifar100` |
+| **P4** | Q3 pruning | ~6 GPU-h (5k pool) | **DONE — H3 falsified, and CONFOUNDED** | `analysis/s3_pruning.csv` |
+| **P5** | publish everything, once | minutes | **ready — run next** | `Shanmuk4622/msc-cifar100` |
 
-**Next action: run `S3_NB4_Pruning` (Q3).** Q1 and Q2 are both settled.
+**Next action: run `S3_NB5_Publish`.** All three questions have answers;
+Q3's needs a design fix before it means anything (see below).
 
 ---
 
@@ -53,8 +54,86 @@ Written **before** any run. Do not edit the prediction column.
 |---|---|---|---|---|
 | **H1** | oracle excess survives joint exit training | ≥ 2.0 pt, 3 of 3 archs | **8.55 / 9.15 / 10.64 pt** | **SUPPORTED** (3 of 3) |
 | **H2** | a learned router captures little of the gap | < 25 % (cross-seed) | **1.7 %** | **SUPPORTED** |
-| **H3** | saturated-source pruning is worse | ≥ 1.0 pt at 30 % keep | _pending_ | _pending_ |
-| **H3b** | saturated source ≈ random pruning | ± 0.5 pt at 30 % keep | _pending_ | _pending_ |
+| **H3** | saturated-source pruning is worse | ≥ 1.0 pt at 30 % keep | **−8.54 pt (reversed)** | **FALSIFIED — but confounded** |
+| **H3b** | saturated source ≈ random pruning | ± 0.5 pt at 30 % keep | **−2.70 pt** | **FALSIFIED** |
+
+---
+
+## 2026-08-20 (Q3 DONE) · H3 falsified backwards — and the design is confounded
+
+| keep | saturated | unsaturated | random | full |
+|---|---|---|---|---|
+| 100 % | — | — | — | **70.24** |
+| 50 % | 25.05 | **14.76** | 25.58 | |
+| 30 % | 16.46 | **7.92** | 19.16 | |
+
+**H3 predicted the saturated source would be WORSE by ≥ 1.0 pt. It is BETTER by
+8.54 pt.** H3b predicted saturated ≈ random within ±0.5; it is 2.70 pt below.
+Both **FALSIFIED**, and H3 in the opposite direction.
+
+### But neither verdict tests what it was meant to test
+
+**Both difficulty-guided arms lose to random pruning at 30 %** (saturated −2.70,
+unsaturated −11.24). That is the tell. The selection rule is *"keep the hardest
+samples"*, and at aggressive retention that is a known-poor strategy — hard
+subsets are dominated by atypical and mislabelled examples. Sorscher et al.
+(*Beyond neural scaling laws*, 2022) is explicit: keep hard examples when data is
+abundant, keep **easy** ones when pruning hard.
+
+So the experiment inverts itself. A **more reliable** difficulty score is
+**better** at finding genuinely hard samples, therefore keeps a harder and
+noisier training set, therefore trains worse. The measurement runs
+*"how well does this score identify hard samples"* through a rule that punishes
+identifying them.
+
+Read that way the ordering is **consistent with Study 2**: `mobilenetv2`'s
+`ce_loss` (ρ_seed 0.849, unsaturated) finds hard samples more effectively than
+`convnext_femto`'s (ρ_seed 0.150, saturated), and is penalised for it. That is
+weak supporting evidence for the reliability claim — arriving through a lens
+that reverses its sign.
+
+**The regime makes it worse.** 30 % of a 5,000-sample pool is 1,500 images across
+**100 classes — 15 per class**. Keeping atypical examples is maximally harmful
+there, and absolute accuracy collapses to 8–25 % against 70 % on full data.
+
+### What Q3 needs to actually answer H3
+
+1. **Invert the rule** — keep the *easiest* samples, which is what the pruning
+   literature does at these rates; or
+2. **use a mild retention** (70–90 %), where keeping-hard is the sensible rule;
+   and ideally
+3. **report both directions**, since "which rule is right" is itself the
+   confound.
+
+The subsets are index lists, so rebuilding them is free; only the retraining
+costs (~6 GPU-h). **H3 is recorded as falsified-and-confounded rather than
+quietly re-cut** — the stopping rule says a null is reported as a null, and this
+is a null whose design flaw is now visible and stated.
+
+**A note on my own predictions.** H3 was written expecting "better score →
+better pruning". That is only true if the selection rule matches the regime, and
+I did not think about the regime when writing it. The pre-registration was
+underspecified, not merely wrong.
+
+---
+
+## 2026-08-20 (publish) · NB5 called a method on the wrong class
+
+```
+AttributeError: 'MSCHub' object has no attribute 'resolve_meta'
+```
+
+`resolve_meta` lives on **`BackgroundUploader`**. `sess.hub` is an `MSCHub`,
+which carries only `repo_id` and `token`. It failed at the verification step —
+**after** the upload had already run.
+
+**Fix:** NB5 now makes the same `hf_hub_url` + `get_hf_file_metadata` call
+directly, keeping the important property — `None` only for a genuine 404, and a
+raise otherwise, because absence reported by a failed lookup is the D-20 false
+alarm.
+
+**Canary added:** every `sess.hub.X` used by any notebook must exist on
+`MSCHub`, checked against the class AST at build time. 75/75.
 
 ---
 

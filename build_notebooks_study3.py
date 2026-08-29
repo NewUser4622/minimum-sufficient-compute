@@ -1585,9 +1585,26 @@ files are there, and `list_repo_files` has lied before. The only trustworthy
 check is asking HuggingFace to resolve specific paths and seeing a 200.
 """),
         code("""
-# `sess.hub.resolve_meta` is THE rule-9 check: it asks HuggingFace to resolve a
-# specific path and returns None only for a genuine 404, raising instead of
-# reporting absence when the lookup itself failed.
+# Rule 9: trust `resolve` only. `resolve_meta` lives on BackgroundUploader, not
+# on MSCHub -- `sess.hub` has only `repo_id` and `token` -- so the same call is
+# made here directly rather than through an attribute that does not exist.
+# It returns None ONLY for a genuine 404 and raises otherwise, because absence
+# reported by a failed lookup is the D-20 false alarm.
+from huggingface_hub import get_hf_file_metadata, hf_hub_url
+
+def resolve_meta(rel):
+    url = hf_hub_url(repo_id=REPO, filename=rel, repo_type='dataset',
+                     revision='main')
+    try:
+        m = get_hf_file_metadata(url, token=TOKEN or None)
+    except Exception as e:
+        msg = str(e).lower()
+        if '404' in msg or 'not found' in msg or 'entrynotfound' in msg:
+            return None
+        raise RuntimeError(
+            f'could not determine whether {rel} exists: {e}. Refusing to '
+            'report absence on a failed lookup.') from e
+    return {'path': rel, 'size': getattr(m, 'size', None)}
 probe = sorted(set(
     sel.sample(min(8, len(sel)), random_state=0)['path'].tolist()
     + [p for p in sel['path'] if p.endswith('per_sample/test.parquet')][:3]
@@ -1595,7 +1612,7 @@ probe = sorted(set(
 
 ok = miss = 0
 for rel in probe:
-    meta = sess.hub.resolve_meta(Path(rel).as_posix())
+    meta = resolve_meta(Path(rel).as_posix())
     print(f'  {"OK  " if meta else "MISS"} {rel}'
           + (f'  ({meta["size"]:,} B)' if meta and meta.get('size') else ''))
     ok, miss = ok + bool(meta), miss + (not meta)

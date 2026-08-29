@@ -154,6 +154,27 @@ the gap **widens** as retention falls.
 single-seed difficulty score from a memorising model is worth no more than
 chance.*
 
+> **RESULT 2026-08-20: H3 FALSIFIED in reverse, H3b FALSIFIED — and the design
+> is confounded.** Saturated 16.46 %, unsaturated 7.92 %, random 19.16 % at 30 %
+> retention. H3 predicted saturated worse by ≥ 1.0 pt; it is *better* by 8.54.
+>
+> **Both guided arms lose to random**, which is the tell. "Keep the hardest
+> samples" is a known-poor rule at aggressive retention (Sorscher et al. 2022:
+> keep hard when data is abundant, easy when pruning hard). So a *more reliable*
+> score finds harder samples, keeps a noisier subset, and trains worse — the
+> measurement runs "how well does this score find hard samples" through a rule
+> that punishes finding them. At 30 % of a 5,000 pool that is 15 images per
+> class, where keeping atypical examples is maximally harmful.
+>
+> The ordering is nonetheless *consistent* with Study 2 — `mobilenetv2`'s
+> `ce_loss` finds hard samples better and is penalised for it — but as a test of
+> H3 it is inconclusive by construction. **Answering H3 needs the rule inverted
+> (keep easiest) or a mild retention (70–90 %), reporting both directions.**
+> Recorded as falsified-and-confounded rather than re-cut.
+>
+> My own error: H3 assumed "better score → better pruning", which holds only if
+> the selection rule suits the regime. The pre-registration was underspecified.
+
 **Cheap pre-check before spending 18 GPU-h.** Compute the overlap between the
 kept-sets. If the saturated and unsaturated sources select ≥ 90 % of the same
 samples, no downstream difference is possible and the experiment is cancelled.
