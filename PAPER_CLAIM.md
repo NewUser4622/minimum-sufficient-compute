@@ -211,6 +211,21 @@ Rule 12 applies to our own manuscript.
 
 ---
 
+## This is now planned as Study 4
+
+The gap analysis above is scheduled in [`study4/README.md`](study4/README.md),
+with pre-registered thresholds in [`study4/01_PROTOCOL.md`](study4/01_PROTOCOL.md).
+
+**Two estimates in this document were corrected when checked:**
+
+- **"extra baselines ~2 GPU-h, pure re-analysis"** — only two-thirds true.
+  Margin and patience are free; **entropy is not computable** because only the
+  top-2 probabilities were stored, never full logits. Study 4 omits entropy and
+  says so rather than approximating it.
+- **"ImageNet ~25 GPU-h"** quoted `resnet50`'s **41.5 GPU-h** run, which is the
+  D-59 `channels_last` disaster against a documented ~6 h. Revised to ~20 GPU-h
+  with a throughput gate in epoch 1.
+
 ## Recommended sequence
 
 1. **G4 + G5 + G3** (free / ~2 GPU-h) → **submit Paper A to TMLR.**

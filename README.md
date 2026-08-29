@@ -13,6 +13,7 @@ live in this repository:
 | **Study 1 · ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
 | **Study 2** | CIFAR-100, re-analysed | — | 15 | **complete** — [`study2/PAPER.md`](study2/PAPER.md) |
 | **Study 3** | CIFAR-100 | — | 3 + pruning | **complete** — [`study3/04_FINDINGS.md`](study3/04_FINDINGS.md) |
+| **Study 4** | CIFAR-100 + ImageNet-100 | 32px + 224px | 2 + MSDNet | **planned** — [`study4/README.md`](study4/README.md) |
 
 **Study 3 runs offline.** Training and analysis notebooks never touch the network; `S3_NB5_Publish` uploads the finished tree in one pass at the end.
 
