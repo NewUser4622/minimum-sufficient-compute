@@ -103,7 +103,28 @@ import numpy as np, pandas as pd
 
 runs_dir = Path(MSC_ROOT) / 'runs'
 
-def measured_runs(dataset='cifar100', methods=('base',), require=True):
+def measured_runs(dataset='cifar100', methods=('base',), require=True,
+                  include_probes=False):
+    '''Runs on disk that belong to the STUDY POPULATION.
+
+    D-90. This is a DISK SCAN, and that is the whole problem. The library
+    keeps `msdnet` out of sweeps and preflight with `atlas=False`, but that
+    flag governs what gets PLANNED -- it says nothing about what is found by
+    walking runs/. The moment S4_NB4 trains
+    `p7-msdnet-cifar100-jointexit-s1`, a plain scan for jointexit runs
+    silently grows S4_NB0's bootstrap population from 3 attached-exit runs to
+    5 runs mixing attached and DESIGNED exits, and the published P0 intervals
+    move. Nothing errors; the notebook just answers a different question.
+
+    Caught by tools/s4_harness.py, whose built-in excess is 9.0 pt for the
+    attached runs and 3.0 for MSDNet: the mean CI dropped to ~6.5 and the
+    bracketing check failed. A canary over a population that can change is
+    worth more than one over a fixed number.
+
+    Probe architectures are therefore excluded here too. Pass
+    `include_probes=True` to get them; nothing feeding a published table
+    should.
+    '''
     ids = sorted(d.name for d in runs_dir.iterdir()
                  if d.is_dir() and (d / 'per_sample' / 'test.parquet').exists())
     if not ids:
@@ -114,6 +135,13 @@ def measured_runs(dataset='cifar100', methods=('base',), require=True):
             raise RuntimeError(
                 f'parse_run_id gave no {col!r} column. Present: '
                 f'{list(df.columns)}. Ids look like {ids[:3]}')
+    if not include_probes:
+        probes = {a for a, m in M.ZOO.items() if not m.get('atlas', True)}
+        hit = df[df['arch'].isin(probes)]
+        df = df[~df['arch'].isin(probes)]
+        if len(hit):
+            print(f'excluded {len(hit)} probe run(s) from the study '
+                  f'population: {sorted(hit["run_id"])}')
     sel = df[(df['dataset'] == dataset) & (df['method'].isin(methods))]
     if require and sel.empty:
         raise RuntimeError('; '.join([
@@ -995,6 +1023,529 @@ if len(vit):
 
 
 # ---------------------------------------------------------------------------
+# S4_NB4 -- MSDNet (P3, hypothesis H5)
+# ---------------------------------------------------------------------------
+def nb4():
+    return notebook([
+        md("""
+# S4_NB4 — does the excess survive an architecture with *designed* exits?
+
+**~5 GPU-hours · 2 runs · fully resumable · offline**
+
+## What this settles
+
+Every result in this project so far uses **attached** exits: linear heads bolted
+onto a backbone that was designed to be run to completion. Study 3 showed the
+excess gets *larger* when those heads are trained jointly (8.55 / 9.15 / 10.64
+pt), which is suggestive but not decisive.
+
+A reviewer's move is obvious: **maybe the excess is an artifact of attaching
+exits at all.** A head at 20 % depth reads a fine, local feature map that was
+never meant to support a classification. Of course it disagrees with the final
+layer in strange ways.
+
+MSDNet is the architecture built to remove that objection. It keeps three
+resolutions alive through the whole network and its classifiers read the
+**coarsest** scale, so an early exit sees a feature map that has already
+integrated most of the image. If the excess is about attachment, it should
+shrink here. If it survives, the claim is architecture-independent.
+
+**H5 (pre-registered):** `oracle_in − acc_full ≥ 2.0 pt`, in **2 of 2 seeds**.
+
+| measured | consequence |
+|---|---|
+| ≥ 2.0 pt | **the claim is architecture-independent** — the strongest available outcome |
+| 0.5 – 2.0 pt | present but attenuated; report both, attribute to architecture |
+| < 0.5 pt | **the excess is a property of attached exits** — a *sharper* claim than the current one, and more actionable |
+
+**The third row is not a failure.** `study4/01_PROTOCOL.md` says so in advance,
+and this notebook prints it as a result, not as a problem.
+
+## What is honest to say about this MSDNet
+
+It is a **re-implementation**, and the protocol names that as the thing most
+likely to make H5 wrong. Recorded deviations from Huang et al. (ICLR 2018,
+arXiv:1703.09844), all visible in `msc_lib.msdnet_channel_spec`:
+
+- no bottleneck (1×1) convolutions — cost is capped by a small `growth` instead
+- no channel-reduction transitions between stages
+- **exits are the project's standard linear `ExitHead`**, not MSDNet's two-conv
+  classifier
+
+The third is deliberate and load-bearing. Every other architecture in the study
+is measured with that head; holding it fixed is what makes this a statement
+about the **backbone** rather than about the head. It also means a weak result
+here cannot be blamed on a head change.
+
+## Comparability
+
+Trained **jointly** (`joint_exits=True`, `uniform` weights) because MSDNet
+trains all its classifiers jointly by design — that is intrinsic, not a knob.
+So the comparison is against **Study 3's joint runs**, not the frozen ones, and
+this notebook makes that comparison explicitly rather than leaving it to the
+reader.
+"""),
+        code(bootstrap_cell()),
+        code(paths_cell(phase="p7", dataset="cifar100")),
+        code(runs_cell()),
+        md("""
+---
+## First: is the architecture actually what we think it is?
+
+**Nothing below spends GPU time.** MSDNet is the only network in this project
+written from scratch rather than borrowed, and it was written on a machine with
+**no torch** — so every line of it ships unexecuted until this cell runs.
+
+The arithmetic lives in `msdnet_channel_spec`, which is pure Python and already
+carries 36 canaries (`tools/s4_msdnet_canaries.py`, each one proven able to fail
+against a deliberately corrupted spec). What that *cannot* check is whether the
+modules were wired to match it. That is what this cell is for.
+"""),
+        code("""
+import torch
+
+spec = M.msdnet_channel_spec()
+print(f"spec: {spec['n_scales']} scales x {spec['n_layers']} layers, "
+      f"base={spec['base']} growth={spec['growth']}")
+print(f"  resolutions   {spec['resolutions']}")
+print(f"  stem widths   {spec['stem_out']}")
+print(f"  exit layers   {spec['cuts']}")
+print(f"  exit widths   {spec['feature_dims']}")
+print()
+
+model = M.build_model('msdnet', 100, dataset='cifar100').eval()
+x = torch.randn(2, 3, 32, 32)
+with torch.no_grad():
+    logits = model(x)
+    feats = model.forward_features(x)
+    prefs = [model.forward_prefix(x, k) for k in range(len(feats))]
+
+print(f'parameters    {M.count_parameters(model):,}')
+print(f'logits        {tuple(logits.shape)}')
+print(f'exit features {[tuple(f.shape) for f in feats]}')
+print()
+
+fail = []
+if tuple(model.feature_dims) != tuple(spec['feature_dims']):
+    fail.append(f'probed dims {tuple(model.feature_dims)} != spec '
+                f'{tuple(spec["feature_dims"])}')
+if len(feats) != len(M.DEPTH_FRACTIONS):
+    fail.append(f'{len(feats)} exits, expected {len(M.DEPTH_FRACTIONS)}')
+
+# THE architectural claim. Exits must read the COARSEST scale (8x8), not the
+# finest (32x32). If a wiring slip made them read scale 0, MSDNet degenerates
+# into precisely the attached head it exists to be contrasted with, and this
+# whole notebook would answer nothing while producing a perfectly good number.
+if not all(tuple(f.shape[-2:]) == (8, 8) for f in feats):
+    fail.append(f'exits are not on the coarsest scale: '
+                f'{[tuple(f.shape[-2:]) for f in feats]}')
+
+if not all(torch.allclose(a, b, atol=1e-5) for a, b in zip(prefs, feats)):
+    fail.append('forward_prefix disagrees with forward_features')
+
+# THE honest-cost claim (protocol 2.1). An exit that runs the whole backbone
+# and slices a mid-layer activation costs FULL compute, and every rho it
+# reports would be fiction. Count the layers that actually execute.
+seen = {'n': 0}
+hooks = [b.register_forward_hook(
+    lambda *_a, _c=seen: _c.__setitem__('n', _c['n'] + 1)) for b in model.blocks]
+try:
+    with torch.no_grad():
+        model.forward_prefix(x, 0)
+finally:
+    for h in hooks:
+        h.remove()
+if seen['n'] != spec['cuts'][0]:
+    fail.append(f"forward_prefix(x,0) ran {seen['n']} layers, expected "
+                f"{spec['cuts'][0]} -- it is NOT stopping early")
+print(f"forward_prefix(x,0) executed {seen['n']} of {len(model.blocks)} layers")
+
+if fail:
+    for f in fail:
+        print(f'  [FAIL] {f}')
+    raise RuntimeError('MSDNet is not wired as specified -- no GPU time spent.')
+print()
+print('architecture verified')
+"""),
+        md("""
+---
+## The cost profile — and one thing worth noticing
+
+`rho` is measured with the same profiler as every other architecture, on a
+wrapper that truncates the network, so the cost of an early exit is counted
+rather than asserted.
+
+**MSDNet's rho curve should be visibly flatter at the early exits than a
+ResNet's**, and that is not a defect — it is the architecture. A ResNet prefix
+at 20 % depth computes 20 % of one narrow stack; an MSDNet prefix at 20 % depth
+computes *three resolutions* of the first four layers. Designed exits are not
+free, and the paper should say so.
+"""),
+        code("""
+bud = M.load_or_build_budgets('msdnet', sess.work, 'cifar100')
+rho = list(bud['axes']['depth']['rho'])
+print(f'msdnet   rho {[round(r, 4) for r in rho]}')
+
+if len(rho) != len(M.DEPTH_FRACTIONS):
+    raise RuntimeError(f'{len(rho)} budgets, expected {len(M.DEPTH_FRACTIONS)}')
+if not all(b > a for a, b in zip(rho, rho[1:])):
+    raise RuntimeError(f'rho is not strictly ascending: {rho}. compute_msc '
+                       'refuses ties -- "smallest sufficient budget" is '
+                       'ill-defined when two budgets cost the same.')
+if abs(rho[-1] - 1.0) > 1e-6:
+    raise RuntimeError(f'the final budget must be 1.0, got {rho[-1]}')
+
+print()
+print('for contrast, architectures already measured:')
+for a in ('resnet32x4', 'vgg8'):
+    try:
+        r = M.load_or_build_budgets(a, sess.work, 'cifar100')['axes']['depth']['rho']
+        print(f'  {a:12s} {[round(v, 4) for v in r]}')
+    except Exception as e:
+        print(f'  {a:12s} unavailable ({type(e).__name__})')
+print()
+print(f'MSDNet exit 0 costs {rho[0]*100:.1f} % of full compute.')
+print('If that is high relative to the ResNets, it is the multi-scale stem and')
+print('trunk being computed at every scale -- report it, do not hide it.')
+"""),
+        md("""
+---
+## Configure — 2 seeds, joint exits, everything else held fixed
+"""),
+        code("""
+ARCH = 'msdnet'
+SEEDS = [1, 2]
+SCHEME = 'uniform'        # same as Study 3 Q1, so the comparison is paired
+
+# `sess.config`, NOT `M.base_config` -- the bound method calls prepare_data()
+# and fills in `data_root`. The raw function does not, and the loader then
+# falls through to locate_cifar100()'s DOWNLOAD path over data already on disk
+# (D-54, hit twice).
+cfgs = [sess.config(ARCH, seed=s, method='jointexit',
+                    joint_exits=True, exit_weight_scheme=SCHEME)
+        for s in SEEDS]
+
+K = len(rho)
+for c in cfgs:
+    assert c.get('joint_exits') is True, 'joint_exits did not survive config()'
+    assert c.get('channels_last') is False, (
+        'channels_last is True -- D-87 was this exact flag carrying two '
+        'different defaults, and it crashed joint training on batch one.')
+    w = M.exit_loss_weights(K, SCHEME)
+    print(f"{c['run_id']:36s} epochs={c['num_epochs']}  K={K}  "
+          f"bs={c.get('batch_size')}  lr={c.get('learning_rate')}  "
+          f"weights={[round(v, 3) for v in w]}")
+
+print()
+print(f'seeds: {SEEDS} -- H5 needs 2 of 2, so both must finish.')
+"""),
+        md("""
+---
+## Dry run and memory probe
+"""),
+        code("""
+import traceback
+ok = True
+for c in cfgs:
+    try:
+        r = M.backbone_dry_run(c)
+        print(f"  {c['run_id']:36s} {r if not isinstance(r, tuple) else r[1]}")
+    except Exception as e:
+        ok = False
+        print(f"  {c['run_id']:36s} FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
+if not ok:
+    raise RuntimeError('dry run failed -- no GPU time spent. Fix first.')
+
+if torch.cuda.is_available():
+    torch.cuda.reset_peak_memory_stats()
+    free, total = torch.cuda.mem_get_info()
+    print()
+    print(f'GPU free {free/2**30:.1f} of {total/2**30:.1f} GiB;  '
+          f'dry-run peak {torch.cuda.max_memory_allocated()/2**30:.2f} GiB')
+    print('Dense concatenation keeps every earlier activation alive, so MSDNet')
+    print('is memory-hungrier per parameter than a ResNet. If a real epoch')
+    print('OOMs, halve batch_size rather than risk the machine.')
+"""),
+        md("""
+---
+## Train
+
+**Safe to stop at any time.** Resume restores optimiser, scheduler, AMP scaler
+and all four RNG streams. Re-running this cell continues from the last epoch.
+
+Run the timing cell below after the first epoch, before leaving this unattended.
+"""),
+        code("""
+results = sess.run_all(cfgs, title='Study 4 P3 / MSDNet joint exits')
+print()
+for r in results:
+    print(f"  {r.get('status','?'):9s} {r.get('run_id','?')}  "
+          f"top1={M.fmt_metric(r.get('best_accuracy'))}  "
+          f"{r.get('num_epochs_run','?')} epochs")
+"""),
+        md("""
+---
+## How long is this actually going to take?
+
+The ~5 GPU-h estimate is derived from FLOPs, not measured — this architecture
+has never run on this machine. Measure epoch 1 and extrapolate rather than
+trusting the estimate. This is the cheap version of P2's throughput gate: there
+is no published img/s benchmark for a network we wrote, so there is nothing
+honest to compare against, and the check is "is this going to take all week?"
+"""),
+        code("""
+import pandas as pd
+for c in cfgs:
+    hist = M.run_layout(sess.work, c['run_id'])['metrics'] / 'epochs.csv'
+    if not hist.exists():
+        print(f"  {c['run_id']:36s} no epochs.csv yet"); continue
+    h = pd.read_csv(hist)
+    tcol = next((x for x in ('epoch_time_sec', 'time_sec', 'wall_sec')
+                 if x in h.columns), None)
+    if tcol is None or h.empty:
+        print(f"  {c['run_id']:36s} no timing column"); continue
+    sec = float(h[tcol].median())
+    hrs = sec * int(c['num_epochs']) / 3600.0
+    print(f"  {c['run_id']:36s} {sec:6.1f}s/epoch  ->  {hrs:5.2f} GPU-h "
+          f"({len(h)} epochs done)")
+    if hrs > 12:
+        print('     *** far above the ~2.5 h/seed estimate. Stop and check '
+              'batch_size and AMP before spending the night on it. ***')
+"""),
+        md("""
+---
+## Is the recipe sound?
+
+MSDNet has **no entry in `REFERENCE_ACC`** — and deliberately so. Every number
+in that table comes from the DKD / mdistiller papers for a specific published
+architecture. Ours is a re-implementation, so there is no published figure that
+legitimately applies, and inventing one would be worse than having none.
+
+That leaves a real hole: nothing would catch a broken recipe, and H5 measured on
+an undertrained network is worthless. So the check here is an explicit **floor**
+against architectures already measured on this machine, not a reference match.
+It is weaker than `recipe_ok`, and it is labelled as weaker.
+"""),
+        code("""
+FLOOR = 55.0        # well below mobilenetv2's 64.60, the weakest in the atlas
+
+acc = {}
+for c in cfgs:
+    fin = M.run_layout(sess.work, c['run_id'])['metrics'] / 'final.json'
+    if not fin.exists():
+        print(f"  {c['run_id']:36s} not finished"); continue
+    import json as _json
+    row = _json.loads(fin.read_text())
+    a = row.get('best_accuracy') or row.get('accuracy')
+    a = float(a) * (100.0 if a is not None and a <= 1.0 else 1.0) if a else None
+    acc[c['run_id']] = a
+    print(f"  {c['run_id']:36s} top1 {M.fmt_metric(a)}")
+
+print()
+print(f'atlas reference points (published, for orientation only):')
+for a_ in ('mobilenetv2', 'vgg8', 'resnet32x4'):
+    print(f'  {a_:14s} {M.REFERENCE_ACC.get(a_)}')
+print()
+low = [r for r, v in acc.items() if v is not None and v < FLOOR]
+if low:
+    raise RuntimeError(
+        f'{low} landed below {FLOOR} % top-1, under the weakest architecture in '
+        'the atlas. The recipe is wrong, and H5 measured on this network would '
+        'be a statement about undertraining, not about designed exits. Fix the '
+        'recipe before reading any verdict below.')
+if acc:
+    print(f'recipe floor cleared ({FLOOR} %). This is a FLOOR, not a reference '
+          'match -- record it as such.')
+"""),
+        md("""
+---
+## Measure
+
+`fn=sess.oracle`, `done_fn=sess.measured`, `stage='measure'` — **all three**.
+`stage` only labels the plan; `fn` selects the work and `done_fn` defines what
+"already done" means. Passing fewer plans *training*, finds everything already
+trained, measures nothing, and prints `MY REMAINING WORK: 0` (D-88).
+"""),
+        code("""
+for c in cfgs:
+    hp = M.exit_heads_path(sess.work, c['run_id'])
+    if not hp.exists():
+        raise RuntimeError(f"{c['run_id']}: no exit_heads.pt -- joint training "
+                           "should have written it at every new best.")
+    blob = torch.load(hp, map_location='cpu', weights_only=False)
+    if not blob.get('joint'):
+        raise RuntimeError(f"{c['run_id']}: exit_heads.pt is not marked joint -- "
+                           "these are frozen heads. Delete and retrain.")
+    print(f"  {c['run_id']:36s} joint heads OK  epoch={blob.get('epoch')}")
+
+print()
+res = sess.run_all(cfgs, fn=sess.oracle, done_fn=sess.measured,
+                   stage='measure', title='Study 4 P3 / measurement')
+for r in res:
+    print(f"  {r.get('status','?'):9s} {r.get('run_id','?')}")
+
+# rule 5 / D-79: a plan that says 'nothing to do' is not evidence.
+print()
+missing = []
+for c in cfgs:
+    ps = M.run_layout(sess.work, c['run_id'])['per_sample'] / 'test.parquet'
+    if ps.exists() and ps.stat().st_size > 0:
+        print(f"  {c['run_id']:36s} test.parquet {ps.stat().st_size/2**20:.1f} MB")
+    else:
+        missing.append(c['run_id'])
+if missing:
+    raise RuntimeError(f'measurement reported success but test.parquet is '
+                       f'missing for {missing}')
+"""),
+        md("""
+---
+## Canaries before the verdict
+
+Rule 3: no statistic without a canary that can fail — **including one that
+requires the statistic to DETECT an effect in a world where the effect
+certainly exists.** A check that only confirms "no effect when there is none"
+is satisfied by a function that always returns zero, which is exactly how D-89
+survived.
+
+Both controls below run through `excess_from_correct` — the *same* function
+that produces the verdict.
+"""),
+        code("""
+import numpy as np
+
+def excess_from_correct(corr):
+    '''oracle_in - acc_full, in accuracy points.
+
+    `corr` is (n_samples, K) boolean: was exit k correct on sample i?
+    The in-seed oracle takes the shallowest exit that is RIGHT, so it is
+    correct on any sample some exit gets right -- hence `.any(axis=1)`.
+    '''
+    corr = np.asarray(corr, bool)
+    return (float(corr.any(axis=1).mean()) - float(corr[:, -1].mean())) * 100.0
+
+rng = np.random.default_rng(0)
+n, K = 10000, 5
+
+# POSITIVE control: 12 % of samples are right at exit 0 and wrong at the end.
+# The excess MUST come back as exactly 12.00, or the statistic cannot see an
+# effect that is present by construction.
+pos = np.zeros((n, K), bool)
+pos[:, -1] = True
+early = rng.permutation(n)[:1200]
+pos[early, -1] = False
+pos[early, 0] = True
+got = excess_from_correct(pos)
+assert abs(got - 12.0) < 1e-9, f'positive control: expected 12.00, got {got}'
+print(f'  [PASS] positive control: an effect of 12.00 pt is measured as {got:.2f}')
+
+# NULL control: the final exit is right whenever any earlier exit is, so there
+# is nothing for an oracle to save. Excess must be exactly 0.
+null = rng.random((n, K)) < 0.6
+null[:, -1] |= null.any(axis=1)
+got0 = excess_from_correct(null)
+assert abs(got0) < 1e-9, f'null control: expected 0.00, got {got0}'
+print(f'  [PASS] null control: no effect present, {got0:.2f} pt measured')
+
+# MONOTONE control: excess can never be negative -- the oracle is right
+# wherever the final exit is, by construction of `.any`.
+rnd = rng.random((n, K)) < 0.5
+assert excess_from_correct(rnd) >= 0.0
+print('  [PASS] the excess is non-negative by construction')
+
+# The identity the whole paper rests on: excess == the fraction of samples
+# saved by an early exit and lost at the final one.
+saved = float((pos.any(axis=1) & ~pos[:, -1]).mean()) * 100.0
+assert abs(saved - got) < 1e-9
+print(f'  [PASS] excess == early-saves fraction ({saved:.2f} pt)')
+"""),
+        md("""
+---
+## H5 — the verdict
+"""),
+        code("""
+rows = []
+for c in cfgs:
+    corr, _conf, _sec, _pred, ks = exit_tables(c['run_id'])
+    corr = corr.astype(bool)
+    ex = excess_from_correct(corr)
+    af = float(corr[:, -1].mean()) * 100.0
+    oi = float(corr.any(axis=1).mean()) * 100.0
+    rows.append({'arch': ARCH, 'seed': c['seed'], 'run_id': c['run_id'],
+                 'n_exits': len(ks), 'n_samples': int(corr.shape[0]),
+                 'acc_full': af, 'oracle_in': oi, 'excess': ex,
+                 'exits': 'designed', 'joint': True})
+    print(f"  seed {c['seed']}   excess {ex:+6.2f} pt   "
+          f"full compute {af:5.2f} %   in-seed oracle {oi:5.2f} %")
+
+msd = pd.DataFrame(rows)
+
+# The paired comparison: Study 3's joint runs, ATTACHED exits, same statistic.
+att = []
+for _, r in measured_runs(methods=('jointexit',)).iterrows():
+    if r['arch'] == ARCH:
+        continue
+    c2, *_rest = exit_tables(r['run_id'])
+    c2 = c2.astype(bool)
+    att.append({'arch': r['arch'], 'seed': r['seed'], 'run_id': r['run_id'],
+                'n_exits': c2.shape[1], 'n_samples': int(c2.shape[0]),
+                'acc_full': float(c2[:, -1].mean()) * 100.0,
+                'oracle_in': float(c2.any(axis=1).mean()) * 100.0,
+                'excess': excess_from_correct(c2),
+                'exits': 'attached', 'joint': True})
+attached = pd.DataFrame(att)
+
+print()
+print('attached exits, jointly trained (Study 3 Q1):')
+for _, r in attached.iterrows():
+    print(f"  {r['arch']:12s} s{r['seed']}   excess {r['excess']:+6.2f} pt")
+
+out = pd.concat([msd, attached], ignore_index=True)
+M.save_analysis(sess.data_dir, 's4_msdnet', out)
+print()
+print(f'wrote s4_msdnet.csv  ({len(out)} rows)')
+"""),
+        code("""
+n_ok = int((msd['excess'] >= 2.0).sum())
+print(f'H5 (>= 2.0 pt, 2 of 2 seeds): {n_ok} of {len(msd)} -> '
+      f'{"SUPPORTED" if n_ok == len(msd) else "NOT SUPPORTED"}')
+print()
+
+m = float(msd['excess'].mean())
+a = float(attached['excess'].mean()) if len(attached) else float('nan')
+print(f'  designed exits (MSDNet)      {m:+6.2f} pt   (mean of {len(msd)} seeds)')
+print(f'  attached exits (Study 3 Q1)  {a:+6.2f} pt   (mean of {len(attached)} runs)')
+print(f'  difference                   {m - a:+6.2f} pt')
+print()
+
+# The three-way outcome, scored exactly as pre-registered. The third branch is
+# not a failure -- it is a sharper claim, and it is printed as one.
+if m >= 2.0:
+    print('*** THE CLAIM IS ARCHITECTURE-INDEPENDENT. ***')
+    print('The excess is not an artifact of attaching exits: it survives on a')
+    print('network whose classifiers were designed in, reading coarse features')
+    print('that have already seen most of the image. This is the strongest')
+    print('available outcome and it widens the paper\\'s scope.')
+elif m >= 0.5:
+    print('*** PRESENT BUT ATTENUATED. ***')
+    print('Report both numbers and attribute the gap to architecture. Do NOT')
+    print('average designed and attached into a mean that describes neither.')
+else:
+    print('*** THE EXCESS IS A PROPERTY OF ATTACHED EXITS. ***')
+    print('This is not a failure -- 01_PROTOCOL.md says so in advance. It is a')
+    print('SHARPER and more actionable claim than the one we currently have:')
+    print('  "oracle early-exit bounds are inflated for post-hoc and jointly')
+    print('   trained ATTACHED exits, and sound for architectures with')
+    print('   DESIGNED exits."')
+    print('Report it with equal prominence and rewrite the abstract around it.')
+
+print()
+print('Record the verdict in study4/03_LOG.md, then run S4_NB3_Publish.')
+"""),
+    ])
+
+
+# ---------------------------------------------------------------------------
 # S4_NB3 -- publish
 # ---------------------------------------------------------------------------
 def nb3():
@@ -1002,7 +1553,11 @@ def nb3():
         md("""
 # S4_NB3 — publish, once, at the end
 
-**Run last, with a network.** Nothing else in Study 4 touches HuggingFace.
+**Run last, with a network** — after `S4_NB4_MSDNet`, despite the lower number.
+NB3 was written and executed before P3 existed; renaming a notebook you have
+already run is worse than a number out of order.
+
+Nothing else in Study 4 touches HuggingFace.
 
 Same design as `S3_NB5_Publish`, with the fix that notebook needed:
 `resolve_meta` lives on `BackgroundUploader`, not `MSCHub`, so the verification
@@ -1010,6 +1565,54 @@ call is made directly.
 """),
         code(bootstrap_cell()),
         code(paths_cell(phase="analysis", hf=True)),
+        md("""
+---
+## What of Study 4 is actually on disk?
+
+Publishing half of Study 4 and believing it complete is the failure this cell
+exists to prevent — the same shape as the HF false negatives in Study 3, where
+a *truncated listing* was read as evidence of absence. Here the risk runs the
+other way: a successful upload of an incomplete tree looks identical to a
+successful upload of a complete one.
+
+This does not refuse to publish. A partial upload is often what you want
+mid-study. It refuses to let you publish partially **without being told**.
+"""),
+        code("""
+EXPECTED = {
+    's4_bootstrap.csv':       'P0 -- bootstrap CIs on the excess',
+    's4_baselines.csv':       'P1 -- margin / patience / confidence routing',
+    's4_imagenet_excess.csv': 'P2 -- ImageNet-100 + transformer',
+    's4_msdnet.csv':          'P3 -- MSDNet, designed exits (H5)',
+}
+adir = Path(MSC_ROOT) / 'analysis'
+have, absent = [], []
+for fn, what in EXPECTED.items():
+    p = adir / fn
+    if p.is_file() and p.stat().st_size > 0:
+        have.append(fn)
+        print(f'  [ON DISK] {fn:24s} {p.stat().st_size:>8,} B   {what}')
+    else:
+        absent.append(fn)
+        print(f'  [ABSENT ] {fn:24s} {"":>8}     {what}')
+
+fig = Path(MSC_ROOT) / 'paper' / 'figures' / 'fig1_headroom.png'
+print(f'  [{"ON DISK" if fig.is_file() else "ABSENT "}] '
+      f'{"fig1_headroom.png":24s} {"":>8}     P0 -- Figure 1')
+
+print()
+if absent:
+    print(f'{len(absent)} of {len(EXPECTED)} Study 4 artifacts are NOT on disk:')
+    for fn in absent:
+        print(f'    {fn}  ->  {EXPECTED[fn]}')
+    print()
+    print('Publishing now uploads a PARTIAL Study 4. That is fine if you meant')
+    print('it. If you did not, run the notebook that produces the missing file')
+    print('first -- s4_msdnet.csv comes from S4_NB4_MSDNet.')
+else:
+    print(f'all {len(EXPECTED)} Study 4 artifacts present -- this is a complete '
+          'publish')
+"""),
         md("""
 ---
 ## Check the token BEFORE uploading anything
@@ -1125,7 +1728,12 @@ NOTEBOOKS = {
     "S4_NB0_Figures.ipynb": nb0,
     "S4_NB1_Baselines.ipynb": nb1,
     "S4_NB2_ImageNet.ipynb": nb2,
-    "S4_NB3_Publish.ipynb": nb3,
+    "S4_NB4_MSDNet.ipynb": nb4,
+    "S4_NB3_Publish.ipynb": nb3,      # LAST, despite the number -- see its
+                                      # header. NB3 was written and run before
+                                      # P3 existed; renaming a notebook the
+                                      # user has already executed is worse than
+                                      # a number that is out of order.
 }
 
 

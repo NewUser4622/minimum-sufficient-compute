@@ -13,7 +13,7 @@ live in this repository:
 | **Study 1 · ImageNet-100** | 130k @ 224px | 40× data, 49× pixels | 2 (pilot) + 3 students | pilot complete — [`docs/imagenet100/26_IN100_FINDINGS.md`](docs/imagenet100/26_IN100_FINDINGS.md) |
 | **Study 2** | CIFAR-100, re-analysed | — | 15 | **complete** — [`study2/PAPER.md`](study2/PAPER.md) |
 | **Study 3** | CIFAR-100 | — | 3 + pruning | **complete** — [`study3/04_FINDINGS.md`](study3/04_FINDINGS.md) |
-| **Study 4** | CIFAR-100 + ImageNet-100 | 32px + 224px | 2 + MSDNet | **planned** — [`study4/README.md`](study4/README.md) |
+| **Study 4** | CIFAR-100 + ImageNet-100 | 32px + 224px | 2 + MSDNet | **P0–P2 complete, P3 built** — [`study4/README.md`](study4/README.md) |
 
 **Study 3 runs offline.** Training and analysis notebooks never touch the network; `S3_NB5_Publish` uploads the finished tree in one pass at the end.
 
@@ -153,11 +153,12 @@ HuggingFace at
 ### Verification
 
 ```
-python src/msc_lib.py --selftest        461 checks
+python src/msc_lib.py --selftest        483 checks
 python tools/s2_canaries.py               3
 python tools/s2_routing_canaries.py      18
 python tools/s3_canaries.py              75
-python tools/s4_harness.py               executes S4_NB0/NB1 on known data
+python tools/s4_msdnet_canaries.py       47  (each proven able to fail)
+python tools/s4_harness.py               executes S4_NB0/NB1/NB4 on known data
 python tools/s3_nb0_harness.py           executes S3_NB0 on known data
 python tools/s3_nb3_harness.py           executes S3_NB3 on known data
 python tools/check_links.py              every doc cross-reference resolves

@@ -59,6 +59,10 @@ def parse_run_id(r):
     return {"run_id": r, "phase": ph, "arch": arch, "dataset": ds,
             "method": meth, "seed": int(sd[1:])}
 M.parse_run_id = parse_run_id
+# D-90: measured_runs consults ZOO to keep probe architectures (atlas=False)
+# out of the study population. The real ZOO carries atlas=False on msdnet.
+M.ZOO = {a: {'atlas': True} for a in ARCHS}
+M.ZOO['msdnet'] = {'atlas': False}
 M.save_analysis = lambda *a, **k: None
 sess = types.SimpleNamespace(data_dir="/tmp", work="/tmp/s3fake")
 

@@ -133,9 +133,25 @@ maintains multiple scales throughout and places classifiers on them by design.
 If the excess is an artifact of *attaching* exits rather than *designing* them,
 MSDNet is where that shows.
 
-**Design.** MSDNet on CIFAR-100, the standard configuration, 2 seeds. Measured
-with the same code as everything else — that invariance is the point of the
-paired design.
+**Design.** MSDNet on CIFAR-100, 2 seeds. Measured with the same code as
+everything else — that invariance is the point of the paired design.
+
+> **BUILT 2026-09-01, not yet run.** `notebooks_study4/S4_NB4_MSDNet.ipynb`.
+> Configuration as registered in `msc_lib.ZOO`: 3 scales × 20 multi-scale dense
+> layers, base 16, growth 6, exits at layers 4/8/12/16/20 (exactly
+> `DEPTH_FRACTIONS`), widths 160/256/352/448/544. Trained **jointly**, because
+> MSDNet trains all its classifiers jointly by design — so the comparator is
+> Study 3's **joint** runs (8.55 / 9.15 / 10.64 pt), not the frozen ones.
+>
+> **Cost revised down: ~5 GPU-h, not ~15.** The original figure predated the
+> architecture. At ≈ 0.24 GFLOPs against `resnet32x4`'s ≈ 1.09 it is ~2.5 h per
+> seed. Still an estimate; the notebook times epoch 1 and extrapolates.
+>
+> **`msdnet` is a probe, not an atlas entry** (`atlas=False`). It is excluded
+> from `zoo_for_dataset` and from every notebook's `measured_runs`, so the
+> study population stays at the 15 architectures Studies 1–3 measured. Adding
+> it without that guard would have moved the published P0 intervals — see D-90
+> in `03_LOG.md`.
 
 **H5 (pre-registered).**
 
@@ -172,6 +188,19 @@ than the one we currently have, and it must be reported with equal prominence.
 - **Our MSDNet is not the real MSDNet.** A re-implementation can differ from the
   published architecture in ways that matter. Record the configuration and cite
   the source; if H5 lands near a threshold, that ambiguity is load-bearing.
+  **Deviations, recorded in `msc_lib.msdnet_channel_spec`:** no bottleneck (1×1)
+  convolutions, no channel-reduction transitions, and the project's standard
+  linear `ExitHead` in place of MSDNet's two-conv classifier. The last is
+  deliberate — holding the head fixed across every architecture is what makes
+  P3 a statement about the backbone — and it means a weak H5 cannot be blamed
+  on a changed head.
+- **MSDNet has no `REFERENCE_ACC` entry, so there is no recipe check.** Every
+  number in that table is a published figure for a specific architecture; ours
+  is a re-implementation, and inventing a reference would be worse than having
+  none. The notebook substitutes an explicit **floor** (55 %, below
+  `mobilenetv2`'s 64.60) and labels it as weaker than `recipe_ok`. An
+  undertrained MSDNet would make H5 a statement about training, not about
+  designed exits.
 - **One seed at ImageNet scale.** Valid for the identity, but no interval.
 - **Entropy remains untested** as a baseline (logits not stored).
 - **CIFAR-100 and ImageNet-100 are both small.** Neither is ImageNet-1k.

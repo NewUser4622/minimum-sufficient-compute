@@ -79,6 +79,9 @@ def parse(r):
     return {"run_id": r, "phase": ph, "arch": arch, "dataset": ds,
             "method": meth, "seed": int(sd[1:])}
 M.parse_run_id = parse
+# D-90: measured_runs consults ZOO to keep probe architectures (atlas=False)
+# out of the study population. The real ZOO carries atlas=False on msdnet.
+M.ZOO = {'msdnet': {'atlas': False}}   # anything absent defaults to atlas=True
 sess = types.SimpleNamespace(work="/tmp/s3nb3", data_dir="/tmp")
 for r in RUNS:
     (Path("/tmp/s3nb3") / r / "per_sample").mkdir(parents=True, exist_ok=True)

@@ -3905,6 +3905,125 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any, List[str], str]:
 # Feature tensors are (B, C, H, W) for convolutional families and (B, N, C) for
 # ViT / Mixer. ExitHead dispatches on rank, so nothing downstream cares.
 
+
+# --------------------------------------------------------------------------
+# MSDNet channel bookkeeping -- deliberately TORCH-FREE
+# --------------------------------------------------------------------------
+# Every other backbone in the zoo is torchvision's or a well-worn CIFAR recipe.
+# MSDNet is the one architecture this project WRITES, which makes its channel
+# arithmetic the one piece of zoo code with no external reference to check it
+# against. Two-scale dense growth is exactly the kind of bookkeeping that is
+# wrong by a factor of two and still runs.
+#
+# So the arithmetic lives here, in pure Python, and the nn.Modules below are
+# built by READING this spec rather than by recomputing it. One source of
+# truth, and -- because it needs no torch -- one that `tools/s4_msdnet_canaries.py`
+# can execute in an environment that has never seen a GPU. D-89's lesson was
+# that a canary a broken function passes is not a canary; a canary that cannot
+# run at all is worse.
+def msdnet_channel_spec(n_scales: int = 3, n_steps: int = 5, step: int = 4,
+                        base: int = 16, growth: int = 6,
+                        in_res: int = 32) -> Dict[str, Any]:
+    """Channel and resolution plan for `MSDNetBackbone`.
+
+    MSDNet (Huang et al., ICLR 2018, arXiv:1703.09844) keeps `n_scales`
+    resolutions alive through the whole network instead of downsampling once
+    and for all. Each layer grows every scale by a few channels, computed from
+    the SAME scale and from the next FINER one, and classifiers read the
+    coarsest scale -- which is why its early exits see coarse, already-global
+    features rather than the fine, local ones an attached head is stuck with.
+    That difference is the entire point of P3.
+
+    Structure per layer, at scale s (0 = finest):
+
+        g_s              = growth * 2**s              channels added
+        s == 0           g_0 from a 3x3 stride-1 conv on scale 0
+        s  > 0           g_s//2 from a 3x3 stride-1 conv on scale s
+                       + g_s-g_s//2 from a 3x3 stride-2 conv on scale s-1
+        out_s            = concat(in_s, new_s)        dense, nothing discarded
+
+    `n_steps` stages of `step` layers each give `n_steps` exits at exactly
+    DEPTH_FRACTIONS, so no exit is dropped for want of depth.
+
+    Deviations from the published architecture, recorded because
+    `study4/01_PROTOCOL.md` names "our MSDNet is not the real MSDNet" as the
+    thing that would make H5 wrong:
+
+      * no bottleneck (1x1) convs -- the paper uses them to cap the cost of
+        dense growth; we cap it by choosing a small `growth` instead;
+      * no channel-reduction transitions between stages;
+      * exits are the project's standard linear `ExitHead` on pooled features,
+        not MSDNet's two-conv classifier. This one is deliberate and
+        load-bearing: every other architecture in the study is measured with
+        that head, and holding the head fixed is what makes P3 a statement
+        about the BACKBONE.
+
+    Returns a plain dict -- no torch, no modules -- so it can be asserted
+    against in any interpreter.
+    """
+    if n_scales < 1:
+        raise ValueError(f"n_scales must be >= 1, got {n_scales}")
+    if n_steps < 1:
+        raise ValueError(f"n_steps must be >= 1, got {n_steps}")
+    if step < 1:
+        raise ValueError(f"step must be >= 1, got {step}")
+    if base < 1:
+        raise ValueError(f"base must be >= 1, got {base}")
+    if growth < 1:
+        raise ValueError(f"growth must be >= 1, got {growth}")
+    # The coarsest scale is in_res / 2**(n_scales-1). If that does not divide
+    # evenly the stride-2 convs silently floor, the two branches feeding a
+    # scale disagree on spatial size, and torch.cat raises 20 layers later with
+    # a message that names neither the scale nor the resolution.
+    shrink = 2 ** (n_scales - 1)
+    if in_res % shrink:
+        raise ValueError(
+            f"in_res={in_res} is not divisible by 2**(n_scales-1)={shrink}; "
+            f"scale {n_scales - 1} would land on a fractional resolution")
+
+    resolutions = [in_res // (2 ** s) for s in range(n_scales)]
+    stem_out = [base * (2 ** s) for s in range(n_scales)]
+    # Scale 0 reads the image; every coarser scale reads the scale above it.
+    stem = [dict(scale=s, cin=(3 if s == 0 else stem_out[s - 1]),
+                 cout=stem_out[s], stride=(1 if s == 0 else 2),
+                 res=resolutions[s])
+            for s in range(n_scales)]
+
+    ch = list(stem_out)
+    layers: List[List[Dict[str, Any]]] = []
+    for _ in range(n_steps * step):
+        layer = []
+        for s in range(n_scales):
+            g = growth * (2 ** s)
+            if s == 0:
+                parts = [dict(src="same", cin=ch[0], cout=g, stride=1)]
+            else:
+                half = g // 2
+                parts = [dict(src="same", cin=ch[s], cout=half, stride=1),
+                         dict(src="finer", cin=ch[s - 1], cout=g - half,
+                              stride=2)]
+            grew = sum(p["cout"] for p in parts)
+            if grew != g:
+                raise AssertionError(                       # pragma: no cover
+                    f"scale {s}: parts add to {grew}, expected {g}")
+            layer.append(dict(scale=s, growth=g, cin=ch[s], cout=ch[s] + g,
+                              res=resolutions[s], parts=parts))
+        layers.append(layer)
+        ch = [d["cout"] for d in layer]
+
+    cuts = tuple(step * (i + 1) for i in range(n_steps))
+    coarse = n_scales - 1
+    # Closed form: after c layers, scale s holds 2**s * (base + c*growth).
+    # The canaries check this against the accumulation above -- two derivations
+    # of the same number, so a slip in either one shows up as a disagreement.
+    feature_dims = tuple((2 ** coarse) * (base + c * growth) for c in cuts)
+    return dict(n_scales=n_scales, n_steps=n_steps, step=step, base=base,
+                growth=growth, in_res=in_res, resolutions=resolutions,
+                stem_out=stem_out, stem=stem, layers=layers, cuts=cuts,
+                feature_dims=feature_dims, n_layers=n_steps * step,
+                final_channels=tuple(ch))
+
+
 if _TORCH_OK:
 
     class StagedBackbone(nn.Module):
@@ -4718,6 +4837,143 @@ if _TORCH_OK:
         bb.classifier = nn.Linear(c, num_classes)
         return bb
 
+    # ------------------------------------------------------------- MSDNet
+    # The only architecture in the zoo with exits by DESIGN rather than by
+    # attachment. See `msdnet_channel_spec` above for the structure and for
+    # the deviations from the published network.
+    #
+    # The trick that keeps this cheap: an MSD layer takes a LIST of S feature
+    # maps and returns a list of S feature maps, so it still satisfies
+    # StagedBackbone's "blocks are a chain" assumption and inherits
+    # `_run_to`, `stage_cuts`, `depth_fractions` and the probe unchanged. Only
+    # the three methods that collapse a stage to one tensor are overridden,
+    # and they all collapse the same way: take the COARSEST scale.
+    class _MSDStem(nn.Module):
+        """Image -> one feature map per scale."""
+
+        def __init__(self, spec: Dict[str, Any]):
+            super().__init__()
+            self.convs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(d["cin"], d["cout"], 3, d["stride"], 1,
+                              bias=False),
+                    nn.BatchNorm2d(d["cout"]),
+                    nn.ReLU(inplace=True))
+                for d in spec["stem"]])
+
+        def forward(self, x):
+            outs, h = [], x
+            for conv in self.convs:
+                h = conv(h)            # each scale reads the one above it
+                outs.append(h)
+            return outs
+
+    class _MSDLayer(nn.Module):
+        """One multi-scale dense layer: S feature maps in, S feature maps out.
+
+        Nothing is discarded -- each scale's output is its input concatenated
+        with the new channels, which is what makes the growth `dense`.
+        """
+
+        def __init__(self, layer_spec: Sequence[Dict[str, Any]]):
+            super().__init__()
+            self.branches = nn.ModuleList()
+            self.sources: List[List[str]] = []
+            for sl in layer_spec:
+                mods, srcs = nn.ModuleList(), []
+                for p in sl["parts"]:
+                    mods.append(nn.Sequential(
+                        nn.Conv2d(p["cin"], p["cout"], 3, p["stride"], 1,
+                                  bias=False),
+                        nn.BatchNorm2d(p["cout"]),
+                        nn.ReLU(inplace=True)))
+                    srcs.append(p["src"])
+                self.branches.append(mods)
+                self.sources.append(srcs)
+
+        def forward(self, xs):
+            out = []
+            for s, mods in enumerate(self.branches):
+                new = [m(xs[s] if src == "same" else xs[s - 1])
+                       for m, src in zip(mods, self.sources[s])]
+                out.append(torch.cat([xs[s]] + new, dim=1))
+            return out
+
+    class MSDNetBackbone(StagedBackbone):
+        """Multi-scale dense network with classifiers on the coarsest scale.
+
+        `forward_prefix(x, k)` runs the stem and the first `stage_cuts[k]` MSD
+        layers and stops -- every scale up to that layer, nothing after it.
+        That is the honest cost of an MSDNet exit: a real MSDNet also computes
+        all scales up to the block it exits from. The FLOPs profiler sees the
+        same truncated module, so rho is measured, not asserted.
+        """
+
+        is_token_model = False
+        supports_native_resolution = True
+
+        def _coarsest(self, feats):
+            """Collapse a stage's S feature maps to the one the exit reads.
+
+            MSDNet puts its classifiers on the coarsest scale, and that choice
+            is the architectural claim under test: a coarse feature map at
+            layer 4 has already seen most of the image, whereas an attached
+            head at 20 % depth is reading a fine, local one.
+            """
+            return feats[-1]
+
+        def forward_prefix(self, x, k: int):
+            k = max(0, min(k, len(self.stage_cuts) - 1))
+            return self._coarsest(self._run_to(x, self.stage_cuts[k]))
+
+        def forward_features(self, x) -> List["torch.Tensor"]:
+            feats, h, prev = [], self.stem(x), 0
+            for c in self.stage_cuts:
+                for i in range(prev, c):
+                    h = self.blocks[i](h)
+                prev = c
+                feats.append(self._coarsest(h))
+            return feats
+
+        def forward(self, x):
+            h = self._coarsest(self._run_to(x, len(self.blocks)))
+            if self.final_norm is not None:
+                h = self.final_norm(h)
+            return self.classifier(self.pooled(h))
+
+    def build_msdnet(num_classes: int = 100, n_scales: int = 3,
+                     n_steps: int = 5, step: int = 4, base: int = 16,
+                     growth: int = 6, probe_res: int = 32) -> "MSDNetBackbone":
+        """MSDNet sized for CIFAR-100: 3 scales, 20 layers, 5 exits.
+
+        `n_steps=5` with DEPTH_FRACTIONS=(0.2,...,1.0) puts the cuts at layers
+        4/8/12/16/20 exactly, so K=5 like every other CIFAR architecture and
+        the exit index means the same thing across the study.
+        """
+        spec = msdnet_channel_spec(n_scales=n_scales, n_steps=n_steps,
+                                   step=step, base=base, growth=growth,
+                                   in_res=probe_res)
+        bb = MSDNetBackbone(_MSDStem(spec),
+                            [_MSDLayer(l) for l in spec["layers"]],
+                            nn.Identity(), probe_res=probe_res)
+        # ASK THE MODEL, then hold it to the spec (rule 2). `feature_dims` came
+        # from a real forward pass; the spec derived them in closed form. If a
+        # concat is wired to the wrong scale both still produce five numbers,
+        # and only the comparison notices.
+        if tuple(bb.feature_dims) != tuple(spec["feature_dims"]):
+            raise AssertionError(
+                f"MSDNet feature dims disagree: probed {tuple(bb.feature_dims)} "
+                f"vs spec {tuple(spec['feature_dims'])}. The module and "
+                f"msdnet_channel_spec have diverged -- fix the module, not "
+                f"this assertion.")
+        if tuple(bb.stage_cuts) != tuple(spec["cuts"]):
+            raise AssertionError(
+                f"MSDNet stage cuts {tuple(bb.stage_cuts)} != spec "
+                f"{tuple(spec['cuts'])}; n_steps must equal len(DEPTH_FRACTIONS)")
+        bb.msd_spec = spec
+        bb.classifier = nn.Linear(spec["feature_dims"][-1], num_classes)
+        return bb
+
 
 # --------------------------------------------------------------------------
 # Zoo registry
@@ -4747,6 +5003,21 @@ ZOO: Dict[str, Dict[str, Any]] = {
     "convnext_femto": dict(family="convnext", builder=("convnext_femto", dict())),
     "vit_tiny":     dict(family="vit",    builder=("vit_tiny", dict())),
     "mixer_nano":   dict(family="mixer",  builder=("mixer_nano", dict())),
+    # The only entry whose exits are DESIGNED rather than attached. Its own
+    # family, because grouping it with "resnet" would corrupt Q3's
+    # within-family-transfer comparison with an architecture that shares no
+    # structure with a ResNet.
+    #
+    # `atlas=False` KEEPS IT OUT OF THE STUDY POPULATION, and that flag is the
+    # whole reason this entry is safe to add. Studies 1-3 measured 15
+    # architectures x 3 seeds; PAPER.md says "15" in four places and
+    # PAPER_CLAIM.md in one. A plain registry entry would have made
+    # zoo_for_dataset return 16, so every downstream sweep would have planned a
+    # 16th architecture with no runs behind it -- the atlas would have grown a
+    # column that the published claims do not cover, without a single error.
+    # MSDNet is a Study 4 probe of ONE hypothesis (H5) and is requested by name.
+    "msdnet":       dict(family="msdnet", atlas=False,
+                         builder=("msdnet", dict())),
 
     # ---------------------------------------------------- ImageNet-100, 224 px
     # Eight architectures crossing the CNN/attention boundary four different
@@ -4794,10 +5065,23 @@ TRANSFORMER_LIKE = {"vit_tiny", "mixer_nano", "convnext_femto",
 DEIT_RECIPE = {"deit_small"}
 
 
-def zoo_for_dataset(dataset: str) -> List[str]:
-    """Every architecture belonging to this dataset's zoo, in registry order."""
+def zoo_for_dataset(dataset: str, include_probes: bool = False) -> List[str]:
+    """Every architecture in this dataset's ATLAS population, registry order.
+
+    "Atlas population" and "everything buildable" are not the same set, and
+    conflating them is how a paper ends up claiming a sample size it does not
+    have. An entry carrying `atlas=False` is a targeted probe for one
+    hypothesis -- `msdnet` for Study 4's H5 -- and is excluded here so that
+    sweeps, preflights and `all_configs` keep planning exactly the 15
+    architectures Studies 1-3 measured.
+
+    Pass `include_probes=True` to get the full buildable set. Nothing that
+    feeds a published table should.
+    """
     want = dataset_spec(dataset)["zoo"]
-    return [a for a, m in ZOO.items() if m.get("zoo", "cifar") == want]
+    return [a for a, m in ZOO.items()
+            if m.get("zoo", "cifar") == want
+            and (include_probes or m.get("atlas", True))]
 
 
 def build_model(arch: str, num_classes: Optional[int] = None,
@@ -4839,7 +5123,7 @@ def build_model(arch: str, num_classes: Optional[int] = None,
         "resnet": build_resnet_cifar, "wrn": build_wrn, "vgg": build_vgg,
         "mobilenetv2": build_mobilenetv2, "shufflenetv2": build_shufflenetv2,
         "convnext_femto": build_convnext_femto, "vit_tiny": build_vit_tiny,
-        "mixer_nano": build_mixer_nano,
+        "mixer_nano": build_mixer_nano, "msdnet": build_msdnet,
         # ImageNet-100
         "resnet_in": build_resnet_imagenet, "vgg_in": build_vgg_imagenet,
         "shufflenetv2_in": build_shufflenetv2_imagenet,
@@ -14754,6 +15038,90 @@ def _selftest() -> bool:
           {"resnet", "wrn", "vgg", "mobile", "vit", "mixer"}
           <= {v["family"] for v in ZOO.values()})
 
+    # --- the probe/atlas boundary (Study 4 H5) ------------------------------
+    # msdnet is buildable but must NEVER enter the study population. If this
+    # ever flips, every "15 architectures" in PAPER.md becomes a false
+    # statement about the sample -- silently, because a 16th architecture with
+    # no runs looks exactly like an architecture that has not been trained yet.
+    check("msdnet is registered", "msdnet" in ZOO)
+    check("msdnet is a PROBE, not part of the atlas",
+          ZOO["msdnet"].get("atlas", True) is False
+          and "msdnet" not in zoo_for_dataset("cifar100"),
+          "atlas=False keeps it out of sweeps, preflight and all_configs")
+    check("...but is reachable when asked for by name",
+          "msdnet" in zoo_for_dataset("cifar100", include_probes=True))
+    check("include_probes adds exactly the probes",
+          set(zoo_for_dataset("cifar100", include_probes=True))
+          - set(zoo_for_dataset("cifar100")) == {"msdnet"})
+    check("every non-probe CIFAR arch stays in the atlas",
+          all(ZOO[a].get("atlas", True) for a in zoo_for_dataset("cifar100")))
+    check("msdnet has its own family",
+          ZOO["msdnet"]["family"] == "msdnet"
+          and [a for a, v in ZOO.items() if v["family"] == "msdnet"] == ["msdnet"],
+          "grouping it with resnet would corrupt Q3 within-family transfer")
+
+    print("msdnet channel spec (torch-free)")
+    _sp = msdnet_channel_spec()
+    check("default spec is 3 scales x 20 layers -> 5 exits",
+          _sp["n_scales"] == 3 and _sp["n_layers"] == 20
+          and len(_sp["cuts"]) == len(DEPTH_FRACTIONS),
+          f"cuts={_sp['cuts']}")
+    check("cuts land exactly on DEPTH_FRACTIONS",
+          tuple(c / _sp["n_layers"] for c in _sp["cuts"]) == DEPTH_FRACTIONS,
+          f"{tuple(c / _sp['n_layers'] for c in _sp['cuts'])}")
+    # Two derivations of the same number. The accumulation walks the layers and
+    # adds; the closed form multiplies. A slip in either shows up here.
+    _acc, _drift = list(_sp["stem_out"]), []
+    for _i, _l in enumerate(_sp["layers"]):
+        for _d in _l:
+            if _d["cin"] != _acc[_d["scale"]]:
+                _drift.append(f"layer {_i} scale {_d['scale']}: "
+                              f"cin={_d['cin']} but running={_acc[_d['scale']]}")
+        _acc = [_d["cout"] for _d in _l]
+    check("each layer's declared cin equals the running channel count",
+          not _drift, "; ".join(_drift[:3]))
+    check("accumulated channels match the closed form",
+          tuple(_acc) == tuple((2 ** s) * (_sp["base"] + _sp["n_layers"] * _sp["growth"])
+                               for s in range(_sp["n_scales"])),
+          f"accumulated {tuple(_acc)}")
+    check("feature_dims read the COARSEST scale",
+          _sp["feature_dims"][-1] == _acc[-1] and _sp["feature_dims"][-1] > _acc[0],
+          f"{_sp['feature_dims']} vs final {tuple(_acc)}")
+    check("feature dims strictly ascend",
+          all(b > a for a, b in zip(_sp["feature_dims"], _sp["feature_dims"][1:])),
+          f"{_sp['feature_dims']}")
+    check("every layer's parts sum to its growth",
+          all(sum(p["cout"] for p in d["parts"]) == d["growth"]
+              and d["cout"] == d["cin"] + d["growth"]
+              for l in _sp["layers"] for d in l))
+    check("scale 0 has no finer neighbour to read",
+          all(l[0]["parts"][0]["src"] == "same" and len(l[0]["parts"]) == 1
+              for l in _sp["layers"]))
+    check("coarser scales fuse same-scale AND finer-scale, strided",
+          all(len(d["parts"]) == 2
+              and {p["src"] for p in d["parts"]} == {"same", "finer"}
+              and [p["stride"] for p in d["parts"] if p["src"] == "finer"] == [2]
+              for l in _sp["layers"] for d in l[1:]))
+    check("the finer branch reads the channel count that scale actually has",
+          all(p["cin"] == l[d["scale"] - 1]["cin"]
+              for l in _sp["layers"] for d in l[1:]
+              for p in d["parts"] if p["src"] == "finer"),
+          "off-by-one here builds a net that runs and is wrong")
+    check("stem halves resolution per scale",
+          _sp["resolutions"] == [32, 16, 8] and
+          [d["stride"] for d in _sp["stem"]] == [1, 2, 2])
+    check("stem scale s reads scale s-1",
+          [d["cin"] for d in _sp["stem"]] == [3] + _sp["stem_out"][:-1])
+    for _bad, _why in ((dict(n_scales=4, in_res=30), "in_res not divisible"),
+                       (dict(n_scales=0), "n_scales < 1"),
+                       (dict(step=0), "step < 1"),
+                       (dict(growth=0), "growth < 1")):
+        try:
+            msdnet_channel_spec(**_bad)
+            check(f"spec refuses {_why}", False, "it accepted the bad config")
+        except ValueError:
+            check(f"spec refuses {_why}", True)
+
     # --- the ImageNet-100 design, checked as a design -----------------------
     _in = set(zoo_for_dataset("imagenet100"))
     check("ImageNet zoo crosses the boundary four ways",
@@ -15532,7 +15900,7 @@ def _selftest() -> bool:
     check("absence is reported as absence", not budget_table_valid(
         None, "resnet50", "imagenet100")[0])
     if _TORCH_OK:
-        for a in ("resnet20", "vgg8", "vit_tiny", "mixer_nano"):
+        for a in ("resnet20", "vgg8", "vit_tiny", "mixer_nano", "msdnet"):
             try:
                 m = build_model(a, 10)
                 x = torch.randn(2, 3, 32, 32)
@@ -15542,6 +15910,45 @@ def _selftest() -> bool:
                       f"dims={m.feature_dims}")
             except Exception as e:
                 check(f"{a} builds and runs", False, f"{type(e).__name__}: {e}")
+
+        # MSDNet is the architecture we wrote, so it gets checked as an
+        # architecture and not merely as a thing that returns a tensor.
+        try:
+            _m = build_model("msdnet", 10).eval()
+            _x = torch.randn(2, 3, 32, 32)
+            with torch.no_grad():
+                _fs = _m.forward_features(_x)
+                _pre = [_m.forward_prefix(_x, k) for k in range(5)]
+            check("msdnet probed dims match the torch-free spec",
+                  tuple(_m.feature_dims) == tuple(_m.msd_spec["feature_dims"]),
+                  f"{tuple(_m.feature_dims)} vs {_m.msd_spec['feature_dims']}")
+            # Exits read the COARSEST scale: 8x8 at every depth, not 32x32.
+            # If a wiring slip made them read scale 0, this is what catches it.
+            check("every exit reads the coarsest scale (8x8)",
+                  all(f.shape[-1] == 8 and f.shape[-2] == 8 for f in _fs),
+                  f"{[tuple(f.shape) for f in _fs]}")
+            check("forward_prefix agrees with forward_features at every k",
+                  all(torch.allclose(a_, b_, atol=1e-5)
+                      for a_, b_ in zip(_pre, _fs)),
+                  "prefix must compute the same tensor the stage does")
+            # THE honest-cost check. forward_prefix(x, 0) must run 4 layers,
+            # not 20. A backbone that computes everything and slices costs full
+            # compute, and every rho it reports would be fiction (protocol 2.1).
+            _n_called = {"n": 0}
+            _hooks = [b.register_forward_hook(
+                lambda *_a, _c=_n_called: _c.__setitem__("n", _c["n"] + 1))
+                for b in _m.blocks]
+            try:
+                with torch.no_grad():
+                    _m.forward_prefix(_x, 0)
+            finally:
+                for h_ in _hooks:
+                    h_.remove()
+            check("forward_prefix(x,0) really stops -- 4 of 20 layers run",
+                  _n_called["n"] == 4, f"{_n_called['n']} layers executed")
+        except Exception as e:                                   # noqa: BLE001
+            check("msdnet architecture checks", False,
+                  f"{type(e).__name__}: {e}")
 
         # --- D-21: the MSC-KD training step must survive AMP autocast -------
         # This is the loss the entire method rests on, and NO test had ever run

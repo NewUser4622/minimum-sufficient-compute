@@ -36,11 +36,17 @@ and checked**.
 | **P0** | Figure 1 (ρ-sweep) + bootstrap CIs | free | **DONE — 3/3 CIs exclude zero** | `analysis/s4_bootstrap.csv`, `paper/figures/fig1_headroom.png` |
 | **P1** | margin + patience baselines | free | **DONE — H6 split: baselines agree, but headroom is NOT negative everywhere** | `analysis/s4_baselines.csv` |
 | **P2** | ImageNet-100 + transformer | ~20 GPU-h | **DONE — H4 and H4b SUPPORTED** | `runs/p6-*-jointexit-s1` |
-| **P3** | MSDNet, a designed early-exit net | ~15 GPU-h | **not built yet** — needs new zoo code, own pass | `runs/p7-msdnet-*` |
+| **P3** | MSDNet, a designed early-exit net | **~5 GPU-h** (revised) | **BUILT — ready to run.** `S4_NB4_MSDNet.ipynb` | `runs/p7-msdnet-*` |
 
-**Next action: update the manuscript.** H6's result materially qualifies the
-paper's central claim — the honest ceiling is **positive below ρ ≈ 0.65**, not
-negative everywhere. Then MSDNet (P3) is the last gap.
+**Next action: run `S4_NB4_MSDNet.ipynb`, then `S4_NB3_Publish.ipynb`.**
+The manuscript is updated for H6. P3 is the last gap before submission.
+
+> **The ~15 GPU-h estimate was wrong, and low is the safe direction.** It was a
+> guess made before the architecture existed. With the configuration now in the
+> zoo (3 scales × 20 layers, base 16, growth 6) MSDNet is ≈ 0.24 GFLOPs against
+> `resnet32x4`'s ≈ 1.09 — so **~2.5 GPU-h per seed, ~5 total**. That is still a
+> FLOPs estimate, not a measurement, so the notebook times epoch 1 and
+> extrapolates rather than trusting it.
 
 ---
 
@@ -54,6 +60,97 @@ Do not edit the prediction column.
 | **H4** | excess holds at ImageNet-100 scale | ≥ 2.0 pt, 2 of 2 | **7.39 / 6.91 pt** | **SUPPORTED** |
 | **H4b** | it holds on the **transformer** specifically | ≥ 2.0 pt | **6.91 pt** | **SUPPORTED** |
 | **H5** | excess holds on MSDNet | ≥ 2.0 pt, 2 of 2 seeds | _pending_ | _pending_ |
+
+---
+
+## 2026-09-01 (P3 build) · MSDNet enters the zoo — and immediately contaminates it
+
+No GPU time spent. This entry is about the architecture, the notebook, and one
+defect that the build itself produced.
+
+### What was added
+
+`msc_lib.MSDNetBackbone` — the first architecture this project **writes** rather
+than borrows. Three resolutions kept alive through 20 multi-scale dense layers;
+classifiers read the **coarsest** scale, which is the whole point: an exit at
+20 % depth sees a feature map that has already integrated most of the image,
+instead of the fine local one an attached head is stuck with.
+
+| | |
+|---|---|
+| config | 3 scales × 20 layers, base 16, growth 6, `in_res` 32 |
+| exits | 5, at layers 4/8/12/16/20 — exactly `DEPTH_FRACTIONS` |
+| exit widths | 160 / 256 / 352 / 448 / 544 |
+| trained | **jointly** (`joint_exits=True`, uniform) — MSDNet trains all classifiers jointly by design, so the comparison is against Study 3's **joint** runs |
+
+**Recorded deviations from Huang et al. (arXiv:1703.09844)**, because
+`01_PROTOCOL.md` names "our MSDNet is not the real MSDNet" as the thing most
+likely to make H5 wrong: no bottleneck convs, no channel-reduction transitions,
+and the project's standard linear `ExitHead` rather than MSDNet's two-conv
+classifier. **The third is deliberate** — every other architecture is measured
+with that head, and holding it fixed is what makes P3 a statement about the
+*backbone*.
+
+### The arithmetic is torch-free on purpose
+
+`msdnet_channel_spec()` is pure Python and is the **single source of truth**:
+the `nn.Module`s are built by reading it, not by recomputing it. So the
+bookkeeping is checkable on a machine with no GPU — which is the machine this
+was written on.
+
+`tools/s4_msdnet_canaries.py`: **47 checks**, and every predicate is run twice —
+once on the real spec where it must pass, once on a spec corrupted in the exact
+way that predicate exists to catch, where it must **fail**. A predicate passing
+both is reported as broken.
+
+**That caught one of my own canaries on its first run.** `p_closed_form` was
+paired with a mutation that relabelled `growth` without touching any width, so
+the predicate was blind to it. Fixed by writing a mutation that corrupts what
+the predicate actually reads. This is D-89's lesson applied one level up: *a
+canary a broken function passes is not a canary.*
+
+### D-90 — adding an architecture silently changed the study population
+
+`measured_runs` is a **directory scan**. The library keeps `msdnet` out of
+sweeps and preflight with `atlas=False`, but that flag governs what gets
+**planned** — it says nothing about what walking `runs/` finds.
+
+So the moment `S4_NB4` trains `p7-msdnet-cifar100-jointexit-s1`, S4_NB0's scan
+for jointexit runs would have grown from 3 attached-exit runs to 5 runs mixing
+attached and **designed** exits, and the **published P0 bootstrap intervals
+would have moved**. Nothing errors. The notebook just answers a different
+question.
+
+**Caught by `tools/s4_harness.py`**, whose synthetic runs carry a built-in
+excess of 9.0 pt for attached and 3.0 for MSDNet: the mean CI fell to ≈ 6.5 and
+the bracketing check failed. A canary over a population that can *change* is
+worth more than one over a fixed number.
+
+**Fixed** in both `build_notebooks_study3.py` and `build_notebooks_study4.py`:
+`measured_runs` now excludes `atlas=False` architectures by default, prints what
+it excluded, and takes `include_probes=True` for the rare caller that wants
+them. A source-level canary checks all 8 generated notebooks that define it.
+
+The same boundary is enforced in the library: `zoo_for_dataset` filters probes,
+so **the CIFAR atlas is still exactly 15 architectures** — the number PAPER.md
+claims in four places.
+
+### State
+
+| gate | |
+|---|---|
+| `msc_lib` selftest | **483/483** (was 461) |
+| `tools/s4_msdnet_canaries.py` | **47/47** |
+| `tools/s4_harness.py` | all pass, NB0 + NB1 + **NB4** |
+| Study 3 / Study 4 build gates | parse, names, and every `M.*`/`sess.*` resolves |
+
+**Not yet run.** Every architecture check in `S4_NB4` cell 4 ships unexecuted —
+this environment has no torch. That cell is the first thing the notebook does
+and it spends no GPU time: it verifies probed dims against the spec, that all
+five exits are 8×8 (**coarsest** scale, not finest), that `forward_prefix`
+agrees with `forward_features`, and — via forward hooks — that
+`forward_prefix(x, 0)` executes **4 of 20 layers** rather than computing
+everything and slicing. That last one is what makes ρ honest.
 
 ---
 

@@ -122,7 +122,7 @@ embarrassment into evidence that the final number was hard to get wrong.
 |---|---|---|
 | **TMLR** | limits/critique work is explicitly in scope; no novelty bar | **submit now** — nothing is missing for it |
 | **Pattern Recognition** / **Neural Networks** (Q1, Elsevier) | empirical-analysis papers welcome | **now viable** — the scale gap is closed (2 datasets, 2 scales, conv + transformer) |
-| **IEEE TPAMI / IJCV** (Q1) | wants architecture breadth | plausible **after MSDNet** (G1), the one remaining gap |
+| **IEEE TPAMI / IJCV** (Q1) | wants architecture breadth | plausible **after MSDNet** (G1) — built, one ~5 GPU-h run outstanding |
 | **NeurIPS/ICML D&B or main** | possible, but reviewers want a method | riskier than TMLR |
 
 **Recommendation: TMLR first.** It is the natural home for "the field's
@@ -137,7 +137,7 @@ experiment below.
 
 Ordered by how much each buys per GPU-hour.
 
-### G1 · A real early-exit architecture · ~15 GPU-h · **the biggest single win**
+### G1 · A real early-exit architecture · **~5 GPU-h · BUILT, awaiting one run**
 
 Our exits are heads on a staged backbone, trained jointly. The field uses
 **MSDNet** and **BranchyNet**, which are architecturally different (dense
@@ -146,10 +146,29 @@ multi-scale connections, exits designed in from the start).
 **Reviewer question:** *"does your identity hold on the architectures the claim
 is about?"* Right now: unknown.
 
-**Experiment.** Implement MSDNet on CIFAR-100, 2 seeds, measure the same
-identity. It is a per-run quantity so even one run answers it.
+**Experiment.** MSDNet on CIFAR-100, 2 seeds, measured with the same code. It is
+a per-run quantity so even one run answers it.
 **If the excess persists, Claim 1 becomes architecture-independent** and the
 paper's scope widens from "our setup" to "early-exit networks".
+
+> **Status 2026-09-01 — implemented and gated, not yet trained.**
+> `msc_lib.MSDNetBackbone` (3 scales × 20 dense layers, exits on the coarsest
+> scale) plus `notebooks_study4/S4_NB4_MSDNet.ipynb`. Cost revised from ~15 to
+> **~5 GPU-h** now that the architecture exists to be measured.
+>
+> **All three pre-registered outcomes are already written**, including the one
+> where H5 fails. If the excess vanishes on designed exits, the paper does not
+> lose a claim — it gains a sharper one: *"oracle early-exit bounds are inflated
+> for attached exits and sound for designed ones."* That is more actionable than
+> the current claim, and `study4/01_PROTOCOL.md` committed to reporting it with
+> equal prominence before the run.
+>
+> **Caveat that must survive into the manuscript:** this is a re-implementation
+> without bottleneck convs or channel-reduction transitions, and it uses the
+> project's standard linear exit head rather than MSDNet's two-conv classifier.
+> The last is deliberate — the head is held fixed across all 16 architectures,
+> so P3 is a statement about the backbone. If H5 lands near 2.0 pt, that
+> ambiguity is load-bearing and the paper must say so.
 
 ### G2 · Scale · ~~~25 GPU-h~~ · **DONE — objection closed**
 
@@ -202,9 +221,10 @@ Q1's joint runs are one seed per architecture. The identity does not need seeds,
 but reviewers expect error bars. Bootstrap over the **10,000 test samples** —
 that is a legitimate interval for a per-run quantity and it costs nothing.
 
-**Remaining to Q1-ready: ~15 GPU-h (MSDNet) plus a free re-run of S4_NB1.**
-G2, G4 and G5 are done; G3 needs only the re-run. The original estimate was
-~42 GPU-h and ~27 of those are spent.
+**Remaining to Q1-ready: ~5 GPU-h — one run of `S4_NB4_MSDNet`.**
+G2, G3, G4 and G5 are all done. G1 is built, canaried and costed; only the GPU
+time is outstanding. The original estimate was ~42 GPU-h, ~27 are spent, and the
+last gap turned out to be a third of what it was budgeted at.
 
 ---
 
@@ -281,8 +301,8 @@ with pre-registered thresholds in [`study4/01_PROTOCOL.md`](study4/01_PROTOCOL.m
 
 1. **G4 + G5 + G3** (free / ~2 GPU-h) → **submit Paper A to TMLR.**
 2. **Q3 rerun** (~6 GPU-h) → **submit Paper B.**
-3. **G1 MSDNet** (~15 GPU-h) → the architecture-independence result.
-4. **G2 ImageNet + transformer** (~25 GPU-h) → resubmit A to a JCR-Q1 journal.
+3. **G1 MSDNet** (~5 GPU-h, **built**) → the architecture-independence result.
+4. ~~G2 ImageNet + transformer~~ → **done**; A is JCR-Q1 ready once G1 lands.
 
 Steps 1 and 2 need almost no compute and produce two submissions. Steps 3 and 4
 are what turn "correct and careful" into "broad enough for TPAMI".

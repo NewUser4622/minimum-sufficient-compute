@@ -24,7 +24,7 @@ one phase below.
 |---|---|---|
 | *"only one baseline — what about entropy, patience, learned policies?"* | **P1** | **free** (partly) |
 | *"one dataset, 32px, no transformer"* | **P2** | ~20 GPU-h |
-| *"your architecture is not the one the claim is about"* | **P3** | ~15 GPU-h |
+| *"your architecture is not the one the claim is about"* | **P3** | **~5 GPU-h** |
 | *"no error bars, and your headroom curve is a table"* | **P0** | **free** |
 
 ---
@@ -35,7 +35,7 @@ one phase below.
 P0  figures + bootstrap intervals        free, CPU minutes   ── submit A ──▶
 P1  extra baselines (margin, patience)   free, CPU minutes
 P2  ImageNet-100 + a transformer         ~20 GPU-h           ── gate ──▶
-P3  MSDNet: a real early-exit network    ~15 GPU-h
+P3  MSDNet: a real early-exit network    ~5 GPU-h  (BUILT)
 ```
 
 **P0 and P1 cost nothing and make Paper A submittable.** Do them, submit to
@@ -88,7 +88,7 @@ is convolutional, and early-exit work is now largely transformer work.
 > not be used for planning**, and P2 carries a throughput gate in epoch 1 that
 > aborts if the layout regression has returned.
 
-### P3 — a real early-exit architecture · ~15 GPU-h · highest risk
+### P3 — a real early-exit architecture · ~5 GPU-h · BUILT, not yet run
 
 Our exits are heads on a staged backbone. The field means **MSDNet** and
 **BranchyNet**: multi-scale dense connections, exits designed in from the start.
@@ -100,6 +100,31 @@ Our exits are heads on a staged backbone. The field means **MSDNet** and
 rather than a new config flag — and this environment has no torch, so it ships
 unexecuted. The dry-run and shape canaries exist for exactly that.
 
+> **BUILT 2026-09-01 — run `notebooks_study4/S4_NB4_MSDNet.ipynb`.**
+>
+> 3 scales × 20 multi-scale dense layers, base 16, growth 6; exits at layers
+> 4/8/12/16/20 with widths 160/256/352/448/544; trained **jointly**, because
+> MSDNet trains all its classifiers jointly by design. The comparator is
+> therefore Study 3's **joint** runs, not the frozen ones.
+>
+> **Cost revised: ~5 GPU-h, not ~15.** The old figure predated the
+> architecture; at ≈ 0.24 GFLOPs it is ~2.5 h/seed. The notebook times epoch 1
+> and extrapolates rather than trusting that.
+>
+> **The unexecuted-code risk is handled in cell 4, before any GPU time.** It
+> verifies probed dims against the torch-free spec, that all five exits sit on
+> the **coarsest** scale (8×8, not 32×32 — if they read the finest, MSDNet
+> degenerates into the attached head it exists to be contrasted with), that
+> `forward_prefix` matches `forward_features`, and — via forward hooks — that
+> `forward_prefix(x, 0)` runs **4 of 20 layers** instead of computing
+> everything and slicing. `tools/s4_msdnet_canaries.py` covers the arithmetic
+> with 47 checks, each proven able to fail against a corrupted spec.
+>
+> **`msdnet` is a probe, not an atlas entry.** `atlas=False` keeps it out of
+> `zoo_for_dataset` and out of every notebook's `measured_runs`, so the study
+> population stays at 15 architectures. Without that guard, training it would
+> have silently moved the published P0 intervals — D-90 in `03_LOG.md`.
+
 ---
 
 ## What this buys
@@ -110,7 +135,7 @@ unexecuted. The dry-run and shape canaries exist for exactly that.
 | + P2 | credible at a JCR-Q1 journal (*Pattern Recognition*, *Neural Networks*) |
 | + P3 | architecture-independent; TPAMI/IJCV becomes arguable |
 
-**Total ~35 GPU-h**, of which the first two phases are free.
+**Total ~25 GPU-h**, of which the first two phases are free.
 
 ---
 

@@ -143,7 +143,17 @@ import numpy as np, pandas as pd
 
 runs_dir = Path(MSC_ROOT) / 'runs'
 
-def measured_runs(dataset='cifar100', methods=('base',), require=True):
+def measured_runs(dataset='cifar100', methods=('base',), require=True,
+                  include_probes=False):
+    '''Runs on disk that belong to the STUDY POPULATION.
+
+    D-90. This walks runs/, and `atlas=False` governs what gets PLANNED, not
+    what a directory scan finds. Once Study 4 trains
+    `p7-msdnet-cifar100-jointexit-s1`, an unfiltered scan for jointexit runs
+    would fold a DESIGNED-exit architecture into Study 3's attached-exit
+    population and move numbers that are already written up -- silently,
+    because a new run looks exactly like a run that was always there.
+    '''
     ids = sorted(d.name for d in runs_dir.iterdir()
                  if d.is_dir() and (d / 'per_sample' / 'test.parquet').exists())
     if not ids:
@@ -155,6 +165,14 @@ def measured_runs(dataset='cifar100', methods=('base',), require=True):
             raise RuntimeError(
                 f'parse_run_id did not yield a {col!r} column. Columns present: '
                 f'{list(df.columns)}. Run ids look like: {ids[:3]}')
+
+    if not include_probes:
+        probes = {a for a, m in M.ZOO.items() if not m.get('atlas', True)}
+        hit = df[df['arch'].isin(probes)]
+        df = df[~df['arch'].isin(probes)]
+        if len(hit):
+            print(f'excluded {len(hit)} probe run(s) from the study '
+                  f'population: {sorted(hit["run_id"])}')
 
     sel = df[(df['dataset'] == dataset) & (df['method'].isin(methods))]
     if require and sel.empty:
