@@ -51,9 +51,16 @@ out **larger**, not smaller: **8.55 / 9.15 / 10.64 pt** against 6.42 / 7.95 /
 on almost nothing, so they cannot rescue a sample the final layer gets wrong;
 rescues need competent exits, and the pool grows with exit quality.
 
-Study 3 Q2 then asked whether a *learned* gate can reach that gap. It captures
-**1.7 %** — and in-seed capture is no higher than cross-seed, so it is not even
-memorising noise: **there is nothing in the deployable signal to capture.**
+Study 3 Q2 then asked whether a *learned* gate can reach that gap **at
+ρ = 0.80**. It captures **1.7 %**, and in-seed capture is no higher than
+cross-seed, so it is not even memorising noise.
+
+**Study 4 closed the scale objection and qualified the claim.** The excess holds
+at 224 px on ImageNet-100 — `resnet50` **+7.39 pt**, `vit_small_p16`
+**+6.91 pt**, a vision transformer. But sweeping the compute budget, the honest
+cross-seed ceiling **changes sign at ρ ≈ 0.65**: negative above it, **positive
+below** (+7.74 pt at ρ = 0.40), with three independent exit rules agreeing
+within 1.8 pt. *"No headroom"* is true only at generous budgets.
 Q3 (does the memorisation collapse damage pruning?) came back inconclusive with
 a confounded design, recorded rather than re-cut. See
 [`study3/04_FINDINGS.md`](study3/04_FINDINGS.md).

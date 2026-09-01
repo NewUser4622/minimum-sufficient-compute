@@ -22,6 +22,18 @@ experiment. The gap analysis at the end is the part worth acting on.
 > Study 4 P0 adds bootstrap intervals on the CIFAR joint runs — 10.64
 > [10.00, 11.28], 8.55 [7.98, 9.10], 9.15 [8.61, 9.71] — **3 of 3 excluding
 > zero**, widths ~1.2 pt against effects of 8–11 pt.
+>
+> **AND A QUALIFICATION THAT MUST LEAD, NOT HIDE.** Study 4 P1 swept the honest
+> (cross-seed) ceiling across budgets. **It changes sign at ρ ≈ 0.65:**
+>
+> | ρ | 0.40 | 0.50 | 0.60 | 0.70 | 0.80 | 0.90 | 0.95 |
+> |---|---|---|---|---|---|---|---|
+> | honest headroom (pt) | **+7.74** | **+7.29** | **+3.74** | −3.05 | −8.30 | −13.13 | −14.98 |
+>
+> *"There is no headroom"* is therefore **true only at generous budgets**. At
+> the aggressive budgets where adaptive inference is actually motivated, a
+> cross-seed oracle beats a deployable baseline by **3–8 points**. This belongs
+> in the abstract.
 
 ### The one-paragraph version
 
@@ -35,9 +47,13 @@ when exits are trained jointly rather than post-hoc (8.6–10.6 pt), because
 rescuing a sample the final layer fails requires a *competent* early exit. Using
 a second training seed as an instrument, we show the excess does not survive a
 change of seed (optimism bias +22.4 pt), and that a learned per-exit gate reading
-the deployable signal recovers **1.7 %** of it. The headroom that motivates
-per-sample adaptive inference is therefore largely an artifact of scoring a
-network against itself.
+the deployable signal recovers **1.7 %** of it at ρ = 0.80. **The picture is
+budget-dependent**: sweeping ρ = 0.40–0.95, the honest cross-seed ceiling is
+negative above ρ ≈ 0.65 but **positive below it** (+7.7 pt at ρ = 0.40), with
+three independent exit rules agreeing within 1.8 points. So the *excess over
+full compute* is unreachable by construction, while genuine seed-transferable
+headroom does exist in the aggressive-budget regime that confidence
+thresholding fails to capture.
 
 ### Why this is a real contribution, not a straw man
 
@@ -59,7 +75,8 @@ unsafe.
 | **1** | the bound exceeds the network's own full accuracy | +6.86 pt on **90/90** CIFAR runs; **+7.39 / +6.91 pt** on ImageNet-100 @224 px incl. a **transformer**; bootstrap CIs exclude zero 3/3 | **very strong** — an identity, needs no seeds, now across two datasets, two scales and two architecture families |
 | **2** | it **grows** with better exits | frozen 6.4–8.0 → joint 8.6–10.6 pt, 3/3 architectures; survives conditioning on accuracy (+2.49 median) | **strong** — paired, one variable, mechanism explained |
 | **3** | it does not survive a change of seed | optimism bias **+22.4 pt**, 90 pairs | **medium** — see the caveat below |
-| **4** | a deployable gate recovers almost none of it | **1.7 %** cross-seed; in-seed no higher, so not noise-memorisation | **strong**, and it is a lower bound |
+| **4** | a deployable gate recovers almost none of it **at ρ = 0.80** | **1.7 %** cross-seed; in-seed no higher, so not noise-memorisation | **strong at that budget**, a lower bound, and **budget-specific** |
+| **5** | the honest ceiling is **budget-dependent**, positive below ρ ≈ 0.65 | +7.74 / +7.29 / +3.74 pt at ρ = 0.40 / 0.50 / 0.60, negative from 0.70 up; three exit rules agree within 1.78 pt | **strong** — 15 architectures, and it cross-checks Study 2 to 0.40 pt at ρ = 0.80 |
 
 **Claim 1 is the paper's spine.** It needs one trained network and its own
 per-exit predictions. No seeds, no instrument, no assumptions. A bound above
@@ -150,13 +167,18 @@ architectures measured.
 convolutional, and early-exit work is now largely transformer work (DE3-BERT is
 BERT). Reuse `notebooks_in100/`.
 
-### G3 · Baselines beyond confidence thresholding · **RUN, RESULTS VOID — re-run**
+### G3 · Baselines beyond confidence thresholding · **DONE**
 
-> **The first run is void (D-89).** `route_threshold`'s bisection was inverted,
-> so accuracy *fell* as the budget rose — impossible. The bug is fixed and
-> verified (cost now tracks the budget, accuracy monotone), but `S4_NB1` must be
-> re-run before H6 has an answer. Studies 2–3 are **unaffected**: they use a
-> different function whose direction was always correct.
+> **Completed 2026-08-20, after a re-run.** Confidence and margin agree within
+> **1.78 pt** at every budget; at matched cost confidence 58.03 %, margin
+> 58.18 %, patience 55.62 %. **Confidence was not a weak comparator**, so the
+> headroom numbers in Studies 2–3 stand. Entropy remains untested — logits were
+> never stored.
+>
+> The first run was void under D-89: an inverted bisection made accuracy *fall*
+> as the budget rose. Fixed, verified monotone, re-run. Studies 2–3 were
+> **unaffected** — they use a different function whose direction was correct,
+> and the two agree to 0.40 pt where they overlap.
 
 ### G3 · Baselines beyond confidence thresholding · ~2 GPU-h · **cheapest credibility**
 
@@ -224,8 +246,11 @@ Paper A being accepted.
 
 Rule 12 applies to our own manuscript.
 
-- **Not** "adaptive inference does not work." We measured one bound at one
-  scale, and Q2's gate is a lower bound.
+- **Not** "adaptive inference does not work." Study 4 P1 shows the opposite at
+  aggressive budgets: the honest ceiling is **positive below ρ ≈ 0.65**. The
+  negative result is specific to ρ ≥ 0.70.
+- **Not** "there is no headroom" without a budget attached. Stated loosely it is
+  contradicted by our own sweep.
 - **Not** "the excess cannot be reached by any router." A second seed cannot,
   and our gate on exit-local confidence cannot. A gate with pooled embeddings is
   untested.

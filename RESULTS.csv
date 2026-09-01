@@ -43,4 +43,15 @@ study,question,metric,scope,value,unit,source
 4,P2 ImageNet-100 @224px,"full-compute accuracy, vit_small_p16",1 seed,63.23,%,s4_imagenet_excess.csv
 4,P2 ImageNet-100 @224px,H4: excess >= 2.0 pt,2 of 2 archs,6.91,pt (min),s4_imagenet_excess.csv
 4,P2 ImageNet-100 @224px,H4b: the TRANSFORMER alone,vit_small_p16,6.91,pt,s4_imagenet_excess.csv
-4,P1 baselines,WITHHELD -- produced under D-89,re-run S4_NB1 with the fixed router,n/a,,s4_baselines.csv
+4,P1 honest headroom vs budget,"cross-seed oracle - confidence, rho=0.40",median over 15 CIFAR architectures,7.74,pt,s4_baselines.csv
+4,P1 honest headroom vs budget,"cross-seed oracle - confidence, rho=0.50",median over 15 CIFAR architectures,7.29,pt,s4_baselines.csv
+4,P1 honest headroom vs budget,"cross-seed oracle - confidence, rho=0.60",median over 15 CIFAR architectures,3.74,pt,s4_baselines.csv
+4,P1 honest headroom vs budget,"cross-seed oracle - confidence, rho=0.70",median over 15 CIFAR architectures,-3.05,pt,s4_baselines.csv
+4,P1 honest headroom vs budget,"cross-seed oracle - confidence, rho=0.80",median over 15 CIFAR architectures,-8.3,pt,s4_baselines.csv
+4,P1 honest headroom vs budget,"cross-seed oracle - confidence, rho=0.90",median over 15 CIFAR architectures,-13.13,pt,s4_baselines.csv
+4,P1 honest headroom vs budget,"cross-seed oracle - confidence, rho=0.95",median over 15 CIFAR architectures,-14.98,pt,s4_baselines.csv
+4,P1 honest headroom vs budget,budgets with POSITIVE honest headroom,confidence baseline,"[0.4, 0.5, 0.6]",rho,s4_baselines.csv
+4,P1 baseline independence,max |confidence - margin| headroom gap,the two rules that hit the budget exactly,1.78,pt,s4_baselines.csv
+4,P1 baseline strength,"confidence, at matched cost","median accuracy, never overspending",58.03,%,s4_baselines.csv
+4,P1 baseline strength,"margin, at matched cost","median accuracy, never overspending",58.18,%,s4_baselines.csv
+4,P1 baseline strength,"patience, at matched cost","median accuracy, never overspending",55.62,%,s4_baselines.csv

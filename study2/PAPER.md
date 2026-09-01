@@ -163,8 +163,20 @@ differences is not a difference of medians.)*
 merely smaller — it is negative, in **0 of 15** architectures positive, ranging
 from +15.93 pt (`resnet8x4`) to +32.18 pt (`mixer_nano`) of bias.
 
-**It is not an artifact of the operating point.** Sweeping the budget
-(`s2_headroom_sweep.csv`), honest headroom is negative everywhere:
+> **QUALIFIED by Study 4 P1 (2026-08-20).** The sweep below measures
+> **per-sample difficulty-score routing** against confidence. Study 4 swept the
+> **cross-seed oracle** against a deployable baseline over the same budgets and
+> found it changes sign: **positive at ρ ≤ 0.60** (+7.74 / +7.29 / +3.74 pt),
+> negative from ρ = 0.70 up. Both are correct about different quantities, and
+> where they overlap at ρ = 0.80 they agree to 0.40 pt (−7.90 vs −8.30).
+>
+> **Consequence for this paper: "no headroom" must always carry a budget.** The
+> negative result is specific to ρ ≥ 0.70; at the aggressive budgets that
+> motivate adaptive inference there is 3–8 points of genuine, seed-transferable
+> headroom that confidence thresholding does not capture.
+
+**Score routing is not an artifact of the operating point.** Sweeping the budget
+(`s2_headroom_sweep.csv`), per-score honest headroom is negative everywhere:
 
 | ρ | 0.40 | 0.50 | 0.60 | 0.70 | 0.80 | 0.90 | 0.95 |
 |---|---|---|---|---|---|---|---|

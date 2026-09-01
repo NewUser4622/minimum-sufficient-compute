@@ -67,6 +67,23 @@ remains negative at every operating point** ρ = 0.40–0.95.
 | honest headroom negative for all 3 baselines at all 7 budgets | **H6 supported** — the conclusion does not depend on the baseline |
 | any baseline shows positive honest headroom | **H6 falsified** — that baseline is the weak one, and the paper must lead with the strongest |
 
+> **RESULT 2026-08-20 — H6 SPLITS.**
+> **(a) baseline-independence: SUPPORTED.** Confidence and margin — the two
+> rules that hit the budget exactly — agree to within **1.78 pt** at every
+> operating point. At matched cost: confidence 58.03 %, margin 58.18 %,
+> patience 55.62 %. Confidence was not a weak comparator; R-04 did not fire.
+> **(b) "negative at every operating point": FALSIFIED.** Honest headroom is
+> **positive at ρ ≤ 0.60** (+7.74, +7.29, +3.74) and negative from ρ = 0.70
+> up, changing sign near ρ ≈ 0.65.
+>
+> This does not contradict Study 2, which swept per-sample *score* routing, a
+> different quantity. Where they overlap (ρ = 0.80) they agree to 0.40 pt
+> (−7.90 vs −8.30) — an independent cross-check across two notebooks.
+>
+> *(The first run of this phase was void under D-89: `route_threshold`'s
+> bisection was inverted, so accuracy fell as the budget rose. Fixed and
+> re-run; accuracy is now monotone.)*
+
 **The strongest baseline must be the comparator.** If patience beats confidence,
 the headroom numbers are recomputed against patience and the paper says so. A
 limits paper that picks a weak baseline is worthless.

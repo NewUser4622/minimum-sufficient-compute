@@ -91,8 +91,29 @@ under `analysis/`, byte-identical to the local copies.
 | H4: excess >= 2.0 pt | 2 of 2 archs | **6.91 pt (min)** | `s4_imagenet_excess.csv` |
 | H4b: the TRANSFORMER alone | vit_small_p16 | **6.91 pt** | `s4_imagenet_excess.csv` |
 
-## Study 4 — P1 baselines
+## Study 4 — P1 honest headroom vs budget
 
 | metric | scope | value | source |
 |---|---|---|---|
-| WITHHELD -- produced under D-89 | re-run S4_NB1 with the fixed router | **n/a ** | `s4_baselines.csv` |
+| cross-seed oracle - confidence, rho=0.40 | median over 15 CIFAR architectures | **7.74 pt** | `s4_baselines.csv` |
+| cross-seed oracle - confidence, rho=0.50 | median over 15 CIFAR architectures | **7.29 pt** | `s4_baselines.csv` |
+| cross-seed oracle - confidence, rho=0.60 | median over 15 CIFAR architectures | **3.74 pt** | `s4_baselines.csv` |
+| cross-seed oracle - confidence, rho=0.70 | median over 15 CIFAR architectures | **-3.05 pt** | `s4_baselines.csv` |
+| cross-seed oracle - confidence, rho=0.80 | median over 15 CIFAR architectures | **-8.3 pt** | `s4_baselines.csv` |
+| cross-seed oracle - confidence, rho=0.90 | median over 15 CIFAR architectures | **-13.13 pt** | `s4_baselines.csv` |
+| cross-seed oracle - confidence, rho=0.95 | median over 15 CIFAR architectures | **-14.98 pt** | `s4_baselines.csv` |
+| budgets with POSITIVE honest headroom | confidence baseline | **[0.4, 0.5, 0.6] rho** | `s4_baselines.csv` |
+
+## Study 4 — P1 baseline independence
+
+| metric | scope | value | source |
+|---|---|---|---|
+| max |confidence - margin| headroom gap | the two rules that hit the budget exactly | **1.78 pt** | `s4_baselines.csv` |
+
+## Study 4 — P1 baseline strength
+
+| metric | scope | value | source |
+|---|---|---|---|
+| confidence, at matched cost | median accuracy, never overspending | **58.03 %** | `s4_baselines.csv` |
+| margin, at matched cost | median accuracy, never overspending | **58.18 %** | `s4_baselines.csv` |
+| patience, at matched cost | median accuracy, never overspending | **55.62 %** | `s4_baselines.csv` |

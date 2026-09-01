@@ -34,12 +34,13 @@ and checked**.
 | | what | cost | state | artifact |
 |---|---|---|---|---|
 | **P0** | Figure 1 (ρ-sweep) + bootstrap CIs | free | **DONE — 3/3 CIs exclude zero** | `analysis/s4_bootstrap.csv`, `paper/figures/fig1_headroom.png` |
-| **P1** | margin + patience baselines | free | **RUN, RESULTS VOID (D-89) — re-run** | `analysis/s4_baselines.csv` |
+| **P1** | margin + patience baselines | free | **DONE — H6 split: baselines agree, but headroom is NOT negative everywhere** | `analysis/s4_baselines.csv` |
 | **P2** | ImageNet-100 + transformer | ~20 GPU-h | **DONE — H4 and H4b SUPPORTED** | `runs/p6-*-jointexit-s1` |
 | **P3** | MSDNet, a designed early-exit net | ~15 GPU-h | **not built yet** — needs new zoo code, own pass | `runs/p7-msdnet-*` |
 
-**Next action: re-run `S4_NB1_Baselines`.** Its router was broken (D-89);
-the fix is in and verified, but the results on disk are void.
+**Next action: update the manuscript.** H6's result materially qualifies the
+paper's central claim — the honest ceiling is **positive below ρ ≈ 0.65**, not
+negative everywhere. Then MSDNet (P3) is the last gap.
 
 ---
 
@@ -49,14 +50,76 @@ Do not edit the prediction column.
 
 | | prediction | threshold | measured | verdict |
 |---|---|---|---|---|
-| **H6** | conclusion is baseline-independent | negative at all 7 budgets | **VOID — D-89** | re-run required |
+| **H6** | conclusion is baseline-independent | negative at all 7 budgets | **spread ≤ 1.78 pt; POSITIVE at ρ ≤ 0.60** | **SPLIT** — see below |
 | **H4** | excess holds at ImageNet-100 scale | ≥ 2.0 pt, 2 of 2 | **7.39 / 6.91 pt** | **SUPPORTED** |
 | **H4b** | it holds on the **transformer** specifically | ≥ 2.0 pt | **6.91 pt** | **SUPPORTED** |
 | **H5** | excess holds on MSDNet | ≥ 2.0 pt, 2 of 2 seeds | _pending_ | _pending_ |
 
 ---
 
-## 2026-08-20 (RESULTS) · P0 and P2 land; P1 is VOID — D-89
+## 2026-08-20 (P1 re-run) · H6 SPLITS — and it qualifies the paper
+
+The D-89 fix is confirmed on real data: **confidence accuracy is now monotone in
+the budget** (36.70 → 71.49 across ρ = 0.40 → 0.95). Before the fix it ran
+backwards, 71.57 down to 19.21.
+
+### H6 bundled two claims. They separate.
+
+**(a) Baseline-independence — SUPPORTED.** The two rules that hit the budget
+exactly agree closely at every operating point:
+
+| ρ | confidence | margin | gap |
+|---|---|---|---|
+| 0.40 | **+7.74** | +7.01 | 0.73 |
+| 0.50 | **+7.29** | +5.51 | 1.78 |
+| 0.60 | **+3.74** | +2.44 | 1.30 |
+| 0.70 | −3.05 | −3.70 | 0.65 |
+| 0.80 | −8.30 | −8.41 | 0.11 |
+| 0.90 | −13.13 | −13.29 | 0.16 |
+| 0.95 | −14.98 | −15.03 | 0.05 |
+
+**Max gap 1.78 pt.** Confidence was not a weak comparator: at matched cost,
+confidence 58.03 % vs margin 58.18 % vs patience 55.62 %. R-04 did not fire.
+(Patience is excluded from the sign question — it cannot hit ρ = 0.50–0.70,
+landing at 0.603/0.636/0.637, so it is not comparable there.)
+
+**(b) "Negative at every operating point" — FALSIFIED.**
+
+**The honest headroom is POSITIVE at ρ ≤ 0.60** (+7.74, +7.29, +3.74) and
+negative from ρ = 0.70 upward. It changes sign at about **ρ ≈ 0.65**.
+
+### Why this does not contradict Study 2, and why it matters
+
+Study 2's sweep reported negative headroom at every budget — but that measured
+**per-sample difficulty-score routing** against confidence, a different
+quantity. Study 4 measures the **cross-seed oracle** against a deployable
+baseline. Both are correct about different things.
+
+**An independent cross-check.** At ρ = 0.80, where the two overlap:
+
+| | |
+|---|---|
+| Study 2 `ceiling_honest` | **−7.90 pt** |
+| Study 4 headroom | **−8.30 pt** |
+
+Different notebooks, different code paths, agreeing to **0.40 pt**. That is the
+strongest validation either measurement has.
+
+### What the paper must now say
+
+The claim *"the honest ceiling is negative"* is **true only at generous budgets**
+(ρ ≥ 0.70). At aggressive budgets — where adaptive inference is actually
+motivated — a cross-seed oracle beats a deployable baseline by **3–8 points**.
+
+That is a real qualification and it must lead, not hide in a limitations
+section. It also makes the paper *more* interesting: the excess over full
+compute (Claim 1) is unreachable, but there is genuine, seed-transferable
+headroom in the aggressive-budget regime that confidence thresholding does not
+capture. **`PAPER_CLAIM.md` is updated accordingly.**
+
+---
+
+## 2026-08-20 (RESULTS) · P0 and P2 land; P1 was VOID — D-89
 
 ### P0 — the intervals are tight and all exclude zero
 

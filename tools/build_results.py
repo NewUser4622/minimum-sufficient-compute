@@ -153,13 +153,40 @@ if im:
             vit[0]["arch"], round(float(vit[0]["excess"]), 2), "pt",
             "s4_imagenet_excess.csv")
 
-# P1 (s4_baselines.csv) is deliberately NOT included: the run that produced it
-# used route_threshold with an inverted bisection (D-89), so its baseline
-# accuracies do not correspond to the budgets they are labelled with. Publishing
-# them beside correct numbers would be worse than omitting them.
-if (AN / "s4_baselines.csv").exists():
-    add("4", "P1 baselines", "WITHHELD -- produced under D-89",
-        "re-run S4_NB1 with the fixed router", "n/a", "", "s4_baselines.csv")
+bl = load("s4_baselines.csv")
+if bl:
+    hh = defaultdict(list)
+    accs = defaultdict(list)
+    for r in bl:
+        hh[(float(r["target_rho"]), r["baseline"])].append(float(r["honest_headroom"]))
+        accs[(float(r["target_rho"]), r["baseline"])].append(float(r["baseline_acc"]))
+    rhos = sorted({float(r["target_rho"]) for r in bl})
+    # confidence and margin hit the budget exactly; patience cannot, so the
+    # sign question is answered on the two that are comparable.
+    for rr in rhos:
+        v = st.median(hh[(rr, "confidence")])
+        add("4", "P1 honest headroom vs budget",
+            f"cross-seed oracle - confidence, rho={rr:.2f}",
+            "median over 15 CIFAR architectures", round(v, 2), "pt",
+            "s4_baselines.csv")
+    flip = [rr for rr in rhos if st.median(hh[(rr, "confidence")]) > 0]
+    add("4", "P1 honest headroom vs budget", "budgets with POSITIVE honest headroom",
+        "confidence baseline", str(flip), "rho", "s4_baselines.csv")
+    sp = max(abs(st.median(hh[(rr, "confidence")]) - st.median(hh[(rr, "margin")]))
+             for rr in rhos)
+    add("4", "P1 baseline independence",
+        "max |confidence - margin| headroom gap",
+        "the two rules that hit the budget exactly", round(sp, 2), "pt",
+        "s4_baselines.csv")
+    fair = [r for r in bl
+            if float(r["achieved_cost"]) <= float(r["target_rho"]) + 0.01]
+    m = defaultdict(list)
+    for r in fair:
+        m[r["baseline"]].append(float(r["baseline_acc"]))
+    for k in sorted(m):
+        add("4", "P1 baseline strength", f"{k}, at matched cost",
+            "median accuracy, never overspending", round(st.median(m[k]), 2), "%",
+            "s4_baselines.csv")
 
 # ---- write ---------------------------------------------------------------
 with (out_dir / "RESULTS.csv").open("w", newline="", encoding="utf-8") as fh:
