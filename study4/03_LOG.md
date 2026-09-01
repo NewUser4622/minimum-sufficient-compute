@@ -33,16 +33,13 @@ and checked**.
 
 | | what | cost | state | artifact |
 |---|---|---|---|---|
-| **P0** | Figure 1 (ρ-sweep) + bootstrap CIs | **free**, CPU min | **built — ready to run** | `analysis/s4_bootstrap.csv`, `paper/figures/fig1_headroom.png` |
-| **P1** | margin + patience baselines | **free**, CPU min | **built — ready to run** | `analysis/s4_baselines.csv` |
-| **P2** | ImageNet-100 + transformer | ~20 GPU-h | **built** — gated on P0/P1 | `runs/p6-*-jointexit-s1` |
+| **P0** | Figure 1 (ρ-sweep) + bootstrap CIs | free | **DONE — 3/3 CIs exclude zero** | `analysis/s4_bootstrap.csv`, `paper/figures/fig1_headroom.png` |
+| **P1** | margin + patience baselines | free | **RUN, RESULTS VOID (D-89) — re-run** | `analysis/s4_baselines.csv` |
+| **P2** | ImageNet-100 + transformer | ~20 GPU-h | **DONE — H4 and H4b SUPPORTED** | `runs/p6-*-jointexit-s1` |
 | **P3** | MSDNet, a designed early-exit net | ~15 GPU-h | **not built yet** — needs new zoo code, own pass | `runs/p7-msdnet-*` |
 
-**Next action: run `S4_NB0_Figures`, then `S4_NB1_Baselines`.** Both are
-built, both are free, both were executed against synthetic data first. They cost nothing, they produce the
-paper's main figure and its intervals, and P1 can overturn the headline numbers
-by finding a stronger baseline — which is exactly why it runs before any GPU
-time is spent.
+**Next action: re-run `S4_NB1_Baselines`.** Its router was broken (D-89);
+the fix is in and verified, but the results on disk are void.
 
 ---
 
@@ -52,10 +49,90 @@ Do not edit the prediction column.
 
 | | prediction | threshold | measured | verdict |
 |---|---|---|---|---|
-| **H6** | conclusion is baseline-independent | honest headroom negative for margin + patience at all 7 budgets | _pending_ | _pending_ |
-| **H4** | excess holds at ImageNet-100 scale | ≥ 2.0 pt, 2 of 2 | _pending_ | _pending_ |
-| **H4b** | it holds on the **transformer** specifically | ≥ 2.0 pt, `vit_small_p16` | _pending_ | _pending_ |
+| **H6** | conclusion is baseline-independent | negative at all 7 budgets | **VOID — D-89** | re-run required |
+| **H4** | excess holds at ImageNet-100 scale | ≥ 2.0 pt, 2 of 2 | **7.39 / 6.91 pt** | **SUPPORTED** |
+| **H4b** | it holds on the **transformer** specifically | ≥ 2.0 pt | **6.91 pt** | **SUPPORTED** |
 | **H5** | excess holds on MSDNet | ≥ 2.0 pt, 2 of 2 seeds | _pending_ | _pending_ |
+
+---
+
+## 2026-08-20 (RESULTS) · P0 and P2 land; P1 is VOID — D-89
+
+### P0 — the intervals are tight and all exclude zero
+
+| arch | excess | 95 % CI over 10,000 test samples |
+|---|---|---|
+| `resnet20` | **10.64** | [10.00, 11.28] |
+| `resnet32x4` | **8.55** | [7.98, 9.10] |
+| `vgg8` | **9.15** | [8.61, 9.71] |
+
+**3 of 3 exclude zero**, and the widths are ~1.2 pt against effects of 8–11 pt.
+The refusal condition did not trigger. Figure 1 is written to
+`paper/figures/fig1_headroom.png`.
+
+*(Sample interval, not a seed interval — the label says so, and the n is read
+from the data rather than assumed.)*
+
+### P2 — the scale objection is closed, transformer included
+
+| arch | excess | full compute |
+|---|---|---|
+| `resnet50` | **7.39 pt** | 81.58 % |
+| **`vit_small_p16`** | **6.91 pt** | 63.23 % |
+
+**H4 SUPPORTED (2 of 2). H4b SUPPORTED — the transformer shows 6.91 pt.**
+
+This is the result Study 4 existed for. The excess is no longer a CIFAR-100
+finding on small convolutional nets: it holds at **224 px on ImageNet-100** and
+on a **vision transformer**, at magnitudes (6.9–7.4 pt) close to CIFAR's 6.86.
+The claim in `../PAPER_CLAIM.md` can drop "on CIFAR-100" from its scope.
+
+### D-89 — P1's router had an inverted bisection, and a canary that could not fail
+
+`S4_NB1` produced this, which is impossible:
+
+| ρ | 0.40 | 0.60 | 0.80 | 0.90 | 0.95 |
+|---|---|---|---|---|---|
+| confidence accuracy | 71.57 | 71.57 | 69.52 | 27.97 | **19.21** |
+
+**Accuracy fell as the budget rose.** More compute cannot hurt.
+
+**Cause.** Cost is non-decreasing in the threshold — a higher bar means fewer
+early exits and more compute. So when the achieved cost is *below* target the
+bar must go **up**. `route_threshold` lowered it. The search ran the budget
+backwards, which is exactly the inverted curve above.
+
+**Why it survived.** Two compounding mistakes of mine:
+
+1. **`achieved_cost` echoed the target.** For the threshold rules I recorded
+   `tr` — the requested budget — instead of the measured cost. So the overspend
+   check I had *just built* could never fire for them, and the inversion was
+   invisible in the table.
+2. **The canary asserted `cost <= target`.** A constant satisfies that at every
+   loose budget. It passed while the function ignored the budget entirely.
+   **A canary a broken function passes is not a canary** — the lesson this
+   project keeps re-learning, in a new place.
+
+**Fixed:** correct bisection direction, `lo` side chosen so it never overspends,
+measured cost recorded, and the canary strengthened to require that **cost
+tracks the budget** (spread > 0.15, not constant) and that **accuracy never
+falls as the budget rises**. Verified: cost spread 0.394, monotone accuracy.
+
+### A near-miss worth recording
+
+While checking whether Studies 2–3 were contaminated, my first diagnostic used
+**binary** synthetic confidence. Only three costs are reachable there, so *both*
+the old and new functions sat on the same plateau and the test reported
+`route_confidence` as **ALSO BROKEN**. It is not. With continuous scores both
+track the budget exactly and agree to three decimals.
+
+**I nearly reported Studies 2–3 as invalid on the strength of a bad test.**
+Study 2/3's `route_confidence` raises the bar with `lo = th` — the correct
+direction — and was right all along. D-89 is confined to Study 4's P1.
+
+**Consequence:** `s4_baselines.csv` is void and withheld from `RESULTS.md`
+rather than published beside correct numbers. H6 is unanswered until
+`S4_NB1` is re-run.
 
 ---
 

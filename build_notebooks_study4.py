@@ -156,20 +156,38 @@ def _cost(k, rho):  return float(np.mean(np.asarray(rho)[k]))
 
 def route_threshold(score, correct, rho, target, higher_exits=True):
     '''Exit at the first exit whose per-exit SCORE clears a threshold.
-    higher_exits=True means a LARGER score means "exit here".'''
+    `higher_exits=True` means a LARGER score means "exit here".
+
+    D-89. The first version had the bisection INVERTED. Cost is non-decreasing
+    in the threshold -- a higher bar means fewer early exits and more compute --
+    so when the achieved cost is below target the bar must go UP. The code
+    lowered it, and the search never tracked the budget at all: it returned the
+    same cost (0.594) for every target from 0.30 to 0.95, which produced the
+    impossible result that ACCURACY FELL as the budget rose.
+
+    It survived because the canary only asserted `cost <= target`, and a
+    constant 0.594 satisfies that at every loose budget. A canary that a broken
+    function passes is not a canary.
+    '''
     n, K = correct.shape
-    lo, hi = (float(np.min(score)), float(np.max(score)))
+    s = np.asarray(score, float)
+    if not higher_exits:
+        s = -s                       # now LARGER always means "exit here"
+
+    def cost_at(th):
+        fires = s >= th
+        fires = np.concatenate([fires[:, :-1], np.ones((n, 1), bool)], axis=1)
+        k = fires.argmax(axis=1)
+        return k, _cost(k, rho)
+
+    lo, hi = float(s.min()) - 1e-6, float(s.max()) + 1e-6   # cheapest .. dearest
     for _ in range(60):
         th = (lo + hi) / 2
-        fires = (score >= th) if higher_exits else (score <= th)
-        fires = np.concatenate([fires[:, :-1], np.ones((n, 1), bool)], axis=1)
-        k = fires.argmax(axis=1); c = _cost(k, rho)
-        if c < target:
-            if higher_exits: hi = th
-            else: lo = th
+        if cost_at(th)[1] < target:
+            lo = th                  # under budget -> raise the bar
         else:
-            if higher_exits: lo = th
-            else: hi = th
+            hi = th
+    k, c = cost_at(lo)               # `lo` side is the one that never overspends
     return float(correct[np.arange(n), k].mean()), c
 
 def route_patience(pred, correct, rho, target):
@@ -510,12 +528,15 @@ for (arch, dset), grp in base.groupby(['arch', 'dataset']):
     n = min(len(ci_), len(cj_))
     ci_, cf_, s2_, pr_, cj_ = ci_[:n], cf_[:n], s2_[:n], pr_[:n], cj_[:n]
     for tr in BUDGETS:
-        b_conf, _ = route_threshold(cf_, ci_, rho, tr)
-        b_marg, _ = route_threshold(cf_ - s2_, ci_, rho, tr)
+        # MEASURE the cost, never echo the target. The first version recorded
+        # `tr` for the threshold rules, so the overspend check could not fire
+        # for them by construction -- which is what hid D-89 for a whole run.
+        b_conf, c_conf = route_threshold(cf_, ci_, rho, tr)
+        b_marg, c_marg = route_threshold(cf_ - s2_, ci_, rho, tr)
         b_pat, c_pat, pat_n = route_patience(pr_, ci_, rho, tr)
         orc_cross, _ = route_oracle(cj_, ci_, rho, tr)
-        for name, acc, cost in [('confidence', b_conf, tr),
-                                ('margin', b_marg, tr),
+        for name, acc, cost in [('confidence', b_conf, c_conf),
+                                ('margin', b_marg, c_marg),
                                 ('patience', b_pat, c_pat)]:
             rows.append({'arch': arch, 'target_rho': tr, 'baseline': name,
                          'baseline_acc': acc * 100,
@@ -683,10 +704,22 @@ a_mg_noise, _ = route_threshold(rng.random((n, K)), cc, rho, .7)
 chk(f'margin uses the gap ({a_mg*100:.1f} vs {a_mg_noise*100:.1f} on noise)',
     a_mg > a_mg_noise + .02)
 
-# every rule must respect the budget
-for nm, (_, c) in [('confidence', route_threshold(cf_good, cc, rho, .7)),
-                   ('margin', route_threshold(mg_good, cc, rho, .7))]:
-    chk(f'{nm} respects the budget (cost {c:.3f} <= 0.70)', c <= 0.70 + 1e-6)
+# THE CANARY THAT MATTERS (D-89). 'cost <= target' is satisfied by a CONSTANT,
+# so it passed while route_threshold ignored the budget entirely. The cost must
+# TRACK the target, and accuracy must never fall as the budget rises.
+costs, accs = [], []
+for t in (.3, .4, .5, .6, .7, .8, .9, .95):
+    a_, c_ = route_threshold(cf_good, cc, rho, t)
+    costs.append(c_); accs.append(a_)
+    if c_ > t + 1e-6:
+        chk(f'never overspends at target {t}', False, f'cost {c_:.3f}'); break
+else:
+    chk('never overspends at any budget', True)
+chk(f'cost TRACKS the budget (spread {max(costs)-min(costs):.3f}, not constant)',
+    max(costs) - min(costs) > 0.15)
+chk('accuracy never falls as the budget rises',
+    all(b >= a - 1e-9 for a, b in zip(accs, accs[1:])),
+    f'{[round(x*100,1) for x in accs]}')
 
 print(f'\\n{sum(res)}/{len(res)} canaries pass')
 if not all(res):

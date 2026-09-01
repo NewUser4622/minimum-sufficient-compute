@@ -122,6 +122,45 @@ if pr:
         add("3", "Q3 pruning", f"target accuracy, {arm}", f"keep {rate}%",
             round(st.mean(v), 2), "%", "s3_pruning.csv")
 
+# ---- Study 4 -------------------------------------------------------------
+bs = load("s4_bootstrap.csv")
+for r in bs:
+    add("4", "P0 bootstrap CI", f"excess, {r['arch']}",
+        f"95% CI over {int(float(r['n_samples'])):,} TEST SAMPLES (not seeds)",
+        f"{float(r['excess']):.2f}  [{float(r['ci_lo']):.2f}, {float(r['ci_hi']):.2f}]",
+        "pt", "s4_bootstrap.csv")
+if bs:
+    add("4", "P0 bootstrap CI", "intervals excluding zero",
+        f"{len(bs)} joint runs",
+        sum(1 for r in bs if float(r["ci_lo"]) > 0), f"of {len(bs)}",
+        "s4_bootstrap.csv")
+
+im = load("s4_imagenet_excess.csv")
+for r in im:
+    add("4", "P2 ImageNet-100 @224px", f"excess, {r['arch']}",
+        "1 seed; per-run identity", round(float(r["excess"]), 2), "pt",
+        "s4_imagenet_excess.csv")
+    add("4", "P2 ImageNet-100 @224px", f"full-compute accuracy, {r['arch']}",
+        "1 seed", round(float(r["acc_full"]), 2), "%", "s4_imagenet_excess.csv")
+if im:
+    add("4", "P2 ImageNet-100 @224px", "H4: excess >= 2.0 pt",
+        f"{sum(1 for r in im if float(r['excess']) >= 2.0)} of {len(im)} archs",
+        round(min(float(r["excess"]) for r in im), 2), "pt (min)",
+        "s4_imagenet_excess.csv")
+    vit = [r for r in im if "vit" in r["arch"]]
+    if vit:
+        add("4", "P2 ImageNet-100 @224px", "H4b: the TRANSFORMER alone",
+            vit[0]["arch"], round(float(vit[0]["excess"]), 2), "pt",
+            "s4_imagenet_excess.csv")
+
+# P1 (s4_baselines.csv) is deliberately NOT included: the run that produced it
+# used route_threshold with an inverted bisection (D-89), so its baseline
+# accuracies do not correspond to the budgets they are labelled with. Publishing
+# them beside correct numbers would be worse than omitting them.
+if (AN / "s4_baselines.csv").exists():
+    add("4", "P1 baselines", "WITHHELD -- produced under D-89",
+        "re-run S4_NB1 with the fixed router", "n/a", "", "s4_baselines.csv")
+
 # ---- write ---------------------------------------------------------------
 with (out_dir / "RESULTS.csv").open("w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)

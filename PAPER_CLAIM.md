@@ -13,6 +13,16 @@ experiment. The gap analysis at the end is the part worth acting on.
 
 > ### Oracle upper bounds for early-exit inference exceed the accuracy of the network they bound, and the excess grows as the exits improve.
 
+> **UPDATED 2026-08-20 — the scale objection is CLOSED.** Study 4 P2 measured
+> the excess at **224 px on ImageNet-100**: `resnet50` **+7.39 pt**,
+> `vit_small_p16` **+6.91 pt**. It holds on a **vision transformer**, at a
+> magnitude close to CIFAR-100's +6.86. The claim is no longer "on small
+> convolutional networks at 32 px" and the title should not say so.
+>
+> Study 4 P0 adds bootstrap intervals on the CIFAR joint runs — 10.64
+> [10.00, 11.28], 8.55 [7.98, 9.10], 9.15 [8.61, 9.71] — **3 of 3 excluding
+> zero**, widths ~1.2 pt against effects of 8–11 pt.
+
 ### The one-paragraph version
 
 Early-exit papers motivate adaptive inference by reporting an oracle bound: the
@@ -46,7 +56,7 @@ unsafe.
 
 | # | claim | evidence | strength |
 |---|---|---|---|
-| **1** | the bound exceeds the network's own full accuracy | +6.86 pt, **90/90 runs**, exact identity with the early-right/final-wrong pool | **very strong** — arithmetic, needs no seeds |
+| **1** | the bound exceeds the network's own full accuracy | +6.86 pt on **90/90** CIFAR runs; **+7.39 / +6.91 pt** on ImageNet-100 @224 px incl. a **transformer**; bootstrap CIs exclude zero 3/3 | **very strong** — an identity, needs no seeds, now across two datasets, two scales and two architecture families |
 | **2** | it **grows** with better exits | frozen 6.4–8.0 → joint 8.6–10.6 pt, 3/3 architectures; survives conditioning on accuracy (+2.49 median) | **strong** — paired, one variable, mechanism explained |
 | **3** | it does not survive a change of seed | optimism bias **+22.4 pt**, 90 pairs | **medium** — see the caveat below |
 | **4** | a deployable gate recovers almost none of it | **1.7 %** cross-seed; in-seed no higher, so not noise-memorisation | **strong**, and it is a lower bound |
@@ -93,9 +103,9 @@ embarrassment into evidence that the final number was hard to get wrong.
 
 | venue | fit | realistic? |
 |---|---|---|
-| **TMLR** | limits/critique work is explicitly in scope; no novelty bar | **best first target** — submit close to as-is |
-| **Pattern Recognition** / **Neural Networks** (Q1, Elsevier) | empirical-analysis papers welcome | yes, **after** the scale gap is closed |
-| **IEEE TPAMI / IJCV** (Q1) | needs breadth we do not yet have | not without ImageNet + a transformer |
+| **TMLR** | limits/critique work is explicitly in scope; no novelty bar | **submit now** — nothing is missing for it |
+| **Pattern Recognition** / **Neural Networks** (Q1, Elsevier) | empirical-analysis papers welcome | **now viable** — the scale gap is closed (2 datasets, 2 scales, conv + transformer) |
+| **IEEE TPAMI / IJCV** (Q1) | wants architecture breadth | plausible **after MSDNet** (G1), the one remaining gap |
 | **NeurIPS/ICML D&B or main** | possible, but reviewers want a method | riskier than TMLR |
 
 **Recommendation: TMLR first.** It is the natural home for "the field's
@@ -124,6 +134,12 @@ identity. It is a per-run quantity so even one run answers it.
 **If the excess persists, Claim 1 becomes architecture-independent** and the
 paper's scope widens from "our setup" to "early-exit networks".
 
+### G2 · Scale · ~~~25 GPU-h~~ · **DONE — objection closed**
+
+> **Completed 2026-08-20.** `resnet50` +7.39 pt, `vit_small_p16` +6.91 pt at
+> 224 px on ImageNet-100. H4 and H4b both supported. The text below is the
+> original plan, kept for the record.
+
 ### G2 · Scale · ~25 GPU-h · **closes the standard objection**
 
 CIFAR-100 at 32px only. You already have an ImageNet-100 pipeline and 2
@@ -133,6 +149,14 @@ architectures measured.
 `vit_small_p16`, 1 seed each. **A transformer matters** — every claim we have is
 convolutional, and early-exit work is now largely transformer work (DE3-BERT is
 BERT). Reuse `notebooks_in100/`.
+
+### G3 · Baselines beyond confidence thresholding · **RUN, RESULTS VOID — re-run**
+
+> **The first run is void (D-89).** `route_threshold`'s bisection was inverted,
+> so accuracy *fell* as the budget rose — impossible. The bug is fixed and
+> verified (cost now tracks the budget, accuracy monotone), but `S4_NB1` must be
+> re-run before H6 has an answer. Studies 2–3 are **unaffected**: they use a
+> different function whose direction was always correct.
 
 ### G3 · Baselines beyond confidence thresholding · ~2 GPU-h · **cheapest credibility**
 
@@ -156,7 +180,9 @@ Q1's joint runs are one seed per architecture. The identity does not need seeds,
 but reviewers expect error bars. Bootstrap over the **10,000 test samples** —
 that is a legitimate interval for a per-run quantity and it costs nothing.
 
-**Total to Q1-ready: ~42 GPU-h**, of which G3–G5 are free or nearly so.
+**Remaining to Q1-ready: ~15 GPU-h (MSDNet) plus a free re-run of S4_NB1.**
+G2, G4 and G5 are done; G3 needs only the re-run. The original estimate was
+~42 GPU-h and ~27 of those are spent.
 
 ---
 

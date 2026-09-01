@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+title: "Minimum Sufficient Compute (MSC)"
+message: "If you use this code or data, please cite it."
+type: software
+authors:
+  - family-names: Bonal
+    given-names: Shanmukesh
+repository-code: "https://github.com/NewUser4622/minimum-sufficient-compute"
+abstract: >-
+  Per-sample, cost-normalised measurement of the compute a trained network
+  needs, and an analysis of oracle upper bounds for early-exit inference.
+  Oracle bounds are shown to exceed the accuracy of the network they bound
+  (+6.86 pt on CIFAR-100 over 90 runs; +7.39 and +6.91 pt on ImageNet-100 at
+  224 px including a vision transformer), with the excess growing as the exits
+  improve.
+keywords:
+  - early exit
+  - adaptive inference
+  - example difficulty
+  - oracle bounds
+license: MIT

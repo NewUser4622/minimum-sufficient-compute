@@ -10,10 +10,10 @@ msc_results/
 
 # the library is EMBEDDED in each notebook and written out at run time.
 # a copy sitting next to the notebooks is a build artifact, not source.
-notebooks/msc_lib.py
-notebooks/msc_core.py
-notebooks_in100/msc_lib.py
-notebooks_in100/msc_core.py
+# One rule for every generator, so a new notebooks_* folder is covered the day
+# it is created rather than the day someone notices the artifact in `git status`.
+notebooks*/msc_lib.py
+notebooks*/msc_core.py
 
 # scratch
 scratch/

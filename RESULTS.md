@@ -70,3 +70,29 @@ under `analysis/`, byte-identical to the local copies.
 | target accuracy, sat | keep 50% | **25.05 %** | `s3_pruning.csv` |
 | target accuracy, uns | keep 50% | **14.76 %** | `s3_pruning.csv` |
 | target accuracy, full | keep 100% | **70.24 %** | `s3_pruning.csv` |
+
+## Study 4 — P0 bootstrap CI
+
+| metric | scope | value | source |
+|---|---|---|---|
+| excess, resnet20 | 95% CI over 10,000 TEST SAMPLES (not seeds) | **10.64  [10.00, 11.28] pt** | `s4_bootstrap.csv` |
+| excess, resnet32x4 | 95% CI over 10,000 TEST SAMPLES (not seeds) | **8.55  [7.98, 9.10] pt** | `s4_bootstrap.csv` |
+| excess, vgg8 | 95% CI over 10,000 TEST SAMPLES (not seeds) | **9.15  [8.61, 9.71] pt** | `s4_bootstrap.csv` |
+| intervals excluding zero | 3 joint runs | **3 of 3** | `s4_bootstrap.csv` |
+
+## Study 4 — P2 ImageNet-100 @224px
+
+| metric | scope | value | source |
+|---|---|---|---|
+| excess, resnet50 | 1 seed; per-run identity | **7.39 pt** | `s4_imagenet_excess.csv` |
+| full-compute accuracy, resnet50 | 1 seed | **81.58 %** | `s4_imagenet_excess.csv` |
+| excess, vit_small_p16 | 1 seed; per-run identity | **6.91 pt** | `s4_imagenet_excess.csv` |
+| full-compute accuracy, vit_small_p16 | 1 seed | **63.23 %** | `s4_imagenet_excess.csv` |
+| H4: excess >= 2.0 pt | 2 of 2 archs | **6.91 pt (min)** | `s4_imagenet_excess.csv` |
+| H4b: the TRANSFORMER alone | vit_small_p16 | **6.91 pt** | `s4_imagenet_excess.csv` |
+
+## Study 4 — P1 baselines
+
+| metric | scope | value | source |
+|---|---|---|---|
+| WITHHELD -- produced under D-89 | re-run S4_NB1 with the fixed router | **n/a ** | `s4_baselines.csv` |
